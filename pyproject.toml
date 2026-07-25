@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youtube-video-localizer"
+version = "0.1.0"
+description = "Download YouTube videos, repair and translate subtitles, and create Chinese-dubbed videos."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "edge-tts>=7.2,<8",
+]
+
+[project.optional-dependencies]
+offline-tts = [
+    "piper-tts>=1.4,<2",
+]
+
+[project.scripts]
+youtube-video-localizer = "videodub.ui:main"
+
+[tool.setuptools.packages.find]
+include = ["videodub*"]
