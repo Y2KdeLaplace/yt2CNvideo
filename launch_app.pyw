@@ -19,7 +19,7 @@ except BaseException:
     ERROR_LOG.write_text(traceback.format_exc(), encoding="utf-8")
     ctypes.windll.user32.MessageBoxW(
         0,
-        f"程序启动失败。\n\n详细错误已保存到：\n{ERROR_LOG}",
-        "YouTube 视频中文化工具",
+        f"Application startup failed.\n\nDetails were saved to:\n{ERROR_LOG}",
+        "YouTube Video Localizer",
         0x10,
     )
