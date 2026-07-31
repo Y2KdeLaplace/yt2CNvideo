@@ -1,29 +1,18 @@
-"""Optional Qwen3-ASR/TTS HTTP services for Windows and Linux.
+"""Private, task-scoped Qwen ASR/TTS services.
 
-This module is intentionally not imported by the desktop application unless one
-of its console entry points is launched. The large model runtime therefore stays
-out of the default installation.
+The desktop app starts this module with the Python interpreter belonging to an
+installed model, waits for /health, runs one task, and always terminates it.
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
 import io
-import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-
-
-ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
-ALIGNER_MODEL = os.environ.get(
-    "QWEN_ALIGNER_MODEL",
-    "Qwen/Qwen3-ForcedAligner-0.6B",
-)
-TTS_MODEL = os.environ.get(
-    "QWEN_TTS_MODEL",
-    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-)
 
 
 def _torch_options() -> dict[str, Any]:
@@ -50,31 +39,58 @@ def _timestamp_segments(result: Any) -> list[dict[str, Any]]:
             segments.append({"text": text.strip(), "start": start, "end": end})
             current = []
     if current:
-        start = float(getattr(current[0], "start_time", 0.0))
-        end = float(getattr(current[-1], "end_time", start))
-        text = "".join(str(getattr(part, "text", "")) for part in current)
-        segments.append({"text": text.strip(), "start": start, "end": end})
+        segments.append(
+            {
+                "text": "".join(str(getattr(part, "text", "")) for part in current).strip(),
+                "start": float(getattr(current[0], "start_time", 0.0)),
+                "end": float(getattr(current[-1], "end_time", 0.0)),
+            }
+        )
     return [item for item in segments if item["text"]]
 
 
-def create_asr_app() -> Any:
+def _mlx_segments(result: Any) -> list[dict[str, Any]]:
+    raw = getattr(result, "segments", None)
+    if raw is None and isinstance(result, dict):
+        raw = result.get("segments")
+    segments: list[dict[str, Any]] = []
+    for item in raw or []:
+        value = item if isinstance(item, dict) else vars(item)
+        text = str(value.get("text") or "").strip()
+        if text:
+            segments.append(
+                {
+                    "text": text,
+                    "start": float(value.get("start") or 0),
+                    "end": float(value.get("end") or 0),
+                }
+            )
+    return segments
+
+
+def create_asr_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
     state: dict[str, Any] = {"model": None}
 
     @asynccontextmanager
     async def lifespan(_app: Any):
-        from qwen_asr import Qwen3ASRModel
+        if args.backend == "mlx":
+            from mlx_audio.stt.utils import load_model
 
-        options = _torch_options()
-        state["model"] = Qwen3ASRModel.from_pretrained(
-            ASR_MODEL,
-            forced_aligner=ALIGNER_MODEL,
-            forced_aligner_kwargs=options,
-            max_inference_batch_size=4,
-            max_new_tokens=1024,
-            **options,
-        )
+            state["model"] = load_model(args.model)
+        else:
+            from qwen_asr import Qwen3ASRModel
+
+            options = _torch_options()
+            state["model"] = Qwen3ASRModel.from_pretrained(
+                args.model,
+                forced_aligner=args.aligner,
+                forced_aligner_kwargs=options,
+                max_inference_batch_size=4,
+                max_new_tokens=1024,
+                **options,
+            )
         yield
         state["model"] = None
 
@@ -84,28 +100,42 @@ def create_asr_app() -> Any:
     def health() -> dict[str, str]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {
-            "status": "ok",
-            "model": ASR_MODEL,
-            "backend": "transformers",
-            "type": "asr",
-        }
+        return {"status": "ok", "model": args.model, "backend": args.backend, "type": "asr"}
 
     @app.post("/v1/asr")
     async def transcribe(
         audio: UploadFile = File(...),
         language: str = Form("English"),
     ) -> dict[str, Any]:
-        model = state["model"]
-        if model is None:
-            raise HTTPException(status_code=503, detail="Model not loaded")
         suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
         temp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
                 handle.write(await audio.read())
                 temp_path = Path(handle.name)
-            result = model.transcribe(
+            if args.backend == "mlx":
+                model = state["model"]
+                try:
+                    from mlx_audio.stt.generate import generate_transcription
+
+                    result = generate_transcription(
+                        model=model,
+                        audio_path=str(temp_path),
+                        output_path=str(temp_path.with_suffix(".txt")),
+                        format="txt",
+                        verbose=False,
+                    )
+                except (ImportError, TypeError):
+                    result = model.generate(
+                        str(temp_path),
+                        language=language or None,
+                    )
+                text = str(
+                    (result.get("text") if isinstance(result, dict) else getattr(result, "text", ""))
+                    or ""
+                )
+                return {"text": text, "language": language, "model": args.model, "segments": _mlx_segments(result)}
+            result = state["model"].transcribe(
                 audio=str(temp_path),
                 language=language or None,
                 return_time_stamps=True,
@@ -113,7 +143,7 @@ def create_asr_app() -> Any:
             return {
                 "text": str(result.text),
                 "language": str(result.language),
-                "model": ASR_MODEL,
+                "model": args.model,
                 "segments": _timestamp_segments(result),
             }
         finally:
@@ -123,9 +153,16 @@ def create_asr_app() -> Any:
     return app
 
 
-def create_tts_app() -> Any:
+def _audio_bytes(audio: Any, sample_rate: int) -> str:
     import numpy as np
     import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.asarray(audio).squeeze(), sample_rate, format="WAV")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def create_tts_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
 
@@ -133,12 +170,17 @@ def create_tts_app() -> Any:
 
     @asynccontextmanager
     async def lifespan(_app: Any):
-        from qwen_tts import Qwen3TTSModel
+        if args.backend == "mlx":
+            from mlx_audio.tts.utils import load_model
 
-        state["model"] = Qwen3TTSModel.from_pretrained(
-            TTS_MODEL,
-            **_torch_options(),
-        )
+            state["model"] = load_model(args.model)
+        else:
+            from qwen_tts import Qwen3TTSModel
+
+            state["model"] = Qwen3TTSModel.from_pretrained(
+                args.model,
+                **_torch_options(),
+            )
         yield
         state["model"] = None
 
@@ -151,47 +193,49 @@ def create_tts_app() -> Any:
     def health() -> dict[str, str]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {
-            "status": "ok",
-            "model": TTS_MODEL,
-            "backend": "transformers",
-            "type": "tts",
-        }
+        return {"status": "ok", "model": args.model, "backend": args.backend, "type": "tts"}
 
     @app.post("/v1/tts")
     def synthesize(request: TTSRequest) -> dict[str, Any]:
         model = state["model"]
-        if model is None:
-            raise HTTPException(status_code=503, detail="Model not loaded")
-        wavs, sample_rate = model.generate_custom_voice(
-            text=request.text,
-            language="Chinese",
-            speaker="Vivian",
-        )
-        buffer = io.BytesIO()
-        sf.write(buffer, np.asarray(wavs[0]), sample_rate, format="WAV")
-        return {
-            "audio_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
-            "model": TTS_MODEL,
-        }
+        if args.backend == "mlx":
+            results = model.generate(
+                text=request.text,
+                ref_audio=args.reference_audio,
+                ref_text=args.reference_text,
+            )
+            result = next(iter(results)) if hasattr(results, "__iter__") else results
+            audio = getattr(result, "audio", result)
+            sample_rate = int(getattr(result, "sample_rate", 24000))
+        else:
+            wavs, sample_rate = model.generate_voice_clone(
+                text=request.text,
+                language="Chinese",
+                ref_audio=args.reference_audio,
+                ref_text=args.reference_text,
+            )
+            audio = wavs[0]
+        return {"audio_base64": _audio_bytes(audio, sample_rate), "model": args.model}
 
     return app
 
 
-def _serve(service_type: str, default_port: int) -> None:
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("service", choices=("asr", "tts"))
+    parser.add_argument("--backend", choices=("hf", "mlx"), required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--aligner", default="")
+    parser.add_argument("--reference-audio", default="")
+    parser.add_argument("--reference-text", default="请告诉我 prompt。")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int)
+    args = parser.parse_args()
     import uvicorn
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=default_port)
-    args = parser.parse_args()
-    app = create_asr_app() if service_type == "asr" else create_tts_app()
-    uvicorn.run(app, host=args.host, port=args.port)
+    app = create_asr_app(args) if args.service == "asr" else create_tts_app(args)
+    uvicorn.run(app, host=args.host, port=args.port or (9956 if args.service == "asr" else 9955))
 
 
-def main_asr() -> None:
-    _serve("asr", 9956)
-
-
-def main_tts() -> None:
-    _serve("tts", 9955)
+if __name__ == "__main__":
+    main()

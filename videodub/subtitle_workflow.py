@@ -294,14 +294,26 @@ class SubtitleRepairWorkflow(_TextWorkflow):
             )
         return translated
 
-    def process_job(self, job: VideoJob) -> dict[str, Any]:
+    def process_job(
+        self,
+        job: VideoJob,
+        *,
+        repair: bool = True,
+        translate: bool = True,
+    ) -> dict[str, Any]:
+        if not repair and not translate:
+            return {}
         source = find_source_subtitle(job.video_path)
         if source is None:
             raise RuntimeError(f"缺少 YouTube 字幕：{job.video_path.name}")
-        if not job.asr_subtitle_path.is_file():
+        if repair and not job.asr_subtitle_path.is_file():
             raise RuntimeError(f"缺少 Qwen3-ASR 字幕：{job.asr_subtitle_path.name}")
         youtube_cues = read_srt(source)
-        asr_cues = read_srt(job.asr_subtitle_path)
+        asr_cues = (
+            read_srt(job.asr_subtitle_path)
+            if job.asr_subtitle_path.is_file()
+            else youtube_cues
+        )
         if not youtube_cues or not asr_cues:
             raise RuntimeError(f"字幕为空：{job.video_path.name}")
         job.corrected_subtitle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,11 +321,18 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         completion_before = self.completion_tokens
         self.runner.logger("正在判断主题并建立术语表…")
         domain = self.analyze_domain(job, youtube_cues, asr_cues)
-        self.runner.logger("正在逐条比对 YouTube 与 Qwen3-ASR 字幕…")
-        corrected, repairs = self.repair(youtube_cues, asr_cues, domain)
-        write_srt(job.corrected_subtitle_path, corrected)
-        chinese = self.translate(corrected, domain)
-        write_srt(job.chinese_subtitle_path, chinese)
+        repairs: list[RepairRecord] = []
+        if repair:
+            self.runner.logger("正在逐条比对 YouTube 与 Qwen3-ASR 字幕…")
+            corrected, repairs = self.repair(youtube_cues, asr_cues, domain)
+            write_srt(job.corrected_subtitle_path, corrected)
+        elif job.corrected_subtitle_path.is_file():
+            corrected = read_srt(job.corrected_subtitle_path)
+        else:
+            corrected = youtube_cues
+        if translate:
+            chinese = self.translate(corrected, domain)
+            write_srt(job.chinese_subtitle_path, chinese)
         report = {
             "version": 2,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -337,8 +356,10 @@ class SubtitleRepairWorkflow(_TextWorkflow):
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self.runner.logger(f"修复字幕：{job.corrected_subtitle_path}")
-        self.runner.logger(f"中文字幕：{job.chinese_subtitle_path}")
+        if repair:
+            self.runner.logger(f"修复字幕：{job.corrected_subtitle_path}")
+        if translate:
+            self.runner.logger(f"中文字幕：{job.chinese_subtitle_path}")
         return report
 
 

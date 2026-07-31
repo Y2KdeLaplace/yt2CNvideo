@@ -4,7 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from videodub.config import AppConfig, load_config, migrate_work_directory
+from videodub.config import (
+    DEFAULT_WORK_DIR,
+    AppConfig,
+    api_key_from_runtime,
+    encrypt_api_key,
+    load_config,
+    migrate_work_directory,
+    save_config,
+)
 from videodub.platform_utils import executable_exists, resolve_executable
 
 
@@ -54,12 +62,38 @@ class ConfigPortabilityTests(unittest.TestCase):
 
             migrate_work_directory(source, target)
 
-            self.assertFalse(source.exists())
+            self.assertTrue(source.is_dir())
+            self.assertEqual(list(source.iterdir()), [])
             self.assertEqual(
                 (target / "video.txt").read_text(encoding="utf-8"),
                 "new",
             )
             self.assertTrue((target / "output").is_dir())
+
+    def test_saved_work_directory_persists_then_falls_back_if_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = root / "selected"
+            selected.mkdir()
+            settings = root / "settings.json"
+            config = AppConfig(work_dir=str(selected))
+            save_config(config, settings)
+
+            self.assertEqual(Path(load_config(settings).work_dir), selected.resolve())
+            (selected / "output").rmdir()
+            selected.rmdir()
+            self.assertEqual(
+                Path(load_config(settings).work_dir),
+                DEFAULT_WORK_DIR.resolve(),
+            )
+
+    def test_saved_api_key_is_encrypted_and_can_be_recovered(self) -> None:
+        encrypted = encrypt_api_key("secret-value")
+        self.assertNotIn("secret-value", encrypted)
+        self.assertEqual(
+            api_key_from_runtime(config=AppConfig(subtitle_api_key_encrypted=encrypted)),
+            "secret-value",
+        )
 
 
 if __name__ == "__main__":

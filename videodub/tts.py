@@ -108,19 +108,18 @@ def _synthesize_qwen(
     runner: ProcessRunner,
     cues: list[Cue],
     raw_dir: Path,
+    base_url: str,
 ) -> list[Path]:
-    info = check_qwen_service(config.qwen_tts_base_url, "tts")
-    if not info.available:
-        raise RuntimeError(
-            "未检测到可用的 Qwen3-TTS 服务。请按 README 启动服务后重试。"
-            f"\n{info.error}"
-        )
-    runner.logger(f"Qwen3-TTS 模型：{info.model or '未报告'}")
+    if config.tts_backend != "gguf":
+        info = check_qwen_service(base_url, "tts")
+        if not info.available:
+            raise RuntimeError(f"Qwen3-TTS 模型服务未就绪：{info.error}")
+        runner.logger(f"Qwen3-TTS 模型：{info.model or '未报告'}")
     outputs: list[Path] = []
     for i, cue in enumerate(cues):
         runner.check_cancelled()
         output = raw_dir / f"raw-{i:06d}.wav"
-        synthesize_qwen(config, cue.text, output)
+        synthesize_qwen(config, cue.text, output, runner, base_url=base_url)
         if not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError(f"Qwen3-TTS 未生成有效音频（字幕 {i + 1}）")
         outputs.append(output)
@@ -279,6 +278,7 @@ def dub_video(
     job: VideoJob,
     *,
     speech_subtitle_path: Path | None = None,
+    qwen_base_url: str = "http://127.0.0.1:9955",
 ) -> Path:
     subtitle_path = job.chinese_subtitle_path
     if not subtitle_path.exists():
@@ -299,7 +299,13 @@ def dub_video(
         elif config.tts_provider == "piper":
             raw_files = _synthesize_piper(config, runner, cues, raw_dir)
         elif config.tts_provider == "qwen":
-            raw_files = _synthesize_qwen(config, runner, cues, raw_dir)
+            raw_files = _synthesize_qwen(
+                config,
+                runner,
+                cues,
+                raw_dir,
+                qwen_base_url,
+            )
         else:
             raise RuntimeError(f"未知配音提供方：{config.tts_provider}")
         voice_track = _prepare_timed_track(
