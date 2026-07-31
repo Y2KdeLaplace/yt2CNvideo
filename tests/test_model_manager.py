@@ -8,6 +8,7 @@ from unittest.mock import patch
 from videodub.config import AppConfig
 from videodub.model_manager import (
     ModelChoice,
+    _huggingface_downloaded_bytes,
     _download_huggingface,
     _download_modelscope,
     group_gguf_files,
@@ -24,13 +25,15 @@ from videodub.model_manager import (
 class RecordingRunner:
     def __init__(self) -> None:
         self.command: list[str] = []
+        self.environment: dict[str, str] | None = None
         self.logs: list[str] = []
 
     def logger(self, message: str) -> None:
         self.logs.append(message)
 
-    def run(self, command) -> None:
+    def run(self, command, **kwargs) -> None:
         self.command = [str(item) for item in command]
+        self.environment = kwargs.get("env")
 
     def check_cancelled(self) -> None:
         return
@@ -125,6 +128,26 @@ class ModelManagerTests(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
+    def test_huggingface_download_progress_counts_blob_and_xet_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            blob = root / "hub" / "models--owner--model" / "blobs" / "partial"
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"1234")
+            xet = root / "xet" / "chunk"
+            xet.parent.mkdir(parents=True)
+            xet.write_bytes(b"123456")
+            with patch.dict(
+                os.environ,
+                {
+                    "HF_HUB_CACHE": str(root / "hub"),
+                    "HF_XET_CACHE": str(root / "xet"),
+                },
+            ):
+                downloaded = _huggingface_downloaded_bytes("owner/model")
+
+        self.assertEqual(downloaded, 10)
+
     def test_incomplete_huggingface_snapshot_is_not_installed(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ,
@@ -170,6 +193,35 @@ class ModelManagerTests(unittest.TestCase):
         )
         self.assertNotIn("--local-dir", runner.command)
         self.assertEqual(runner.command[-2:], ["--include", "model.gguf"])
+        self.assertEqual(runner.environment, {"HF_ENDPOINT": "https://huggingface.co"})
+
+    def test_huggingface_download_retries_with_sufy_mirror(self) -> None:
+        class RetryRunner(RecordingRunner):
+            def __init__(self, cache: Path) -> None:
+                super().__init__()
+                self.cache = cache
+                self.endpoints: list[str] = []
+
+            def run(self, command, **kwargs) -> None:
+                super().run(command, **kwargs)
+                endpoint = (kwargs.get("env") or {}).get("HF_ENDPOINT", "")
+                self.endpoints.append(endpoint)
+                if endpoint == "https://huggingface.co":
+                    raise RuntimeError("official endpoint unavailable")
+                create_huggingface_snapshot(self.cache, "owner/model", "model.gguf")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"HF_HUB_CACHE": temp},
+        ):
+            runner = RetryRunner(Path(temp))
+            actual = _download_huggingface("owner/model", runner)
+
+        self.assertTrue(actual.name == "abc123")
+        self.assertEqual(
+            runner.endpoints,
+            ["https://huggingface.co", "https://hf-cdn.sufy.com"],
+        )
 
     def test_selected_custom_gguf_file_becomes_runtime_model_path(self) -> None:
         runner = RecordingRunner()

@@ -8,6 +8,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,11 +20,16 @@ from pathlib import Path
 from . import __version__
 from .config import AppConfig
 from .platform_utils import user_cache_dir
-from .runner import ProcessRunner
+from .runner import CancelledError, CommandError, ProcessRunner
 
 
 RUNTIMES_DIR = user_cache_dir() / "runtimes"
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
+HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
+HF_MIRROR_ENDPOINTS = (
+    "https://hf-cdn.sufy.com",
+    "https://hf-mirror.com",
+)
 
 
 @dataclass(frozen=True)
@@ -284,12 +290,13 @@ def group_gguf_files(files: Iterable[str]) -> tuple[ModelFileOption, ...]:
     )
 
 
-def list_huggingface_gguf_options(
+def _list_huggingface_gguf_options(
     repo_id: str,
     runner: ProcessRunner,
+    endpoint: str,
 ) -> tuple[ModelFileOption, ...]:
     runner.logger(f"正在检查 Hugging Face 模型文件：{repo_id}")
-    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    endpoint = endpoint.rstrip("/")
     safe_repo = urllib.parse.quote(repo_id, safe="/")
     url = (
         f"{endpoint}/api/models/{safe_repo}/tree/main"
@@ -349,6 +356,26 @@ def list_huggingface_gguf_options(
                     url = candidate
                 break
     return group_gguf_files(files)
+
+
+def list_huggingface_gguf_options(
+    repo_id: str,
+    runner: ProcessRunner,
+) -> tuple[ModelFileOption, ...]:
+    errors: list[Exception] = []
+    for endpoint in (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS):
+        try:
+            return _list_huggingface_gguf_options(repo_id, runner, endpoint)
+        except CancelledError:
+            raise
+        except RuntimeError as exc:
+            errors.append(exc)
+            if endpoint != HF_MIRROR_ENDPOINTS[-1]:
+                runner.logger(f"检查失败，正在使用镜像重试：{endpoint}")
+    detail = str(errors[-1]) if errors else "未知错误"
+    raise RuntimeError(f"无法读取 Hugging Face 模型文件：{detail}") from (
+        errors[-1] if errors else None
+    )
 
 
 def _resolve_choice(choice: ModelChoice) -> Path | None:
@@ -559,6 +586,116 @@ def _install_runtime(kind: str, backend: str, runner: ProcessRunner) -> None:
     runner.run([*uv_runtime_prefix(kind, backend), "python", "-c", imports])
 
 
+def _cache_tree_size(root: Path) -> int:
+    if not root.is_dir():
+        return 0
+    total = 0
+    try:
+        for item in root.rglob("*"):
+            if item.is_file():
+                total += item.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _huggingface_downloaded_bytes(repo_id: str) -> int:
+    repository = _hf_repo_root(repo_id)
+    xet_root = Path(
+        os.environ.get(
+            "HF_XET_CACHE",
+            str(
+                Path(os.environ.get("HF_HOME", "") or Path.home() / ".cache" / "huggingface")
+                / "xet"
+            ),
+        )
+    ).expanduser()
+    return _cache_tree_size(repository / "blobs") + _cache_tree_size(xet_root)
+
+
+def _format_download_size(size: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def _run_huggingface_download(
+    command: list[str],
+    repo_id: str,
+    endpoint: str,
+    runner: ProcessRunner,
+) -> None:
+    finished = threading.Event()
+    initial_size = _huggingface_downloaded_bytes(repo_id)
+
+    def monitor() -> None:
+        previous_size = initial_size
+        while not finished.wait(0.75):
+            current_size = _huggingface_downloaded_bytes(repo_id)
+            if current_size <= previous_size:
+                continue
+            previous_size = current_size
+            runner.logger(
+                f"下载进度（缓存已写入）：{_format_download_size(current_size - initial_size)}"
+            )
+
+    watcher = threading.Thread(target=monitor, daemon=True)
+    watcher.start()
+    try:
+        runner.run(command, env={"HF_ENDPOINT": endpoint})
+    finally:
+        finished.set()
+        watcher.join(timeout=1)
+
+
+def _download_with_hfd(
+    repo_id: str,
+    runner: ProcessRunner,
+    endpoint: str,
+    include: tuple[str, ...],
+) -> Path:
+    bash = shutil.which("bash")
+    curl = shutil.which("curl") or shutil.which("curl.exe")
+    if not bash or not curl:
+        raise RuntimeError("hfd requires both Bash and curl")
+    snapshot = _hf_repo_root(repo_id) / "snapshots" / "hfd"
+    snapshot.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="videodub-hfd-") as temporary:
+        script = Path(temporary) / "hfd.sh"
+        runner.logger(f"正在通过 hfd 下载：{repo_id}（{endpoint}）")
+        runner.run(
+            [
+                curl,
+                "--fail",
+                "--location",
+                "--output",
+                script,
+                f"{endpoint}/hfd/hfd.sh",
+            ]
+        )
+        command: list[str | Path] = [
+            bash,
+            script,
+            repo_id,
+            "--local-dir",
+            snapshot,
+        ]
+        if include:
+            command.extend(["--include", *include])
+        runner.run(command, env={"HF_ENDPOINT": endpoint})
+    reference = _hf_repo_root(repo_id) / "refs" / "main"
+    reference.parent.mkdir(parents=True, exist_ok=True)
+    reference.write_text("hfd\n", encoding="utf-8")
+    path = resolve_huggingface_model(repo_id)
+    if path is None:
+        raise RuntimeError(f"hfd completed but no model was found: {repo_id}")
+    return path
+
+
 def _download_huggingface(
     repo_id: str,
     runner: ProcessRunner,
@@ -574,6 +711,33 @@ def _download_huggingface(
     ]
     for pattern in include:
         command.extend(["--include", pattern])
+    errors: list[Exception] = []
+    for endpoint in (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS):
+        runner.logger(f"正在从 Hugging Face 下载：{repo_id}（{endpoint}）")
+        try:
+            _run_huggingface_download(command, repo_id, endpoint, runner)
+            path = resolve_huggingface_model(repo_id)
+            if path is None:
+                raise RuntimeError(f"Hugging Face completed but no model was found: {repo_id}")
+            return path
+        except CancelledError:
+            raise
+        except (CommandError, RuntimeError) as exc:
+            errors.append(exc)
+            if endpoint != HF_MIRROR_ENDPOINTS[-1]:
+                runner.logger(f"下载失败，正在使用镜像重试：{endpoint}")
+    for endpoint in HF_MIRROR_ENDPOINTS:
+        try:
+            return _download_with_hfd(repo_id, runner, endpoint, include)
+        except CancelledError:
+            raise
+        except (CommandError, RuntimeError) as exc:
+            errors.append(exc)
+            runner.logger(f"hfd 下载失败：{endpoint}")
+    detail = str(errors[-1]) if errors else "未知错误"
+    raise RuntimeError(f"Hugging Face 下载失败：{detail}") from (
+        errors[-1] if errors else None
+    )
     runner.logger(f"正在从 Hugging Face 下载：{repo_id}")
     runner.run(command)
     path = resolve_huggingface_model(repo_id)

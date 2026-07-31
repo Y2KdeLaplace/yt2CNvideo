@@ -821,7 +821,7 @@ class VideoDubApp(tk.Tk):
             state="readonly",
         )
         selected_combo.grid(row=0, column=1, sticky="ew", padx=(10, 8))
-        install_open_button = ttk.Button(frame, text="下载")
+        install_open_button = ttk.Button(frame, text="管理")
         install_open_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         lock_button = ttk.Button(frame)
         lock_button.grid(row=0, column=3, sticky="e")
@@ -1101,7 +1101,7 @@ class VideoDubApp(tk.Tk):
                 sticky="e",
                 pady=(10, 0),
             )
-            download_button = ttk.Button(actions, text="下载")
+            download_button = ttk.Button(actions, text="安装")
             download_button.pack(side="left")
             uninstall_button = ttk.Button(actions, text="卸载")
             uninstall_button.pack(side="left", padx=(6, 0))
