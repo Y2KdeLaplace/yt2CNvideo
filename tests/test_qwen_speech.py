@@ -6,6 +6,8 @@ from unittest.mock import patch
 from videodub.config import AppConfig
 from videodub.model_manager import InstalledModel
 from videodub.qwen_speech import (
+    _crispasr_asr_runtime_options,
+    _crispasr_language_code,
     _segments_to_cues,
     _validate_crispasr_asr_model,
     synthesize_qwen,
@@ -21,6 +23,18 @@ class RecordingRunner:
 
 
 class QwenSpeechTests(unittest.TestCase):
+    def test_crispasr_uses_explicit_language_codes(self) -> None:
+        self.assertEqual(_crispasr_language_code("English"), "en")
+        self.assertEqual(_crispasr_language_code("Chinese"), "zh")
+        self.assertEqual(_crispasr_language_code("yue"), "yue")
+
+    def test_crispasr_asr_does_not_download_runtime_helpers(self) -> None:
+        options = _crispasr_asr_runtime_options("English", Path("vad.bin"))
+        self.assertEqual(
+            options,
+            ["-l", "en", "--vad", "-vm", "vad.bin"],
+        )
+
     def test_asr_segments_become_srt_cues(self) -> None:
         cues = _segments_to_cues(
             [

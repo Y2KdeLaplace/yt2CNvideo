@@ -315,11 +315,19 @@ class ModelManagerTests(unittest.TestCase):
             root = Path(temp)
             selected = root / "model-q8_0.gguf"
             selected.write_text("weights", encoding="utf-8")
+            vad_root = root / "vad"
+            vad_root.mkdir()
+            vad_file = vad_root / "ggml-silero-v6.2.0.bin"
+            vad_file.write_text("vad", encoding="utf-8")
             with (
                 patch("videodub.model_manager._install_runtime"),
                 patch(
                     "videodub.model_manager._download_choice",
                     return_value=root,
+                ),
+                patch(
+                    "videodub.model_manager._download_huggingface",
+                    return_value=vad_root,
                 ),
             ):
                 installed = install_model(
@@ -333,6 +341,7 @@ class ModelManagerTests(unittest.TestCase):
 
         self.assertEqual(installed.backend, "gguf")
         self.assertEqual(Path(installed.path), selected)
+        self.assertEqual(Path(installed.vad_path), vad_file)
 
     def test_modelscope_cache_discovers_official_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(

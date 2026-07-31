@@ -66,6 +66,13 @@ def _mlx_segments(result: Any) -> list[dict[str, Any]]:
     return segments
 
 
+def _transcribe_mlx(model: Any, audio_path: Path, language: str) -> Any:
+    return model.generate(
+        str(audio_path),
+        language=language or None,
+    )
+
+
 def create_asr_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
@@ -113,21 +120,7 @@ def create_asr_app(args: argparse.Namespace) -> Any:
                 temp_path = Path(handle.name)
             if args.backend == "mlx":
                 model = state["model"]
-                try:
-                    from mlx_audio.stt.generate import generate_transcription
-
-                    result = generate_transcription(
-                        model=model,
-                        audio_path=str(temp_path),
-                        output_path=str(temp_path.with_suffix(".txt")),
-                        format="txt",
-                        verbose=False,
-                    )
-                except (ImportError, TypeError):
-                    result = model.generate(
-                        str(temp_path),
-                        language=language or None,
-                    )
+                result = _transcribe_mlx(model, temp_path, language)
                 text = str(
                     (result.get("text") if isinstance(result, dict) else getattr(result, "text", ""))
                     or ""

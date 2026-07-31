@@ -61,6 +61,7 @@ class InstalledModel:
     aligner_path: str = ""
     source: str = "huggingface"
     variant: str = ""
+    vad_path: str = ""
 
 
 def _is_apple_silicon() -> bool:
@@ -405,6 +406,16 @@ def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
     return codec_path, aligner_path
 
 
+def _installed_vad_path(kind: str, backend: str) -> str:
+    if kind != "asr" or backend != "gguf":
+        return ""
+    repository = resolve_huggingface_model("ggml-org/whisper-vad")
+    if repository is None:
+        return ""
+    candidate = repository / "ggml-silero-v6.2.0.bin"
+    return str(candidate) if candidate.is_file() else ""
+
+
 def _installed_from_choice(
     kind: str,
     choice: ModelChoice,
@@ -476,6 +487,7 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
                         aligner_path,
                         "huggingface",
                         _variant(repo_id),
+                        _installed_vad_path(kind, backend),
                     )
                 )
         else:
@@ -489,6 +501,7 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
                     aligner_path,
                     "huggingface",
                     _variant(repo_id),
+                    _installed_vad_path(kind, backend),
                 )
             )
     return result
@@ -939,6 +952,7 @@ def install_model(
         model_path = sorted(candidates)[0]
     codec_path = ""
     aligner_path = ""
+    vad_path = ""
     if kind == "asr" and backend == "hf":
         aligner_choice = ModelChoice(
             "aligner",
@@ -960,6 +974,16 @@ def install_model(
         if not codec_files:
             raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
         codec_path = str(codec_files[0])
+    if kind == "asr" and backend == "gguf":
+        vad = _download_huggingface(
+            "ggml-org/whisper-vad",
+            runner,
+            ("ggml-silero-v6.2.0.bin",),
+        )
+        vad_file = vad / "ggml-silero-v6.2.0.bin"
+        if not vad_file.is_file():
+            raise RuntimeError("ASR GGUF 的 Silero VAD 依赖下载后未找到")
+        vad_path = str(vad_file)
     installed = InstalledModel(
         kind,
         backend,
@@ -969,6 +993,7 @@ def install_model(
         aligner_path,
         choice.source,
         _variant(repo_id),
+        vad_path,
     )
     runner.logger(f"模型下载完成：{model_path}")
     return installed

@@ -5,12 +5,27 @@ from unittest.mock import Mock, patch
 
 from videodub.config import AppConfig
 from videodub.model_manager import InstalledModel
-from videodub.model_runtime import ManagedModelService
+from videodub.model_runtime import ManagedModelService, _terminate_process_tree
 from videodub.qwen_speech import QwenServiceInfo
 from videodub.runner import ProcessRunner
 
 
 class ManagedModelServiceTests(unittest.TestCase):
+    def test_windows_termination_kills_the_complete_process_tree(self) -> None:
+        process = Mock(pid=321)
+        process.poll.return_value = None
+        with (
+            patch("videodub.model_runtime.os.name", "nt"),
+            patch("videodub.model_runtime.subprocess.run") as run,
+        ):
+            _terminate_process_tree(process)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", "321", "/T", "/F"],
+        )
+        process.wait.assert_called_once_with(timeout=10)
+
     def test_runner_cancellation_terminates_managed_service(self) -> None:
         process = Mock()
         process.poll.return_value = None
@@ -35,12 +50,12 @@ class ManagedModelServiceTests(unittest.TestCase):
             ),
             patch("videodub.model_runtime.subprocess.Popen", return_value=process),
             patch("videodub.model_runtime.threading.Thread"),
+            patch("videodub.model_runtime._terminate_process_tree") as terminate,
             ManagedModelService(config, runner, "asr", port=12000),
         ):
             runner.cancel()
 
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=10)
+        terminate.assert_called_once_with(process)
 
 
 if __name__ == "__main__":

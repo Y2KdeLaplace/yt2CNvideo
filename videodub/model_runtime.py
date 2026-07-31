@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -10,6 +11,35 @@ from .config import AppConfig
 from .model_manager import read_installed_model, uv_runtime_prefix
 from .qwen_speech import check_qwen_service
 from .runner import ProcessRunner
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=5)
 
 
 class ManagedModelService:
@@ -83,7 +113,12 @@ class ManagedModelService:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt"
+                else 0
+            ),
+            start_new_session=os.name != "nt",
         )
         self.runner.add_cancel_callback(self._terminate)
         threading.Thread(target=self._relay_output, daemon=True).start()
@@ -120,11 +155,7 @@ class ManagedModelService:
             if process is None or process.poll() is not None:
                 return
             self.runner.logger(f"正在停止 {self.kind.upper()} 模型…")
-            process.terminate()
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                _terminate_process_tree(process)
             finally:
                 self.process = None

@@ -14,7 +14,12 @@ from typing import Any
 
 from .config import AppConfig
 from .media import VideoJob, media_duration
-from .model_manager import crispasr_executable, first_model_file, read_installed_model
+from .model_manager import (
+    InstalledModel,
+    crispasr_executable,
+    first_model_file,
+    read_installed_model,
+)
 from .runner import ProcessRunner
 from .subtitles import Cue, read_srt, write_srt
 
@@ -172,7 +177,7 @@ def _segments_to_cues(
     return cues
 
 
-def _validate_crispasr_asr_model(model: Path) -> None:
+def _validate_crispasr_asr_model(model: Path) -> InstalledModel | None:
     installed = read_installed_model(model)
     if (
         installed is not None
@@ -183,6 +188,27 @@ def _validate_crispasr_asr_model(model: Path) -> None:
             "当前 GGUF 文件不是 CrispASR 所需的转换格式。请在模型菜单中卸载旧版 "
             "handy-computer 模型，并重新下载 cstr/qwen3-asr-0.6b-GGUF。"
         )
+    return installed
+
+
+def _crispasr_language_code(language: str) -> str:
+    normalized = language.strip().casefold()
+    return {
+        "english": "en",
+        "chinese": "zh",
+        "mandarin": "zh",
+        "cantonese": "yue",
+    }.get(normalized, normalized or "en")
+
+
+def _crispasr_asr_runtime_options(language: str, vad_model: Path) -> list[str]:
+    return [
+        "-l",
+        _crispasr_language_code(language),
+        "--vad",
+        "-vm",
+        str(vad_model),
+    ]
 
 
 def extract_asr_subtitle(
@@ -220,7 +246,12 @@ def extract_asr_subtitle(
             if executable is None:
                 raise RuntimeError("CrispASR 运行环境未安装")
             model = first_model_file(config.asr_model_path, "*.gguf")
-            _validate_crispasr_asr_model(model)
+            installed = _validate_crispasr_asr_model(model)
+            vad_model = Path(installed.vad_path) if installed else Path()
+            if not installed or not vad_model.is_file():
+                raise RuntimeError(
+                    "ASR GGUF 缺少 Silero VAD 依赖，请在模型菜单中重新下载该模型。"
+                )
             prefix = Path(temp) / "recognized"
             runner.run(
                 [
@@ -231,7 +262,7 @@ def extract_asr_subtitle(
                     model,
                     "-f",
                     wav_path,
-                    "--vad",
+                    *_crispasr_asr_runtime_options(language, vad_model),
                     "-osrt",
                     "-of",
                     prefix,
