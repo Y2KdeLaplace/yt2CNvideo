@@ -200,7 +200,6 @@ def dub_video(
     subtitle_path = job.chinese_subtitle_path
     if not subtitle_path.exists():
         raise RuntimeError(f"缺少中文字幕：{subtitle_path.name}")
-    final_output = _output_path(config, job)
     narration_path = speech_subtitle_path or subtitle_path
     cues = read_srt(narration_path)
     if not cues:

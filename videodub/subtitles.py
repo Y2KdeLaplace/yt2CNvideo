@@ -154,10 +154,3 @@ def find_source_subtitle(video_path: Path) -> Path | None:
         return rank, name
 
     return sorted(candidates, key=score)[0]
-
-
-def cues_to_payload(cues: list[Cue]) -> str:
-    return json.dumps(
-        [{"id": cue.index, "text": cue.text} for cue in cues],
-        ensure_ascii=False,
-    )

@@ -13,7 +13,7 @@ class ProcessRunnerTests(unittest.TestCase):
         started = time.monotonic()
         runner = ProcessRunner(lambda line: logged.append((line, time.monotonic())))
 
-        runner.run(
+        lines = runner.run(
             [
                 sys.executable,
                 "-c",
@@ -28,4 +28,15 @@ class ProcessRunnerTests(unittest.TestCase):
         progress_time = next(timestamp for text, timestamp in logged if text == "25%")
         self.assertLess(progress_time - started, 0.3)
         self.assertIn("done", [text for text, _timestamp in logged])
+        self.assertEqual(lines, ["done"])
 
+    def test_ansi_terminal_codes_are_removed_from_logs_and_output(self) -> None:
+        logged: list[str] = []
+        runner = ProcessRunner(logged.append)
+
+        lines = runner.run(
+            [sys.executable, "-c", "print('\\x1b[31merror\\x1b[0m')"]
+        )
+
+        self.assertEqual(lines, ["error"])
+        self.assertIn("error", logged)

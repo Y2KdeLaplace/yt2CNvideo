@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 
+# Keep the existing storage name so upgrading to scip does not lose settings.
 APP_DIRECTORY_NAME = "YouTube Video Localizer"
 
 
@@ -36,15 +37,29 @@ def user_cache_dir() -> Path:
     return root / "youtube-video-localizer"
 
 
+def application_cache_dir() -> Path:
+    configured = os.environ.get("VIDEODUB_CACHE_DIR", "").strip()
+    return Path(configured).expanduser() if configured else user_cache_dir()
+
+
 def _tool_candidates(command: str) -> list[Path]:
     executable = command + (".exe" if os.name == "nt" else "")
     candidates = [Path(sys.executable).resolve().parent / executable]
     if os.name == "nt":
-        if command == "yt-dlp":
-            candidates.insert(0, Path(r"D:\software\yt-dlp.exe"))
-        else:
-            candidates.insert(
-                0, Path(rf"D:\software\ffmpeg\bin\{command}.exe")
+        for root in (
+            os.environ.get("LOCALAPPDATA", ""),
+            os.environ.get("USERPROFILE", ""),
+            os.environ.get("ChocolateyInstall", ""),
+        ):
+            if not root:
+                continue
+            base = Path(root)
+            candidates.extend(
+                [
+                    base / "Microsoft" / "WinGet" / "Links" / executable,
+                    base / "scoop" / "shims" / executable,
+                    base / "bin" / executable,
+                ]
             )
     else:
         candidates.extend(

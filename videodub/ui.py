@@ -19,8 +19,9 @@ from videodub.config import (
     PROJECT_ROOT,
     api_key_from_runtime,
     encrypt_api_key,
+    configure_cache_directory,
     load_config,
-    migrate_legacy_layout,
+    migrate_cache_directory,
     migrate_work_directory,
     save_config,
 )
@@ -50,7 +51,7 @@ from videodub.subtitles import find_source_subtitle
 from videodub.tts import dub_video
 
 
-GITHUB_REPOSITORY = "Y2KdeLaplace/yt2bilibili"
+GITHUB_REPOSITORY = "Y2KdeLaplace/yt2CNvideo"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -90,11 +91,11 @@ class VideoDubApp(tk.Tk):
         # Keep the initial top-left placement hidden until the final geometry
         # is known, especially on macOS where Tk may paint before construction.
         self.withdraw()
-        self.title("YouTube 视频中文化工具")
+        self.title("scip - YouTube 视频中文化工具")
         self.geometry("1080x738")
         self.minsize(900, 630)
         self.config_data = load_config()
-        migrate_legacy_layout(self.config_data.work_dir)
+        configure_cache_directory(self.config_data.cache_dir)
         self.config_data.ensure_directories()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.runner = ProcessRunner(lambda line: self.events.put(("log", line)))
@@ -104,6 +105,7 @@ class VideoDubApp(tk.Tk):
         self.worker: threading.Thread | None = None
         self.current_task = ""
         self.jobs: list[VideoJob] = []
+        self.model_lock_state = {"asr": False, "tts": False}
         self.session_api_key = api_key_from_runtime(config=self.config_data)
         self.ui_font = tkfont.nametofont("TkDefaultFont").actual()["family"]
         self.mono_font = tkfont.nametofont("TkFixedFont").actual()["family"]
@@ -206,6 +208,10 @@ class VideoDubApp(tk.Tk):
         about_menu = tk.Menu(self, tearoff=False)
         about_menu.add_command(label="更新", command=self._check_update)
         about_menu.add_command(label="版本", command=self._show_version)
+        cache_menu = tk.Menu(about_menu, tearoff=False)
+        cache_menu.add_command(label="设置缓存目录", command=self._set_cache_directory)
+        cache_menu.add_command(label="打开缓存目录", command=self._open_cache_directory)
+        about_menu.add_cascade(label="缓存目录", menu=cache_menu)
         ttk.Menubutton(
             header,
             text="关于",
@@ -586,10 +592,14 @@ class VideoDubApp(tk.Tk):
                 not config.subtitle_api_base_url or not config.subtitle_model
             ):
                 raise ValueError("请先在“模型 → 语言模型”中完成配置。")
-            if stages[0] and not config.asr_model_path:
-                raise ValueError("请先在“模型 → 语音识别模型”中下载并选择模型。")
-            if stages[3] and not config.tts_model_path:
-                raise ValueError("请先在“模型 → 语音生成模型”中下载并选择模型。")
+            if stages[0] and (
+                not self.model_lock_state["asr"] or not config.asr_model_path
+            ):
+                raise ValueError("请先在“模型 → 语音识别模型”中选择并锁定模型。")
+            if stages[3] and (
+                not self.model_lock_state["tts"] or not config.tts_model_path
+            ):
+                raise ValueError("请先在“模型 → 语音生成模型”中选择并锁定模型。")
             if stages[3]:
                 tts_model = read_installed_model(config.tts_model_path)
                 if tts_model and tts_model.variant == "base":
@@ -801,7 +811,7 @@ class VideoDubApp(tk.Tk):
         choices = model_choices(kind)
         selected_model = tk.StringVar()
         installed_map: dict[str, InstalledModel] = {}
-        locked = tk.BooleanVar(value=False)
+        locked = tk.BooleanVar(value=self.model_lock_state[kind])
         download_state: dict[str, object] = {
             "busy": False,
             "runner": None,
@@ -828,7 +838,7 @@ class VideoDubApp(tk.Tk):
         ToolTip(
             selected_combo,
             lambda: installed_map.get(selected_model.get()).path
-            if selected_model.get() in installed_map
+            if locked.get() and selected_model.get() in installed_map
             else "",
         )
 
@@ -944,7 +954,7 @@ class VideoDubApp(tk.Tk):
                 state="disabled" if locked.get() else "readonly"
             )
             lock_button.configure(
-                text="解锁选择" if locked.get() else "锁定选择",
+                text="解锁" if locked.get() else "锁定",
                 state="normal" if has_selection else "disabled",
             )
             refresh_reference_state()
@@ -960,7 +970,6 @@ class VideoDubApp(tk.Tk):
                 source = {
                     "modelscope": "ModelScope",
                     "huggingface": "Hugging Face",
-                    "imported": "已迁移",
                 }.get(item.source, item.source)
                 label = f"{item.repo_id}（{source}）"
                 if item.backend == "gguf" and Path(item.path).is_file():
@@ -986,16 +995,30 @@ class VideoDubApp(tk.Tk):
                         break
             selected_model.set(matched or (labels[0] if labels else ""))
             locked.set(bool(matched) if keep_locked else False)
+            self.model_lock_state[kind] = locked.get()
             if matched and keep_locked:
                 apply_installed(installed_map[matched])
             refresh_lock_state()
 
+        progress_line_active = False
+
         def model_log(text: str) -> None:
             def write() -> None:
+                nonlocal progress_line_active
                 if not dialog.winfo_exists():
                     return
+                message = text.rstrip()
+                is_progress = message.startswith("下载进度（")
                 log.configure(state="normal")
-                log.insert("end", text.rstrip() + "\n")
+                if is_progress and progress_line_active:
+                    log.delete("model_progress_start", "end-1c")
+                elif is_progress:
+                    log.mark_set("model_progress_start", "end-1c")
+                    log.mark_gravity("model_progress_start", "left")
+                elif progress_line_active:
+                    log.mark_unset("model_progress_start")
+                log.insert("end", message + "\n")
+                progress_line_active = is_progress
                 log.see("end")
                 log.configure(state="disabled")
 
@@ -1010,6 +1033,7 @@ class VideoDubApp(tk.Tk):
             if locked.get():
                 save_reference()
                 locked.set(False)
+                self.model_lock_state[kind] = False
                 refresh_lock_state()
                 return
             installed = selected_installed()
@@ -1017,6 +1041,7 @@ class VideoDubApp(tk.Tk):
                 return
             apply_installed(installed)
             locked.set(True)
+            self.model_lock_state[kind] = True
             refresh_lock_state()
 
         def clear_uninstalled(installed: InstalledModel) -> None:
@@ -1026,6 +1051,7 @@ class VideoDubApp(tk.Tk):
                 self.config_data.asr_backend = ""
                 self.config_data.asr_model_id = ""
                 self.config_data.asr_model_path = ""
+                self.model_lock_state["asr"] = False
             elif kind == "tts" and Path(
                 self.config_data.tts_model_path
             ) == Path(installed.path):
@@ -1033,6 +1059,7 @@ class VideoDubApp(tk.Tk):
                 self.config_data.tts_model_id = ""
                 self.config_data.tts_model_path = ""
                 self.config_data.tts_codec_path = ""
+                self.model_lock_state["tts"] = False
             self._persist_config()
 
         def browse_reference() -> None:
@@ -1093,9 +1120,34 @@ class VideoDubApp(tk.Tk):
                 padx=(10, 0),
                 pady=(8, 0),
             )
+            ttk.Label(install_frame, text="已安装模型").grid(
+                row=2,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                pady=(12, 4),
+            )
+            installed_tree = ttk.Treeview(
+                install_frame,
+                columns=("model", "backend", "path"),
+                show="headings",
+                height=6,
+            )
+            installed_tree.heading("model", text="模型")
+            installed_tree.heading("backend", text="类型")
+            installed_tree.heading("path", text="位置")
+            installed_tree.column("model", width=230, stretch=False)
+            installed_tree.column("backend", width=75, stretch=False)
+            installed_tree.column("path", width=330, stretch=True)
+            installed_tree.grid(
+                row=3,
+                column=0,
+                columnspan=2,
+                sticky="nsew",
+            )
             actions = ttk.Frame(install_frame)
             actions.grid(
-                row=2,
+                row=4,
                 column=0,
                 columnspan=2,
                 sticky="e",
@@ -1106,6 +1158,27 @@ class VideoDubApp(tk.Tk):
             uninstall_button = ttk.Button(actions, text="卸载")
             uninstall_button.pack(side="left", padx=(6, 0))
             install_frame.columnconfigure(1, weight=1)
+            install_frame.rowconfigure(3, weight=1)
+            installed_rows: dict[str, InstalledModel] = {}
+
+            def refresh_installed_table(prefer_path: str = "") -> None:
+                installed_rows.clear()
+                installed_tree.delete(*installed_tree.get_children())
+                for index, item in enumerate(list_installed_models(kind)):
+                    row_id = str(index)
+                    installed_rows[row_id] = item
+                    installed_tree.insert(
+                        "",
+                        "end",
+                        iid=row_id,
+                        values=(item.repo_id, item.backend, item.path),
+                    )
+                    if prefer_path and Path(item.path) == Path(prefer_path):
+                        installed_tree.selection_set(row_id)
+
+            def selected_table_model() -> InstalledModel | None:
+                selected = installed_tree.selection()
+                return installed_rows.get(selected[0]) if selected else None
 
             def update_custom(_event: object = None) -> None:
                 choice = choice_by_label(kind, install_choice.get())
@@ -1127,7 +1200,7 @@ class VideoDubApp(tk.Tk):
                 uninstall_button.configure(
                     state=(
                         "normal"
-                        if selected_installed()
+                        if selected_table_model()
                         else "disabled"
                     )
                 )
@@ -1140,6 +1213,7 @@ class VideoDubApp(tk.Tk):
                 if not dialog.winfo_exists():
                     return
                 reload_installed(installed.path, keep_locked=False)
+                refresh_installed_table(installed.path)
                 if installer.winfo_exists():
                     installer.destroy()
 
@@ -1340,7 +1414,7 @@ class VideoDubApp(tk.Tk):
                 installer.destroy()
 
             def uninstall_selected() -> None:
-                installed = selected_installed()
+                installed = selected_table_model()
                 if not installed:
                     return
                 if not messagebox.askyesno(
@@ -1362,6 +1436,7 @@ class VideoDubApp(tk.Tk):
                         def finish() -> None:
                             clear_uninstalled(installed)
                             reload_installed()
+                            refresh_installed_table()
                             if installer.winfo_exists():
                                 installer.destroy()
 
@@ -1384,16 +1459,23 @@ class VideoDubApp(tk.Tk):
                 threading.Thread(target=worker, daemon=True).start()
 
             install_combo.bind("<<ComboboxSelected>>", update_custom)
+            installed_tree.bind(
+                "<<TreeviewSelect>>",
+                lambda _event: uninstall_button.configure(
+                    state="normal" if selected_table_model() else "disabled"
+                ),
+            )
             download_button.configure(command=download_selected)
             uninstall_button.configure(
                 command=uninstall_selected,
-                state="normal" if selected_installed() else "disabled",
+                state="disabled",
             )
             installer.protocol(
                 "WM_DELETE_WINDOW",
                 confirm_close_installer,
             )
             update_custom()
+            refresh_installed_table()
             installer.update_idletasks()
             self._center_dialog(
                 installer,
@@ -1428,13 +1510,43 @@ class VideoDubApp(tk.Tk):
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
         lock_button.configure(command=toggle_lock)
         install_open_button.configure(command=show_install_dialog)
-        reload_installed()
+        reload_installed(keep_locked=self.model_lock_state[kind])
         self._center_dialog(dialog, 780, 510)
+
+    def _set_cache_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self,
+            title="选择缓存目录",
+            initialdir=self.config_data.cache_dir,
+        )
+        if not selected:
+            return
+        target = Path(selected).expanduser().resolve()
+        source = Path(self.config_data.cache_dir).expanduser().resolve()
+        if target == source:
+            return
+        try:
+            migrate_cache_directory(source, target)
+            self.config_data.cache_dir = str(target)
+            configure_cache_directory(target)
+            self._persist_config()
+        except OSError as exc:
+            messagebox.showerror("迁移失败", f"无法迁移缓存目录：{exc}", parent=self)
+            return
+        messagebox.showinfo("缓存目录", f"缓存已迁移到：\n{target}", parent=self)
+
+    def _open_cache_directory(self) -> None:
+        target = Path(self.config_data.cache_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            open_in_file_manager(target)
+        except OSError as exc:
+            messagebox.showerror("打开失败", str(exc), parent=self)
 
     def _show_version(self) -> None:
         messagebox.showinfo(
             "版本",
-            f"YouTube 视频中文化工具\n版本 {__version__}\n\nGitHub：{GITHUB_REPOSITORY}",
+            f"scip - YouTube 视频中文化工具\n版本 {__version__}\n\nGitHub：{GITHUB_REPOSITORY}",
             parent=self,
         )
 
@@ -1443,7 +1555,7 @@ class VideoDubApp(tk.Tk):
 
         def worker() -> None:
             try:
-                headers = {"User-Agent": f"youtube-video-localizer/{__version__}"}
+                headers = {"User-Agent": f"scip/{__version__}"}
                 try:
                     request = urllib.request.Request(
                         f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",

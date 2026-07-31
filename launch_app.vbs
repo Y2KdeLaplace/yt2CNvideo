@@ -11,7 +11,7 @@ End If
 baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
 launcher = fso.BuildPath(baseDir, "launch_app.pyw")
 If shell.Run("cmd.exe /c where uv.exe >nul 2>nul", 0, True) <> 0 Then
-    MsgBox "uv was not found. Install uv first: https://docs.astral.sh/uv/", 16, "YouTube Video Localizer"
+    MsgBox "uv was not found. Install uv first: https://docs.astral.sh/uv/", 16, "scip"
     WScript.Quit 1
 End If
 
