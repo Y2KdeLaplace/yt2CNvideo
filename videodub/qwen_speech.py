@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
-import shutil
 import tempfile
 import urllib.error
 import urllib.parse
@@ -13,10 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, PROJECT_ROOT
+from .config import AppConfig
 from .media import VideoJob, media_duration
+from .model_manager import crispasr_executable, first_model_file, read_installed_model
 from .runner import ProcessRunner
-from .subtitles import Cue, write_srt
+from .subtitles import Cue, read_srt, write_srt
+
+
+ASR_SERVICE_URL = "http://127.0.0.1:9956"
+TTS_SERVICE_URL = "http://127.0.0.1:9955"
 
 
 @dataclass(frozen=True)
@@ -170,14 +174,8 @@ def extract_asr_subtitle(
     job: VideoJob,
     *,
     language: str = "English",
+    base_url: str = ASR_SERVICE_URL,
 ) -> Path:
-    info = check_qwen_service(config.qwen_asr_base_url, "asr")
-    if not info.available:
-        raise RuntimeError(
-            "未检测到可用的 Qwen3-ASR 服务。请按 README 启动服务后重试。"
-            f"\n{info.error}"
-        )
-    runner.logger(f"Qwen3-ASR 模型：{info.model or '未报告'}")
     with tempfile.TemporaryDirectory(prefix="videodub-asr-") as temp:
         wav_path = Path(temp) / "audio.wav"
         runner.logger("正在从视频音轨直接解码为 16 kHz 无损音频…")
@@ -200,11 +198,44 @@ def extract_asr_subtitle(
             ]
         )
         runner.check_cancelled()
-        result = _post_audio(
-            config.qwen_asr_base_url,
-            wav_path,
-            language=language,
-        )
+        if config.asr_backend == "gguf":
+            executable = crispasr_executable()
+            if executable is None:
+                raise RuntimeError("CrispASR 运行环境未安装")
+            model = first_model_file(config.asr_model_path, "*.gguf")
+            prefix = Path(temp) / "recognized"
+            runner.run(
+                [
+                    executable,
+                    "--backend",
+                    "qwen3",
+                    "-m",
+                    model,
+                    "-f",
+                    wav_path,
+                    "--vad",
+                    "-osrt",
+                    "-of",
+                    prefix,
+                ]
+            )
+            srt = prefix.with_suffix(".srt")
+            if not srt.is_file():
+                candidates = list(Path(temp).glob("*.srt"))
+                if not candidates:
+                    raise RuntimeError("CrispASR 未生成 SRT 字幕")
+                srt = candidates[0]
+            cues = read_srt(srt)
+            if not cues:
+                raise RuntimeError("CrispASR 生成的字幕为空")
+            write_srt(job.asr_subtitle_path, cues)
+            runner.logger(f"ASR 字幕：{job.asr_subtitle_path}")
+            return job.asr_subtitle_path
+        info = check_qwen_service(base_url, "asr")
+        if not info.available:
+            raise RuntimeError(f"Qwen3-ASR 模型服务未就绪：{info.error}")
+        runner.logger(f"Qwen3-ASR 模型：{info.model or '未报告'}")
+        result = _post_audio(base_url, wav_path, language=language)
     cues = _segments_to_cues(
         result.get("segments"),
         str(result.get("text") or ""),
@@ -217,49 +248,51 @@ def extract_asr_subtitle(
     return job.asr_subtitle_path
 
 
-def _copy_qwen_audio(
-    config: AppConfig,
-    response: dict[str, Any],
-    target: Path,
-) -> None:
+def _copy_qwen_audio(response: dict[str, Any], target: Path) -> None:
     encoded = response.get("audio_base64")
     if isinstance(encoded, str) and encoded:
         target.write_bytes(base64.b64decode(encoded))
         return
-    audio_url = response.get("audio_url")
-    if isinstance(audio_url, str) and audio_url:
-        with urllib.request.urlopen(
-            urllib.parse.urljoin(config.qwen_tts_base_url + "/", audio_url),
-            timeout=300,
-        ) as source:
-            target.write_bytes(source.read())
-        return
-    raw_path = str(response.get("audio_path") or "").strip()
-    if raw_path:
-        candidate = Path(raw_path).expanduser()
-        candidates = [candidate] if candidate.is_absolute() else []
-        if config.qwen_service_root.strip():
-            candidates.append(Path(config.qwen_service_root).expanduser() / candidate)
-        candidates.extend([PROJECT_ROOT / candidate, Path.cwd() / candidate])
-        for source in candidates:
-            if source.is_file():
-                shutil.copy2(source, target)
-                return
-    raise RuntimeError(
-        "Qwen3-TTS 已完成生成，但客户端无法读取音频。"
-        "请在“模型路径”中填写 qwen-speech-mlx 项目目录，"
-        "或让兼容服务返回 audio_base64/audio_url。"
-    )
+    raise RuntimeError("Qwen3-TTS 没有返回音频")
 
 
 def synthesize_qwen(
     config: AppConfig,
     text: str,
     output: Path,
+    runner: ProcessRunner,
+    *,
+    base_url: str = TTS_SERVICE_URL,
 ) -> None:
+    if config.tts_backend == "gguf":
+        executable = crispasr_executable()
+        installed = read_installed_model(config.tts_model_path)
+        if executable is None or installed is None:
+            raise RuntimeError("Qwen3-TTS GGUF 运行环境或模型不存在")
+        runner.run(
+            [
+                executable,
+                "--backend",
+                "qwen3-tts",
+                "-m",
+                first_model_file(config.tts_model_path, "*.gguf"),
+                "--codec-model",
+                installed.codec_path,
+                "--voice",
+                config.tts_reference_audio,
+                "--ref-text",
+                config.tts_reference_text,
+                "--tts",
+                text,
+                "--tts-output",
+                output,
+            ],
+            quiet=True,
+        )
+        return
     response = _json_request(
-        config.qwen_tts_base_url.rstrip("/") + "/v1/tts",
+        base_url.rstrip("/") + "/v1/tts",
         payload={"text": text},
         timeout=1800,
     )
-    _copy_qwen_audio(config, response, output)
+    _copy_qwen_audio(response, output)
