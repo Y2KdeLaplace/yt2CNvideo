@@ -9,6 +9,7 @@ import stat
 import tarfile
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,17 +20,20 @@ from pathlib import Path
 
 from . import __version__
 from .config import AppConfig
-from .platform_utils import user_cache_dir
+from .platform_utils import application_cache_dir
 from .runner import CancelledError, CommandError, ProcessRunner
 
 
-RUNTIMES_DIR = user_cache_dir() / "runtimes"
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
 HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
 HF_MIRROR_ENDPOINTS = (
     "https://hf-cdn.sufy.com",
     "https://hf-mirror.com",
 )
+
+
+def runtimes_dir() -> Path:
+    return application_cache_dir() / "runtimes"
 
 
 @dataclass(frozen=True)
@@ -208,14 +212,6 @@ def resolve_huggingface_model(repo_id: str) -> Path | None:
         revision = reference.read_text(encoding="utf-8").strip()
         if revision:
             candidates.append(snapshots / revision)
-    if snapshots.is_dir():
-        candidates.extend(
-            sorted(
-                (item for item in snapshots.iterdir() if item.is_dir()),
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
-        )
     for candidate in candidates:
         if _has_model_content(candidate):
             return candidate.resolve()
@@ -302,7 +298,7 @@ def _list_huggingface_gguf_options(
         f"{endpoint}/api/models/{safe_repo}/tree/main"
         "?recursive=true&expand=false"
     )
-    headers = {"User-Agent": f"youtube-video-localizer/{__version__}"}
+    headers = {"User-Agent": f"scip/{__version__}"}
     token = (
         os.environ.get("HF_TOKEN", "").strip()
         or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
@@ -363,15 +359,18 @@ def list_huggingface_gguf_options(
     runner: ProcessRunner,
 ) -> tuple[ModelFileOption, ...]:
     errors: list[Exception] = []
-    for endpoint in (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS):
+    endpoints = (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS)
+    for index, endpoint in enumerate(endpoints):
         try:
             return _list_huggingface_gguf_options(repo_id, runner, endpoint)
         except CancelledError:
             raise
         except RuntimeError as exc:
             errors.append(exc)
-            if endpoint != HF_MIRROR_ENDPOINTS[-1]:
-                runner.logger(f"检查失败，正在使用镜像重试：{endpoint}")
+            if index + 1 < len(endpoints):
+                runner.logger(
+                    f"检查失败，正在使用镜像重试：{endpoints[index + 1]}"
+                )
     detail = str(errors[-1]) if errors else "未知错误"
     raise RuntimeError(f"无法读取 Hugging Face 模型文件：{detail}") from (
         errors[-1] if errors else None
@@ -520,13 +519,6 @@ def read_installed_model(path: str | Path) -> InstalledModel | None:
     return None
 
 
-def is_model_installed(kind: str, backend: str, repo_id: str) -> bool:
-    return any(
-        item.backend == backend and item.repo_id == repo_id
-        for item in list_installed_models(kind)
-    )
-
-
 def runtime_packages(kind: str, backend: str) -> tuple[str, tuple[str, ...]]:
     if backend == "mlx":
         return (
@@ -633,20 +625,39 @@ def _run_huggingface_download(
     initial_size = _huggingface_downloaded_bytes(repo_id)
 
     def monitor() -> None:
-        previous_size = initial_size
-        while not finished.wait(0.75):
+        last_reported_size = 0
+        last_reported_at = 0.0
+        while not finished.wait(1.0):
             current_size = _huggingface_downloaded_bytes(repo_id)
-            if current_size <= previous_size:
+            downloaded = max(0, current_size - initial_size)
+            now = time.monotonic()
+            if downloaded <= 0:
                 continue
-            previous_size = current_size
+            if (
+                last_reported_size
+                and downloaded - last_reported_size < 1024 * 1024
+                and now - last_reported_at < 10
+            ):
+                continue
             runner.logger(
-                f"下载进度（缓存已写入）：{_format_download_size(current_size - initial_size)}"
+                f"下载进度（缓存已写入）：{_format_download_size(downloaded)}"
             )
+            last_reported_size = downloaded
+            last_reported_at = now
 
     watcher = threading.Thread(target=monitor, daemon=True)
     watcher.start()
     try:
-        runner.run(command, env={"HF_ENDPOINT": endpoint})
+        environment = {
+            "HF_ENDPOINT": endpoint,
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+            "NO_COLOR": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+        if endpoint != HF_OFFICIAL_ENDPOINT:
+            environment["HF_HUB_DISABLE_XET"] = "1"
+        runner.run(command, env=environment)
     finally:
         finished.set()
         watcher.join(timeout=1)
@@ -712,38 +723,51 @@ def _download_huggingface(
     for pattern in include:
         command.extend(["--include", pattern])
     errors: list[Exception] = []
-    for endpoint in (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS):
-        runner.logger(f"正在从 Hugging Face 下载：{repo_id}（{endpoint}）")
-        try:
-            _run_huggingface_download(command, repo_id, endpoint, runner)
-            path = resolve_huggingface_model(repo_id)
-            if path is None:
-                raise RuntimeError(f"Hugging Face completed but no model was found: {repo_id}")
-            return path
-        except CancelledError:
-            raise
-        except (CommandError, RuntimeError) as exc:
-            errors.append(exc)
-            if endpoint != HF_MIRROR_ENDPOINTS[-1]:
-                runner.logger(f"下载失败，正在使用镜像重试：{endpoint}")
-    for endpoint in HF_MIRROR_ENDPOINTS:
-        try:
-            return _download_with_hfd(repo_id, runner, endpoint, include)
-        except CancelledError:
-            raise
-        except (CommandError, RuntimeError) as exc:
-            errors.append(exc)
-            runner.logger(f"hfd 下载失败：{endpoint}")
-    detail = str(errors[-1]) if errors else "未知错误"
-    raise RuntimeError(f"Hugging Face 下载失败：{detail}") from (
-        errors[-1] if errors else None
-    )
-    runner.logger(f"正在从 Hugging Face 下载：{repo_id}")
-    runner.run(command)
-    path = resolve_huggingface_model(repo_id)
-    if path is None:
-        raise RuntimeError(f"Hugging Face 下载完成后未找到模型缓存：{repo_id}")
-    return path
+    repository = _hf_repo_root(repo_id)
+    had_installed_model = resolve_huggingface_model(repo_id) is not None
+    if repository.exists() and not had_installed_model:
+        shutil.rmtree(repository)
+
+    try:
+        endpoints = (HF_OFFICIAL_ENDPOINT, *HF_MIRROR_ENDPOINTS)
+        for index, endpoint in enumerate(endpoints):
+            runner.logger(f"正在从 Hugging Face 下载：{repo_id}（{endpoint}）")
+            try:
+                _run_huggingface_download(command, repo_id, endpoint, runner)
+                path = resolve_huggingface_model(repo_id)
+                if path is None:
+                    raise RuntimeError(
+                        f"Hugging Face completed but no model was found: {repo_id}"
+                    )
+                return path
+            except CancelledError:
+                raise
+            except (CommandError, RuntimeError) as exc:
+                errors.append(exc)
+                if index + 1 < len(endpoints):
+                    runner.logger(
+                        f"下载失败，正在使用镜像重试：{endpoints[index + 1]}"
+                    )
+        for endpoint in HF_MIRROR_ENDPOINTS:
+            try:
+                return _download_with_hfd(repo_id, runner, endpoint, include)
+            except CancelledError:
+                raise
+            except (CommandError, RuntimeError) as exc:
+                errors.append(exc)
+                runner.logger(f"hfd 下载失败：{endpoint}")
+        detail = str(errors[-1]) if errors else "未知错误"
+        raise RuntimeError(f"Hugging Face 下载失败：{detail}") from (
+            errors[-1] if errors else None
+        )
+    except Exception:
+        if not had_installed_model and repository.exists():
+            try:
+                shutil.rmtree(repository)
+                runner.logger(f"已清理下载失败的模型文件：{repo_id}")
+            except OSError as cleanup_error:
+                runner.logger(f"未能完整清理下载失败的模型文件：{cleanup_error}")
+        raise
 
 
 def _download_modelscope(repo_id: str, runner: ProcessRunner) -> Path:
@@ -778,7 +802,7 @@ def _download_choice(
 def _download_file(url: str, target: Path, runner: ProcessRunner) -> None:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": f"youtube-video-localizer/{__version__}"},
+        headers={"User-Agent": f"scip/{__version__}"},
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(request, timeout=60) as response, target.open(
@@ -813,7 +837,7 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
     api = f"https://api.github.com/repos/{CRISPASR_REPOSITORY}/releases/latest"
     request = urllib.request.Request(
         api,
-        headers={"User-Agent": f"youtube-video-localizer/{__version__}"},
+        headers={"User-Agent": f"scip/{__version__}"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         release = json.loads(response.read().decode("utf-8"))
@@ -849,13 +873,14 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
     with tempfile.TemporaryDirectory(prefix="videodub-crispasr-") as temp:
         archive = Path(temp) / name
         _download_file(str(asset["browser_download_url"]), archive, runner)
-        RUNTIMES_DIR.mkdir(parents=True, exist_ok=True)
+        runtime_root = runtimes_dir()
+        runtime_root.mkdir(parents=True, exist_ok=True)
         if name.endswith(".zip"):
-            _safe_extract_zip(archive, RUNTIMES_DIR)
+            _safe_extract_zip(archive, runtime_root)
         elif name.endswith((".tar.gz", ".tgz")):
-            _safe_extract_tar(archive, RUNTIMES_DIR)
+            _safe_extract_tar(archive, runtime_root)
         else:
-            target = RUNTIMES_DIR / name
+            target = runtime_root / name
             shutil.copy2(archive, target)
             target.chmod(target.stat().st_mode | stat.S_IEXEC)
     result = crispasr_executable()
@@ -866,9 +891,10 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
 
 def crispasr_executable() -> Path | None:
     try:
-        if not RUNTIMES_DIR.is_dir():
+        runtime_root = runtimes_dir()
+        if not runtime_root.is_dir():
             return None
-        candidates = list(RUNTIMES_DIR.rglob("*"))
+        candidates = list(runtime_root.rglob("*"))
     except OSError:
         return None
     names = {"crispasr.exe"} if os.name == "nt" else {"crispasr"}

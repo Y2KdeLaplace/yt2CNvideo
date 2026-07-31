@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .platform_utils import (
+    application_cache_dir,
     executable_exists,
     resolve_executable,
     user_config_dir,
@@ -20,11 +21,8 @@ from .platform_utils import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = PROJECT_ROOT / "work"
+DEFAULT_CACHE_DIR = application_cache_dir()
 SETTINGS_FILE = user_config_dir() / "settings.json"
-LEGACY_SETTINGS_FILES = (
-    PROJECT_ROOT / "settings.json",
-)
-LEGACY_SUBTITLE_LANGUAGES = "en-orig,en.*,zh-Hans,zh-CN,zh,-live_chat"
 DEFAULT_SUBTITLE_LANGUAGES = "en-orig,en"
 
 
@@ -81,27 +79,23 @@ def migrate_work_directory(source: str | Path, target: str | Path) -> None:
     (DEFAULT_WORK_DIR / "output").mkdir(exist_ok=True)
 
 
-def migrate_legacy_layout(work_dir: str | Path) -> None:
-    """Import the retired yt-video/bl-video layout without scanning elsewhere."""
-    work_path = Path(work_dir).expanduser().resolve()
-    work_path.mkdir(parents=True, exist_ok=True)
-    output_path = work_path / "output"
-    output_path.mkdir(exist_ok=True)
-    for source, target in (
-        (PROJECT_ROOT / "yt-video", work_path),
-        (PROJECT_ROOT / "bl-video", output_path),
-    ):
-        if not source.exists():
-            continue
-        for child in source.iterdir():
-            if child.name == ".gitkeep":
-                continue
-            _merge_move(child, target / child.name)
-        (source / ".gitkeep").unlink(missing_ok=True)
-        try:
-            source.rmdir()
-        except OSError:
-            pass
+def configure_cache_directory(cache_dir: str | Path) -> Path:
+    root = Path(cache_dir).expanduser().resolve()
+    os.environ["VIDEODUB_CACHE_DIR"] = str(root)
+    return root
+
+
+def migrate_cache_directory(source: str | Path, target: str | Path) -> None:
+    source_path = Path(source).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    if source_path == target_path:
+        target_path.mkdir(parents=True, exist_ok=True)
+        return
+    target_path.mkdir(parents=True, exist_ok=True)
+    if source_path.exists():
+        for child in list(source_path.iterdir()):
+            _merge_move(child, target_path / child.name)
+        source_path.rmdir()
 
 
 def _encryption_key() -> bytes:
@@ -110,7 +104,6 @@ def _encryption_key() -> bytes:
             getpass.getuser(),
             platform.node(),
             str(uuid.getnode()),
-            str(PROJECT_ROOT.resolve()),
             "youtube-video-localizer-2.1",
         )
     ).encode("utf-8")
@@ -147,6 +140,7 @@ def decrypt_api_key(value: str) -> str:
 @dataclass
 class AppConfig:
     work_dir: str = str(DEFAULT_WORK_DIR)
+    cache_dir: str = str(DEFAULT_CACHE_DIR)
     yt_dlp_path: str = "yt-dlp"
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
@@ -158,12 +152,8 @@ class AppConfig:
     subtitle_model: str = ""
     subtitle_api_key_encrypted: str = ""
     save_model_info: bool = True
-    subtitle_use_vision: bool = False
     subtitle_detection_batch_size: int = 40
     subtitle_translation_batch_size: int = 30
-    subtitle_context_radius: int = 3
-    subtitle_suspect_threshold: float = 0.55
-    subtitle_screenshot_count: int = 3
 
     asr_backend: str = ""
     asr_model_id: str = ""
@@ -198,27 +188,18 @@ class AppConfig:
 
     def normalize(self) -> "AppConfig":
         self.work_dir = _portable_directory(self.work_dir, DEFAULT_WORK_DIR)
+        self.cache_dir = _portable_directory(self.cache_dir, DEFAULT_CACHE_DIR)
         if not Path(self.work_dir).is_dir():
             self.work_dir = str(DEFAULT_WORK_DIR.resolve())
         self.yt_dlp_path = resolve_executable(self.yt_dlp_path, "yt-dlp")
         self.ffmpeg_path = resolve_executable(self.ffmpeg_path, "ffmpeg")
         self.ffprobe_path = resolve_executable(self.ffprobe_path, "ffprobe")
         self.overwrite = True
-        self.subtitle_use_vision = False
         self.subtitle_detection_batch_size = max(
             10, min(int(self.subtitle_detection_batch_size), 100)
         )
         self.subtitle_translation_batch_size = max(
             10, min(int(self.subtitle_translation_batch_size), 80)
-        )
-        self.subtitle_context_radius = max(
-            1, min(int(self.subtitle_context_radius), 10)
-        )
-        self.subtitle_suspect_threshold = max(
-            0.0, min(float(self.subtitle_suspect_threshold), 1.0)
-        )
-        self.subtitle_screenshot_count = max(
-            1, min(int(self.subtitle_screenshot_count), 5)
         )
         self.original_volume = max(0.0, min(float(self.original_volume), 1.0))
         self.subtitle_api_base_url = self.subtitle_api_base_url.rstrip("/")
@@ -242,14 +223,7 @@ class AppConfig:
 
 
 def load_config(path: Path | None = None) -> AppConfig:
-    source = path
-    if source is None:
-        source = SETTINGS_FILE
-        if not source.exists():
-            source = next(
-                (item for item in LEGACY_SETTINGS_FILES if item.exists()),
-                SETTINGS_FILE,
-            )
+    source = path or SETTINGS_FILE
     config = AppConfig()
     if not source.exists():
         config.normalize()
@@ -263,36 +237,15 @@ def load_config(path: Path | None = None) -> AppConfig:
         return config
     try:
         raw = json.loads(source.read_text(encoding="utf-8"))
-        if not raw.get("subtitle_model"):
-            raw["subtitle_model"] = raw.get("subtitle_text_model", "")
-        if not raw.get("work_dir"):
-            raw["work_dir"] = raw.get("download_dir", "")
-        # Migrate version 2.0 service fields to model-manager fields.
-        if not raw.get("asr_model_id") and raw.get("qwen_asr_enabled"):
-            raw["asr_model_id"] = (
-                "mlx-community/Qwen3-ASR-0.6B-8bit"
-                if platform.system() == "Darwin"
-                else "Qwen/Qwen3-ASR-0.6B"
-            )
-        if not raw.get("tts_model_id") and raw.get("qwen_tts_enabled"):
-            raw["tts_model_id"] = (
-                "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
-                if platform.system() == "Darwin"
-                else "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-            )
         allowed = {item.name for item in fields(AppConfig)}
         values = {key: value for key, value in raw.items() if key in allowed}
         config = AppConfig(**values)
-        if config.subtitle_languages == LEGACY_SUBTITLE_LANGUAGES:
-            config.subtitle_languages = DEFAULT_SUBTITLE_LANGUAGES
         config.normalize()
         try:
             config.ensure_directories()
         except OSError:
             config.work_dir = str(DEFAULT_WORK_DIR.resolve())
             config.ensure_directories()
-        if source in LEGACY_SETTINGS_FILES and path is None:
-            save_config(config)
         return config
     except (OSError, ValueError, TypeError):
         config.work_dir = str(DEFAULT_WORK_DIR.resolve())

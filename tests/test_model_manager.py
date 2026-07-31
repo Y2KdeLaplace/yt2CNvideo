@@ -193,7 +193,16 @@ class ModelManagerTests(unittest.TestCase):
         )
         self.assertNotIn("--local-dir", runner.command)
         self.assertEqual(runner.command[-2:], ["--include", "model.gguf"])
-        self.assertEqual(runner.environment, {"HF_ENDPOINT": "https://huggingface.co"})
+        self.assertEqual(
+            runner.environment,
+            {
+                "HF_ENDPOINT": "https://huggingface.co",
+                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+                "NO_COLOR": "1",
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
 
     def test_huggingface_download_retries_with_sufy_mirror(self) -> None:
         class RetryRunner(RecordingRunner):
@@ -222,6 +231,77 @@ class ModelManagerTests(unittest.TestCase):
             runner.endpoints,
             ["https://huggingface.co", "https://hf-cdn.sufy.com"],
         )
+
+    def test_unreferenced_huggingface_snapshot_is_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"HF_HUB_CACHE": temp},
+        ):
+            snapshot = (
+                Path(temp)
+                / "models--owner--model"
+                / "snapshots"
+                / "incomplete"
+            )
+            snapshot.mkdir(parents=True)
+            (snapshot / "model.gguf").write_bytes(b"partial")
+
+            actual = resolve_huggingface_model("owner/model")
+
+        self.assertIsNone(actual)
+
+    def test_failed_huggingface_download_removes_incomplete_repository(self) -> None:
+        class FailingRunner(RecordingRunner):
+            def __init__(self, repository: Path) -> None:
+                super().__init__()
+                self.repository = repository
+
+            def run(self, command, **kwargs) -> None:
+                super().run(command, **kwargs)
+                snapshot = self.repository / "snapshots" / "partial"
+                snapshot.mkdir(parents=True, exist_ok=True)
+                (snapshot / "model.gguf").write_bytes(b"partial")
+                raise RuntimeError("download failed")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"HF_HUB_CACHE": temp},
+        ):
+            repository = Path(temp) / "models--owner--model"
+            runner = FailingRunner(repository)
+            with patch(
+                "videodub.model_manager._download_with_hfd",
+                side_effect=RuntimeError("hfd failed"),
+            ), self.assertRaises(RuntimeError):
+                _download_huggingface("owner/model", runner, ("model.gguf",))
+
+            self.assertFalse(repository.exists())
+            self.assertTrue(
+                any("已清理下载失败的模型文件" in line for line in runner.logs)
+            )
+
+    def test_failed_download_preserves_previously_installed_repository(self) -> None:
+        class FailingRunner(RecordingRunner):
+            def run(self, command, **kwargs) -> None:
+                super().run(command, **kwargs)
+                raise RuntimeError("download failed")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"HF_HUB_CACHE": temp},
+        ):
+            installed = create_huggingface_snapshot(
+                Path(temp),
+                "owner/model",
+                "existing.gguf",
+            )
+            with patch(
+                "videodub.model_manager._download_with_hfd",
+                side_effect=RuntimeError("hfd failed"),
+            ), self.assertRaises(RuntimeError):
+                _download_huggingface("owner/model", FailingRunner())
+
+            self.assertTrue(installed.is_dir())
 
     def test_selected_custom_gguf_file_becomes_runtime_model_path(self) -> None:
         runner = RecordingRunner()

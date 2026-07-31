@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import locale
 import os
+import re
 import subprocess
 import threading
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 
 
 LogFn = Callable[[str], None]
+ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
 
 class CancelledError(RuntimeError):
@@ -44,61 +46,6 @@ class ProcessRunner:
     def check_cancelled(self) -> None:
         if self.cancel_event.is_set():
             raise CancelledError("任务已由用户停止")
-
-    def _run_legacy(
-        self,
-        command: Iterable[str | Path],
-        *,
-        cwd: str | Path | None = None,
-        env: dict[str, str] | None = None,
-        input_text: str | None = None,
-        quiet: bool = False,
-    ) -> list[str]:
-        self.check_cancelled()
-        args = [str(part) for part in command]
-        if not quiet:
-            self.logger("$ " + subprocess.list2cmdline(args))
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        process = subprocess.Popen(
-            args,
-            cwd=str(cwd) if cwd else None,
-            stdin=subprocess.PIPE if input_text is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=False,
-            creationflags=creationflags,
-            env={**os.environ, **env} if env is not None else None,
-        )
-        with self._lock:
-            self._process = process
-        lines: list[str] = []
-        try:
-            if input_text is not None and process.stdin:
-                process.stdin.write(input_text.encode("utf-8"))
-                process.stdin.close()
-            assert process.stdout is not None
-            for raw_line in process.stdout:
-                raw_line = raw_line.rstrip()
-                try:
-                    line = raw_line.decode("utf-8")
-                except UnicodeDecodeError:
-                    line = raw_line.decode(
-                        locale.getpreferredencoding(False),
-                        errors="replace",
-                    )
-                lines.append(line)
-                if line and not quiet:
-                    self.logger(line)
-                if self.cancel_event.is_set():
-                    process.terminate()
-                    raise CancelledError("任务已由用户停止")
-            returncode = process.wait()
-        finally:
-            with self._lock:
-                self._process = None
-        if returncode:
-            raise CommandError(args, returncode, "\n".join(lines[-20:]))
-        return lines
 
     def run(
         self,
@@ -139,7 +86,9 @@ class ProcessRunner:
                     locale.getpreferredencoding(False),
                     errors="replace",
                 )
-            lines.append(line)
+            line = ANSI_ESCAPE.sub("", line)
+            if not is_progress:
+                lines.append(line)
             if not line or quiet:
                 return
             now = time.monotonic()
@@ -167,11 +116,11 @@ class ProcessRunner:
                     if not endings:
                         break
                     ending = min(endings)
-                    is_progress = pending[ending : ending + 1] == b"\r"
+                    is_carriage = pending[ending : ending + 1] == b"\r"
+                    is_crlf = is_carriage and pending[ending + 1 : ending + 2] == b"\n"
+                    is_progress = is_carriage and not is_crlf
                     emit(pending[:ending], is_progress)
-                    pending = pending[ending + 1 :]
-                    if is_progress and pending.startswith(b"\n"):
-                        pending = pending[1:]
+                    pending = pending[ending + (2 if is_crlf else 1) :]
                     if self.cancel_event.is_set():
                         process.terminate()
                         raise CancelledError("Task cancelled")

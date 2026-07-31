@@ -10,7 +10,6 @@ dist/
 .tmp-*/
 .tmp-*
 settings.json
-startup-error.log
 .subtitle-evidence/
 *.subtitle-report.json
 *.asr.srt
@@ -21,5 +20,3 @@ startup-error.log
 *.onnx.json
 work/
 output/
-yt-video/
-bl-video/

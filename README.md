@@ -1,6 +1,6 @@
-# YouTube Video Localizer 2.1.2
+# scip 2.1.3
 
-一个基于 Tk 的跨平台 YouTube 视频中文化工具：
+scip 是一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 
 1. 用 yt-dlp 下载视频，优先取视频作者提供的字幕，没有时再取 YouTube 自动字幕。
 2. 用 Qwen3-ASR 从音轨生成一份独立识别字幕。
@@ -26,7 +26,7 @@ ASR 不会被当作 YouTube 字幕缺失时的自动后备。修复步骤同时�
 
 ```bash
 uv sync
-uv run python -m videodub
+uv run scip
 ```
 
 快捷启动：
@@ -40,12 +40,12 @@ uv run python -m videodub
 打开顶部“模型”菜单：
 
 - “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入系统用户配置目录中的 `settings.json`。
-- “语音识别模型”：选择并锁定 ASR 模型；点击“下载”进入独立的下载与卸载窗口。
-- “语音生成模型”：选择并锁定 TTS 模型；点击“下载”进入独立的下载与卸载窗口。
+- “语音识别模型”：选择并锁定 ASR 模型；点击“管理”打开模型管理窗口。
+- “语音生成模型”：选择并锁定 TTS 模型；点击“管理”打开模型管理窗口。
 
-应用直接发现 Hugging Face 与 ModelScope 的标准模型缓存，不在项目目录内复制模型。将鼠标放在已安装模型选项上可查看实际路径。模型运行依赖由 uv 放入自己的缓存和隔离环境，主程序不会创建或维护项目内的模型 venv，也不会被 PyTorch、MLX 或 GGUF 依赖污染。
+模型管理窗口会列出当前已安装的模型；选中表格中的模型后可直接卸载。模型锁定状态会在本次程序运行期间保留，关闭模型窗口后再次打开仍然有效；退出并重新启动程序后会回到待锁定状态。处理页只会调用本次会话中已锁定的模型，未锁定表示模型尚未选择完成。锁定时将鼠标放在模型选项上可查看实际路径。
 
-Qwen 官方模型从 ModelScope 下载且不需要指定单个权重文件；MLX、GGUF 和“其他模型”使用 Hugging Face 官方 `hf download`。下载 GGUF 或其他 Hugging Face 模型时，程序先检查仓库文件：单一 GGUF 自动选择，多个量化版本则由用户选择具体版本；分片 GGUF 会作为一个版本成组下载。下载命令的输出显示在模型窗口的运行日志中。下载尚未结束时关闭窗口会先询问是否停止。两种来源都使用各自的默认缓存，已有模型不会重复下载。Hugging Face 默认缓存通常是 `~/.cache/huggingface/hub`，ModelScope 默认缓存通常是 `~/.cache/modelscope`。
+Qwen 官方模型从 ModelScope 下载且不需要指定单个权重文件；MLX、GGUF 和“其他模型”优先使用 Hugging Face 官方 `hf download`，失败后依次尝试镜像与 hfd。下载 GGUF 或其他 Hugging Face 模型时，程序先检查仓库文件：单一 GGUF 自动选择，多个量化版本则由用户选择具体版本；分片 GGUF 会作为一个版本成组下载。下载过程会在模型窗口的运行日志中持续更新缓存写入进度；下载失败或停止时会清理本次产生的不完整模型目录，避免它被误认为可用模型。下载尚未结束时关闭窗口会先询问是否停止。
 
 在中国大陆网络环境中，下载非 Qwen 官方的 Hugging Face 模型前可设置镜像：
 
@@ -53,14 +53,14 @@ macOS / Linux：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
-uv run python -m videodub
+uv run scip
 ```
 
 Windows PowerShell：
 
 ```powershell
 $env:HF_ENDPOINT = "https://hf-mirror.com"
-uv run python -m videodub
+uv run scip
 ```
 
 请自行确认镜像可信。该变量只影响从当前终端启动的程序。
@@ -97,19 +97,15 @@ Qwen3-TTS CustomVoice 使用内置中文音色 Vivian。Base 模型用于声音�
 
 ## 应用数据位置
 
-项目不再使用 `external`。少量运行设置写入操作系统的用户配置目录：
+运行设置写入操作系统的用户配置目录：
 
 - Windows：`%APPDATA%\YouTube Video Localizer\settings.json`
 - macOS：`~/Library/Application Support/YouTube Video Localizer/settings.json`
 - Linux：`${XDG_CONFIG_HOME:-~/.config}/youtube-video-localizer/settings.json`
 
-CrispASR 属于可以重新下载的 GGUF 运行组件，写入操作系统的用户缓存目录：
+为保留升级前的设置，scip 继续使用上述原配置目录名称，不会在启动时执行一次性迁移。
 
-- Windows：`%LOCALAPPDATA%\YouTube Video Localizer\Cache\runtimes`
-- macOS：`~/Library/Caches/YouTube Video Localizer/runtimes`
-- Linux：`${XDG_CACHE_HOME:-~/.cache}/youtube-video-localizer/runtimes`
-
-2.1.1 不再读取或维护项目内的 `external`；模型可按需从标准缓存重新发现或下载。
+“关于 → 缓存目录”只管理本应用的运行组件与可变应用数据，例如 CrispASR 运行组件。可选择“设置缓存目录”指定位置，程序会将旧的应用缓存完整迁移到新位置；也可选择“打开缓存目录”直接查看。Hugging Face 与 ModelScope 下载的模型保持各自原有的标准缓存位置，便于与其他工具共用，不会被本应用移动或重定向。
 
 ## 工作目录
 
@@ -152,7 +148,7 @@ ASR 不需要先生成 MP3。程序让 ffmpeg 直接把视频音轨解码为临�
 
 ## 更新与版本
 
-顶部“关于 → 版本”显示当前版本；“关于 → 更新”读取本项目 GitHub 最新 Release 并比较版本号。
+顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”读取本项目 GitHub 最新 Release 并比较版本号。
 
 ## 开发验证
 
