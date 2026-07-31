@@ -34,10 +34,10 @@ class ManagedModelService:
         path = self.config.asr_model_path if self.kind == "asr" else self.config.tts_model_path
         backend = self.config.asr_backend if self.kind == "asr" else self.config.tts_backend
         if not path:
-            raise RuntimeError(f"请先在“模型”菜单安装并选择{self.kind.upper()}模型")
+            raise RuntimeError(f"请先在“模型”菜单下载并选择{self.kind.upper()}模型")
         installed = read_installed_model(path)
         if installed is None:
-            raise RuntimeError(f"模型未完整安装或已被移动：{path}")
+            raise RuntimeError(f"模型未完整下载或已被移动：{path}")
         if backend == "gguf":
             return self
         existing = check_qwen_service(self.base_url, self.kind, timeout=1)

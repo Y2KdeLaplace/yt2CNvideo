@@ -32,8 +32,10 @@ from videodub.downloader import (
 from videodub.media import VideoJob, discover_video_jobs
 from videodub.model_manager import (
     InstalledModel,
+    ModelFileOption,
     choice_by_label,
     install_model,
+    list_huggingface_gguf_options,
     list_installed_models,
     model_choices,
     read_installed_model,
@@ -97,6 +99,7 @@ class VideoDubApp(tk.Tk):
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.runner = ProcessRunner(lambda line: self.events.put(("log", line)))
         self.active_runners: list[ProcessRunner] = []
+        self.model_download_runner: ProcessRunner | None = None
         self.runners_lock = threading.Lock()
         self.worker: threading.Thread | None = None
         self.current_task = ""
@@ -584,9 +587,9 @@ class VideoDubApp(tk.Tk):
             ):
                 raise ValueError("请先在“模型 → 语言模型”中完成配置。")
             if stages[0] and not config.asr_model_path:
-                raise ValueError("请先在“模型 → 语音识别模型”中安装并选择模型。")
+                raise ValueError("请先在“模型 → 语音识别模型”中下载并选择模型。")
             if stages[3] and not config.tts_model_path:
-                raise ValueError("请先在“模型 → 语音生成模型”中安装并选择模型。")
+                raise ValueError("请先在“模型 → 语音生成模型”中下载并选择模型。")
             if stages[3]:
                 tts_model = read_installed_model(config.tts_model_path)
                 if tts_model and tts_model.variant == "base":
@@ -799,6 +802,11 @@ class VideoDubApp(tk.Tk):
         selected_model = tk.StringVar()
         installed_map: dict[str, InstalledModel] = {}
         locked = tk.BooleanVar(value=False)
+        download_state: dict[str, object] = {
+            "busy": False,
+            "runner": None,
+            "installer": None,
+        }
         reference_audio = tk.StringVar(
             value=self.config_data.tts_reference_audio
         )
@@ -813,7 +821,7 @@ class VideoDubApp(tk.Tk):
             state="readonly",
         )
         selected_combo.grid(row=0, column=1, sticky="ew", padx=(10, 8))
-        install_open_button = ttk.Button(frame, text="安装")
+        install_open_button = ttk.Button(frame, text="下载")
         install_open_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         lock_button = ttk.Button(frame)
         lock_button.grid(row=0, column=3, sticky="e")
@@ -955,6 +963,8 @@ class VideoDubApp(tk.Tk):
                     "imported": "已迁移",
                 }.get(item.source, item.source)
                 label = f"{item.repo_id}（{source}）"
+                if item.backend == "gguf" and Path(item.path).is_file():
+                    label += f" / {Path(item.path).name}"
                 labels.append(label)
                 installed_map[label] = item
             selected_combo.configure(values=labels)
@@ -1037,9 +1047,10 @@ class VideoDubApp(tk.Tk):
 
         def show_install_dialog() -> None:
             installer = tk.Toplevel(dialog)
-            installer.title(f"{title}安装")
+            installer.title(f"{title}下载")
             installer.transient(dialog)
             installer.grab_set()
+            download_state["installer"] = installer
             install_frame = ttk.Frame(installer, padding=14)
             install_frame.pack(fill="both", expand=True)
             install_choice = tk.StringVar(
@@ -1090,8 +1101,8 @@ class VideoDubApp(tk.Tk):
                 sticky="e",
                 pady=(10, 0),
             )
-            install_button = ttk.Button(actions, text="安装")
-            install_button.pack(side="left")
+            download_button = ttk.Button(actions, text="下载")
+            download_button.pack(side="left")
             uninstall_button = ttk.Button(actions, text="卸载")
             uninstall_button.pack(side="left", padx=(6, 0))
             install_frame.columnconfigure(1, weight=1)
@@ -1102,50 +1113,231 @@ class VideoDubApp(tk.Tk):
                     state="normal" if choice.key == "other" else "disabled"
                 )
 
-            def finish_install(installed: InstalledModel) -> None:
+            def set_download_finished(runner: ProcessRunner) -> None:
+                if download_state.get("runner") is runner:
+                    download_state["busy"] = False
+                    download_state["runner"] = None
+                if self.model_download_runner is runner:
+                    self.model_download_runner = None
+
+            def restore_buttons() -> None:
+                if not installer.winfo_exists():
+                    return
+                download_button.configure(state="normal")
+                uninstall_button.configure(
+                    state=(
+                        "normal"
+                        if selected_installed()
+                        else "disabled"
+                    )
+                )
+
+            def finish_download(
+                installed: InstalledModel,
+                runner: ProcessRunner,
+            ) -> None:
+                set_download_finished(runner)
                 if not dialog.winfo_exists():
                     return
                 reload_installed(installed.path, keep_locked=False)
                 if installer.winfo_exists():
                     installer.destroy()
 
-            def install_selected() -> None:
-                choice = choice_by_label(kind, install_choice.get())
-                install_button.configure(state="disabled")
-                uninstall_button.configure(state="disabled")
+            def fail_download(
+                error: Exception,
+                runner: ProcessRunner,
+            ) -> None:
+                set_download_finished(runner)
+                model_log(f"下载失败：{error}")
+                restore_buttons()
 
+            def run_download(
+                choice,
+                repo_id: str,
+                selected_files: tuple[str, ...],
+                runner: ProcessRunner,
+            ) -> None:
                 def worker() -> None:
                     try:
                         installed = install_model(
                             self.config_data,
                             kind,
                             choice,
-                            custom.get(),
-                            ProcessRunner(model_log),
+                            repo_id if choice.key == "other" else "",
+                            runner,
+                            selected_files,
                         )
-                        self.after(0, lambda: finish_install(installed))
+                        self.after(
+                            0,
+                            lambda: finish_download(installed, runner),
+                        )
                     except Exception as exc:
-                        model_log(f"安装失败：{exc}")
                         self.after(
                             0,
-                            lambda: install_button.configure(state="normal")
-                            if installer.winfo_exists()
-                            else None,
-                        )
-                        self.after(
-                            0,
-                            lambda: uninstall_button.configure(
-                                state=(
-                                    "normal"
-                                    if selected_installed()
-                                    else "disabled"
-                                )
-                            )
-                            if installer.winfo_exists()
-                            else None,
+                            lambda error=exc: fail_download(error, runner),
                         )
 
                 threading.Thread(target=worker, daemon=True).start()
+
+            def show_file_selection(
+                options: tuple[ModelFileOption, ...],
+                on_selected,
+                on_cancel,
+            ) -> None:
+                chooser = tk.Toplevel(installer)
+                chooser.title("选择模型版本")
+                chooser.transient(installer)
+                chooser.grab_set()
+                chooser_frame = ttk.Frame(chooser, padding=14)
+                chooser_frame.pack(fill="both", expand=True)
+                selected_label = tk.StringVar(value=options[0].label)
+                ttk.Label(
+                    chooser_frame,
+                    text="检测到多个 GGUF 版本，请选择要下载的模型：",
+                ).pack(anchor="w")
+                option_map = {item.label: item for item in options}
+                version_combo = ttk.Combobox(
+                    chooser_frame,
+                    textvariable=selected_label,
+                    values=list(option_map),
+                    state="readonly",
+                    width=68,
+                )
+                version_combo.pack(fill="x", pady=(10, 12))
+                chooser_actions = ttk.Frame(chooser_frame)
+                chooser_actions.pack(anchor="e")
+
+                def close_chooser() -> None:
+                    chooser.grab_release()
+                    chooser.destroy()
+                    if installer.winfo_exists():
+                        installer.grab_set()
+
+                def choose() -> None:
+                    option = option_map[selected_label.get()]
+                    close_chooser()
+                    on_selected(option.files)
+
+                def cancel() -> None:
+                    close_chooser()
+                    on_cancel()
+
+                ttk.Button(
+                    chooser_actions,
+                    text="下载",
+                    command=choose,
+                ).pack(side="left")
+                ttk.Button(
+                    chooser_actions,
+                    text="取消",
+                    command=cancel,
+                ).pack(side="left", padx=(6, 0))
+                chooser.protocol("WM_DELETE_WINDOW", cancel)
+                chooser.update_idletasks()
+                self._center_dialog(
+                    chooser,
+                    max(620, chooser.winfo_reqwidth()),
+                    chooser.winfo_reqheight(),
+                )
+
+            def download_selected() -> None:
+                choice = choice_by_label(kind, install_choice.get())
+                repo_id = (
+                    custom.get().strip()
+                    if choice.key == "other"
+                    else choice.repo_id
+                )
+                if not repo_id or "/" not in repo_id:
+                    messagebox.showerror(
+                        "模型名称无效",
+                        "请输入有效的模型名称，例如 owner/model。",
+                        parent=installer,
+                    )
+                    return
+                download_button.configure(state="disabled")
+                uninstall_button.configure(state="disabled")
+                runner = ProcessRunner(model_log)
+                download_state["busy"] = True
+                download_state["runner"] = runner
+                self.model_download_runner = runner
+
+                def begin(selected_files: tuple[str, ...]) -> None:
+                    if not installer.winfo_exists():
+                        runner.cancel()
+                        set_download_finished(runner)
+                        return
+                    run_download(choice, repo_id, selected_files, runner)
+
+                should_check_files = (
+                    choice.source == "huggingface"
+                    and (choice.backend == "gguf" or choice.key == "other")
+                )
+                if not should_check_files:
+                    begin(())
+                    return
+
+                def inspect_worker() -> None:
+                    try:
+                        options = list_huggingface_gguf_options(
+                            repo_id,
+                            runner,
+                        )
+
+                        def handle_options() -> None:
+                            if not installer.winfo_exists():
+                                runner.cancel()
+                                set_download_finished(runner)
+                                return
+                            if not options:
+                                if choice.backend == "gguf":
+                                    fail_download(
+                                        RuntimeError(
+                                            "仓库中没有找到 GGUF 模型文件"
+                                        ),
+                                        runner,
+                                    )
+                                else:
+                                    begin(())
+                                return
+                            if len(options) == 1:
+                                begin(options[0].files)
+                                return
+
+                            def cancel_selection() -> None:
+                                set_download_finished(runner)
+                                restore_buttons()
+
+                            show_file_selection(
+                                options,
+                                begin,
+                                cancel_selection,
+                            )
+
+                        self.after(0, handle_options)
+                    except Exception as exc:
+                        self.after(
+                            0,
+                            lambda error=exc: fail_download(error, runner),
+                        )
+
+                threading.Thread(
+                    target=inspect_worker,
+                    daemon=True,
+                ).start()
+
+            def confirm_close_installer() -> None:
+                if download_state.get("busy"):
+                    if not messagebox.askyesno(
+                        "确认关闭",
+                        "模型正在下载，确定停止下载并关闭窗口吗？",
+                        parent=installer,
+                    ):
+                        return
+                    runner = download_state.get("runner")
+                    if isinstance(runner, ProcessRunner):
+                        runner.cancel()
+                        set_download_finished(runner)
+                installer.destroy()
 
             def uninstall_selected() -> None:
                 installed = selected_installed()
@@ -1157,7 +1349,7 @@ class VideoDubApp(tk.Tk):
                     parent=installer,
                 ):
                     return
-                install_button.configure(state="disabled")
+                download_button.configure(state="disabled")
                 uninstall_button.configure(state="disabled")
 
                 def worker() -> None:
@@ -1178,7 +1370,7 @@ class VideoDubApp(tk.Tk):
                         model_log(f"卸载失败：{exc}")
                         self.after(
                             0,
-                            lambda: install_button.configure(state="normal")
+                            lambda: download_button.configure(state="normal")
                             if installer.winfo_exists()
                             else None,
                         )
@@ -1192,10 +1384,14 @@ class VideoDubApp(tk.Tk):
                 threading.Thread(target=worker, daemon=True).start()
 
             install_combo.bind("<<ComboboxSelected>>", update_custom)
-            install_button.configure(command=install_selected)
+            download_button.configure(command=download_selected)
             uninstall_button.configure(
                 command=uninstall_selected,
                 state="normal" if selected_installed() else "disabled",
+            )
+            installer.protocol(
+                "WM_DELETE_WINDOW",
+                confirm_close_installer,
             )
             update_custom()
             installer.update_idletasks()
@@ -1206,6 +1402,21 @@ class VideoDubApp(tk.Tk):
             )
 
         def close_dialog() -> None:
+            if download_state.get("busy"):
+                if not messagebox.askyesno(
+                    "确认关闭",
+                    "模型正在下载，确定停止下载并关闭窗口吗？",
+                    parent=dialog,
+                ):
+                    return
+                runner = download_state.get("runner")
+                if isinstance(runner, ProcessRunner):
+                    runner.cancel()
+                    if self.model_download_runner is runner:
+                        self.model_download_runner = None
+                installer = download_state.get("installer")
+                if isinstance(installer, tk.Toplevel) and installer.winfo_exists():
+                    installer.destroy()
             save_reference()
             dialog.destroy()
 
@@ -1290,6 +1501,15 @@ class VideoDubApp(tk.Tk):
         self.after(100, self._drain_events)
 
     def _on_close(self) -> None:
+        if self.model_download_runner is not None:
+            if not messagebox.askyesno(
+                "退出",
+                "模型正在下载，确定停止下载并退出吗？",
+                parent=self,
+            ):
+                return
+            self.model_download_runner.cancel()
+            self.model_download_runner = None
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno("退出", "任务仍在运行，停止并退出？", parent=self):
                 return

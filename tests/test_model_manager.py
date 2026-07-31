@@ -1,13 +1,19 @@
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from videodub.config import AppConfig
 from videodub.model_manager import (
+    ModelChoice,
     _download_huggingface,
     _download_modelscope,
+    group_gguf_files,
+    install_model,
     list_installed_models,
+    list_huggingface_gguf_options,
     model_choices,
     resolve_huggingface_model,
     resolve_modelscope_model,
@@ -26,6 +32,9 @@ class RecordingRunner:
     def run(self, command) -> None:
         self.command = [str(item) for item in command]
 
+    def check_cancelled(self) -> None:
+        return
+
 
 def create_huggingface_snapshot(
     root: Path,
@@ -43,6 +52,63 @@ def create_huggingface_snapshot(
 
 
 class ModelManagerTests(unittest.TestCase):
+    def test_gguf_files_are_grouped_by_quantization_and_shards(self) -> None:
+        options = group_gguf_files(
+            [
+                "model-q4_k.gguf",
+                "model-q8_0.gguf",
+                "large-q5_k_m-00002-of-00002.gguf",
+                "large-q5_k_m-00001-of-00002.gguf",
+                "README.md",
+            ]
+        )
+
+        self.assertEqual(len(options), 3)
+        split = next(item for item in options if len(item.files) == 2)
+        self.assertIn("2 个分片", split.label)
+        self.assertEqual(
+            split.files,
+            (
+                "large-q5_k_m-00001-of-00002.gguf",
+                "large-q5_k_m-00002-of-00002.gguf",
+            ),
+        )
+
+    def test_huggingface_file_check_returns_only_gguf_options(self) -> None:
+        class FakeResponse:
+            headers: dict[str, str] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    [
+                        {"type": "file", "path": "README.md"},
+                        {"type": "file", "path": "model-q4_k.gguf"},
+                        {"type": "file", "path": "model-q8_0.gguf"},
+                    ]
+                ).encode("utf-8")
+
+        runner = RecordingRunner()
+        with patch(
+            "videodub.model_manager.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            options = list_huggingface_gguf_options(
+                "owner/model",
+                runner,
+            )
+
+        self.assertEqual(
+            [item.files for item in options],
+            [("model-q4_k.gguf",), ("model-q8_0.gguf",)],
+        )
+        self.assertIn("正在检查 Hugging Face", runner.logs[0])
+
     def test_huggingface_cache_discovers_existing_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ,
@@ -104,6 +170,37 @@ class ModelManagerTests(unittest.TestCase):
         )
         self.assertNotIn("--local-dir", runner.command)
         self.assertEqual(runner.command[-2:], ["--include", "model.gguf"])
+
+    def test_selected_custom_gguf_file_becomes_runtime_model_path(self) -> None:
+        runner = RecordingRunner()
+        choice = ModelChoice(
+            "other",
+            "其他 Hugging Face 模型",
+            "",
+            "hf",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = root / "model-q8_0.gguf"
+            selected.write_text("weights", encoding="utf-8")
+            with (
+                patch("videodub.model_manager._install_runtime"),
+                patch(
+                    "videodub.model_manager._download_choice",
+                    return_value=root,
+                ),
+            ):
+                installed = install_model(
+                    AppConfig(),
+                    "asr",
+                    choice,
+                    "owner/model",
+                    runner,
+                    ("model-q8_0.gguf",),
+                )
+
+        self.assertEqual(installed.backend, "gguf")
+        self.assertEqual(Path(installed.path), selected)
 
     def test_modelscope_cache_discovers_official_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(

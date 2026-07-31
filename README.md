@@ -1,4 +1,4 @@
-# YouTube Video Localizer 2.1.1
+# YouTube Video Localizer 2.1.2
 
 一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 
@@ -35,17 +35,17 @@ uv run python -m videodub
 - macOS：首次执行 `chmod +x 启动程序.command`，之后双击
 - Linux：`bash start.sh`
 
-### 2. 模型安装
+### 2. 模型下载与选择
 
 打开顶部“模型”菜单：
 
 - “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入系统用户配置目录中的 `settings.json`。
-- “语音识别模型”：选择并锁定 ASR 模型；点击“安装”进入独立的安装与卸载窗口。
-- “语音生成模型”：选择并锁定 TTS 模型；点击“安装”进入独立的安装与卸载窗口。
+- “语音识别模型”：选择并锁定 ASR 模型；点击“下载”进入独立的下载与卸载窗口。
+- “语音生成模型”：选择并锁定 TTS 模型；点击“下载”进入独立的下载与卸载窗口。
 
 应用直接发现 Hugging Face 与 ModelScope 的标准模型缓存，不在项目目录内复制模型。将鼠标放在已安装模型选项上可查看实际路径。模型运行依赖由 uv 放入自己的缓存和隔离环境，主程序不会创建或维护项目内的模型 venv，也不会被 PyTorch、MLX 或 GGUF 依赖污染。
 
-Qwen 官方模型从 ModelScope 下载；MLX、GGUF 和“其他模型”使用 Hugging Face 官方 `hf download`。两者都使用各自的默认缓存和标准命令，已有模型不会重复下载。Hugging Face 默认缓存通常是 `~/.cache/huggingface/hub`，ModelScope 默认缓存通常是 `~/.cache/modelscope`。
+Qwen 官方模型从 ModelScope 下载且不需要指定单个权重文件；MLX、GGUF 和“其他模型”使用 Hugging Face 官方 `hf download`。下载 GGUF 或其他 Hugging Face 模型时，程序先检查仓库文件：单一 GGUF 自动选择，多个量化版本则由用户选择具体版本；分片 GGUF 会作为一个版本成组下载。下载命令的输出显示在模型窗口的运行日志中。下载尚未结束时关闭窗口会先询问是否停止。两种来源都使用各自的默认缓存，已有模型不会重复下载。Hugging Face 默认缓存通常是 `~/.cache/huggingface/hub`，ModelScope 默认缓存通常是 `~/.cache/modelscope`。
 
 在中国大陆网络环境中，下载非 Qwen 官方的 Hugging Face 模型前可设置镜像：
 

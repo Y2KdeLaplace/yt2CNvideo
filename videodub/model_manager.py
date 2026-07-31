@@ -3,15 +3,20 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import tarfile
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import __version__
 from .config import AppConfig
 from .platform_utils import user_cache_dir
 from .runner import ProcessRunner
@@ -28,7 +33,12 @@ class ModelChoice:
     repo_id: str
     backend: str
     source: str = "huggingface"
-    include: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelFileOption:
+    label: str
+    files: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -72,10 +82,9 @@ def model_choices(kind: str) -> tuple[ModelChoice, ...]:
             ),
             ModelChoice(
                 "gguf",
-                "Qwen3-ASR 0.6B Q8（GGUF）",
+                "Qwen3-ASR 0.6B（GGUF）",
                 "handy-computer/Qwen3-ASR-0.6B-gguf",
                 "gguf",
-                include=("Qwen3-ASR-0.6B-Q8_0.gguf",),
             ),
             ModelChoice("other", "其他 Hugging Face 模型", "", "hf"),
         )
@@ -112,17 +121,15 @@ def model_choices(kind: str) -> tuple[ModelChoice, ...]:
         ),
         ModelChoice(
             "gguf-base",
-            "Qwen3-TTS 0.6B Base Q8（GGUF）",
+            "Qwen3-TTS 0.6B Base（GGUF）",
             "cstr/qwen3-tts-0.6b-base-GGUF",
             "gguf",
-            include=("qwen3-tts-12hz-0.6b-base-q8_0.gguf",),
         ),
         ModelChoice(
             "gguf-custom",
-            "Qwen3-TTS 0.6B CustomVoice Q8（GGUF）",
+            "Qwen3-TTS 0.6B CustomVoice（GGUF）",
             "cstr/qwen3-tts-0.6b-customvoice-GGUF",
             "gguf",
-            include=("qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",),
         ),
         ModelChoice("other", "其他 Hugging Face 模型", "", "hf"),
     )
@@ -244,6 +251,106 @@ def _variant(repo_id: str) -> str:
     return ""
 
 
+_GGUF_SHARD = re.compile(
+    r"^(?P<base>.+?)-(?P<part>\d{5})-of-(?P<total>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+
+
+def group_gguf_files(files: Iterable[str]) -> tuple[ModelFileOption, ...]:
+    groups: dict[str, list[str]] = {}
+    labels: dict[str, str] = {}
+    for raw in files:
+        filename = str(raw).strip().replace("\\", "/")
+        if not filename.casefold().endswith(".gguf"):
+            continue
+        name = filename.rsplit("/", 1)[-1]
+        match = _GGUF_SHARD.match(name)
+        key = filename.casefold()
+        label = filename
+        if match:
+            prefix = filename[: -len(name)]
+            key = (prefix + match.group("base")).casefold()
+            label = (
+                prefix
+                + match.group("base")
+                + f".gguf（{int(match.group('total'))} 个分片）"
+            )
+        groups.setdefault(key, []).append(filename)
+        labels[key] = label
+    return tuple(
+        ModelFileOption(labels[key], tuple(sorted(values, key=str.casefold)))
+        for key, values in sorted(groups.items(), key=lambda item: item[0])
+    )
+
+
+def list_huggingface_gguf_options(
+    repo_id: str,
+    runner: ProcessRunner,
+) -> tuple[ModelFileOption, ...]:
+    runner.logger(f"正在检查 Hugging Face 模型文件：{repo_id}")
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    safe_repo = urllib.parse.quote(repo_id, safe="/")
+    url = (
+        f"{endpoint}/api/models/{safe_repo}/tree/main"
+        "?recursive=true&expand=false"
+    )
+    headers = {"User-Agent": f"youtube-video-localizer/{__version__}"}
+    token = (
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
+    )
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    files: list[str] = []
+    while url:
+        runner.check_cancelled()
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                link = response.headers.get("Link", "")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"无法读取 Hugging Face 模型文件（HTTP {exc.code}）："
+                f"{detail[:500]}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"无法连接 Hugging Face：{exc.reason}"
+            ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("Hugging Face 返回的模型文件列表无效") from exc
+        if not isinstance(payload, list):
+            raise RuntimeError("Hugging Face 返回的模型文件列表无效")
+        for item in payload:
+            if isinstance(item, dict) and item.get("type") == "file":
+                path = str(item.get("path") or "")
+                if path.casefold().endswith(".gguf"):
+                    files.append(path)
+        url = ""
+        for part in link.split(","):
+            if 'rel="next"' not in part:
+                continue
+            start = part.find("<")
+            end = part.find(">", start + 1)
+            if start >= 0 and end > start:
+                candidate = urllib.parse.urljoin(
+                    endpoint + "/",
+                    part[start + 1 : end],
+                )
+                expected = urllib.parse.urlsplit(endpoint)
+                actual = urllib.parse.urlsplit(candidate)
+                if (
+                    actual.scheme == expected.scheme
+                    and actual.netloc == expected.netloc
+                ):
+                    url = candidate
+                break
+    return group_gguf_files(files)
+
+
 def _resolve_choice(choice: ModelChoice) -> Path | None:
     if choice.source == "modelscope":
         return (
@@ -276,7 +383,7 @@ def _installed_from_choice(
     kind: str,
     choice: ModelChoice,
 ) -> InstalledModel | None:
-    if not choice.repo_id:
+    if not choice.repo_id or choice.backend == "gguf":
         return None
     source = choice.source
     path = _resolve_choice(choice)
@@ -287,10 +394,6 @@ def _installed_from_choice(
         and resolve_modelscope_model(choice.repo_id) is None
     ):
         source = "huggingface"
-    if choice.include and not any(
-        list(path.rglob(pattern)) for pattern in choice.include
-    ):
-        return None
     codec_path, aligner_path = _companion_paths(kind, choice.backend)
     return InstalledModel(
         kind,
@@ -319,26 +422,49 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
         path = resolve_huggingface_model(repo_id)
         if path is None:
             continue
+        gguf_files = [
+            item
+            for item in path.rglob("*")
+            if item.is_file() and item.suffix.casefold() == ".gguf"
+        ]
         backend = (
             "mlx"
             if owner.casefold() == "mlx-community"
             else "gguf"
-            if "gguf" in repo_id.casefold()
+            if gguf_files
             else "hf"
         )
         codec_path, aligner_path = _companion_paths(kind, backend)
-        result.append(
-            InstalledModel(
-                kind,
-                backend,
-                repo_id,
-                str(path),
-                codec_path,
-                aligner_path,
-                "huggingface",
-                _variant(repo_id),
+        if backend == "gguf":
+            relative_files = [
+                item.relative_to(path).as_posix() for item in gguf_files
+            ]
+            for option in group_gguf_files(relative_files):
+                result.append(
+                    InstalledModel(
+                        kind,
+                        backend,
+                        repo_id,
+                        str((path / option.files[0]).resolve()),
+                        codec_path,
+                        aligner_path,
+                        "huggingface",
+                        _variant(repo_id),
+                    )
+                )
+        else:
+            result.append(
+                InstalledModel(
+                    kind,
+                    backend,
+                    repo_id,
+                    str(path),
+                    codec_path,
+                    aligner_path,
+                    "huggingface",
+                    _variant(repo_id),
+                )
             )
-        )
     return result
 
 
@@ -478,16 +604,17 @@ def _download_choice(
     choice: ModelChoice,
     repo_id: str,
     runner: ProcessRunner,
+    selected_files: tuple[str, ...] = (),
 ) -> Path:
     if choice.source == "modelscope" and choice.key != "other":
         return _download_modelscope(repo_id, runner)
-    return _download_huggingface(repo_id, runner, choice.include)
+    return _download_huggingface(repo_id, runner, selected_files)
 
 
 def _download_file(url: str, target: Path, runner: ProcessRunner) -> None:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "youtube-video-localizer/2.1.1"},
+        headers={"User-Agent": f"youtube-video-localizer/{__version__}"},
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(request, timeout=60) as response, target.open(
@@ -522,7 +649,7 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
     api = f"https://api.github.com/repos/{CRISPASR_REPOSITORY}/releases/latest"
     request = urllib.request.Request(
         api,
-        headers={"User-Agent": "youtube-video-localizer/2.1.1"},
+        headers={"User-Agent": f"youtube-video-localizer/{__version__}"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         release = json.loads(response.read().decode("utf-8"))
@@ -593,15 +720,36 @@ def install_model(
     choice: ModelChoice,
     custom_repo: str,
     runner: ProcessRunner,
+    selected_files: tuple[str, ...] = (),
 ) -> InstalledModel:
     repo_id = custom_repo.strip() if choice.key == "other" else choice.repo_id
     if not repo_id or "/" not in repo_id:
         raise ValueError("请输入有效的模型名称，例如 owner/model")
-    _install_runtime(kind, choice.backend, runner)
-    target = _download_choice(choice, repo_id, runner)
+    if choice.backend == "gguf" and not selected_files:
+        raise ValueError("请选择要下载的 GGUF 模型版本")
+    backend = "gguf" if selected_files else choice.backend
+    _install_runtime(kind, backend, runner)
+    target = _download_choice(
+        choice,
+        repo_id,
+        runner,
+        selected_files,
+    )
+    model_path = target
+    if backend == "gguf":
+        candidates = [
+            target / relative
+            for relative in selected_files
+            if (target / relative).is_file()
+        ]
+        if not candidates:
+            candidates = sorted(target.rglob("*.gguf"))
+        if not candidates:
+            raise RuntimeError("GGUF 模型下载后未找到 .gguf 文件")
+        model_path = sorted(candidates)[0]
     codec_path = ""
     aligner_path = ""
-    if kind == "asr" and choice.backend == "hf":
+    if kind == "asr" and backend == "hf":
         aligner_choice = ModelChoice(
             "aligner",
             "",
@@ -612,7 +760,7 @@ def install_model(
         aligner_path = str(
             _download_choice(aligner_choice, aligner_choice.repo_id, runner)
         )
-    if kind == "tts" and choice.backend == "gguf":
+    if kind == "tts" and backend == "gguf":
         codec = _download_huggingface(
             "cstr/qwen3-tts-tokenizer-12hz-GGUF",
             runner,
@@ -624,15 +772,15 @@ def install_model(
         codec_path = str(codec_files[0])
     installed = InstalledModel(
         kind,
-        choice.backend,
+        backend,
         repo_id,
-        str(target),
+        str(model_path),
         codec_path,
         aligner_path,
         choice.source,
         _variant(repo_id),
     )
-    runner.logger(f"模型安装完成：{target}")
+    runner.logger(f"模型下载完成：{model_path}")
     return installed
 
 
