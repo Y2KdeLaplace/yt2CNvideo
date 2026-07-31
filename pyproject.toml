@@ -4,18 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "youtube-video-localizer"
-version = "2.1.0"
+version = "2.1.1"
 description = "Download YouTube videos, repair and translate subtitles, and create Chinese-dubbed videos."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=45,<47",
-    "edge-tts>=7.2,<8",
-]
-
-[project.optional-dependencies]
-offline-tts = [
-    "piper-tts>=1.4,<2",
 ]
 
 [project.scripts]

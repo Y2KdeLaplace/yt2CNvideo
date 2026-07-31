@@ -85,9 +85,12 @@ class ToolTip:
 class VideoDubApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        # Keep the initial top-left placement hidden until the final geometry
+        # is known, especially on macOS where Tk may paint before construction.
+        self.withdraw()
         self.title("YouTube 视频中文化工具")
-        self.geometry("1080x820")
-        self.minsize(900, 700)
+        self.geometry("1080x738")
+        self.minsize(900, 630)
         self.config_data = load_config()
         migrate_legacy_layout(self.config_data.work_dir)
         self.config_data.ensure_directories()
@@ -115,6 +118,8 @@ class VideoDubApp(tk.Tk):
         self._configure_style()
         self._set_icon()
         self._build_ui()
+        self._center_main_window()
+        self.deiconify()
         self.after(100, self._drain_events)
         self.after(180, self._check_tools)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -127,6 +132,8 @@ class VideoDubApp(tk.Tk):
         style.configure("TLabelframe.Label", font=(self.ui_font, 11, "bold"))
         style.configure("TButton", font=(self.ui_font, 11), padding=(6, 2))
         style.configure("Toolbutton.TButton", font=(self.ui_font, 11), padding=(5, 2))
+        style.configure("Main.TButton", font=(self.ui_font, 10), padding=(5, 1))
+        style.configure("Main.TMenubutton", font=(self.ui_font, 10), padding=(5, 1))
         style.configure("Stage.TCheckbutton", font=(self.ui_font, 11))
         style.configure("Treeview", rowheight=27)
         style.configure("Treeview.Heading", font=(self.ui_font, 10, "bold"))
@@ -151,6 +158,14 @@ class VideoDubApp(tk.Tk):
         y = max(0, (dialog.winfo_screenheight() - height) // 2)
         dialog.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _center_main_window(self) -> None:
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
@@ -161,32 +176,53 @@ class VideoDubApp(tk.Tk):
         ttk.Entry(header, textvariable=self.work_dir, state="readonly").pack(
             side="left", fill="x", expand=True, padx=(9, 7)
         )
-        ttk.Button(header, text="选择", command=self._browse_work_folder).pack(side="left")
-        ttk.Button(header, text="打开", command=self._open_work_folder).pack(
+        ttk.Button(
+            header,
+            text="选择",
+            command=self._browse_work_folder,
+            style="Main.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            header,
+            text="打开",
+            command=self._open_work_folder,
+            style="Main.TButton",
+        ).pack(
             side="left", padx=(6, 12)
         )
         model_menu = tk.Menu(self, tearoff=False)
         model_menu.add_command(label="语言模型", command=self._show_language_model)
         model_menu.add_command(label="语音识别模型", command=lambda: self._show_model_dialog("asr"))
         model_menu.add_command(label="语音生成模型", command=lambda: self._show_model_dialog("tts"))
-        ttk.Menubutton(header, text="模型", menu=model_menu).pack(side="left")
+        ttk.Menubutton(
+            header,
+            text="模型",
+            menu=model_menu,
+            style="Main.TMenubutton",
+        ).pack(side="left")
         about_menu = tk.Menu(self, tearoff=False)
         about_menu.add_command(label="更新", command=self._check_update)
         about_menu.add_command(label="版本", command=self._show_version)
-        ttk.Menubutton(header, text="关于", menu=about_menu).pack(side="left", padx=(6, 0))
+        ttk.Menubutton(
+            header,
+            text="关于",
+            menu=about_menu,
+            style="Main.TMenubutton",
+        ).pack(side="left", padx=(6, 0))
 
         self.notebook = ttk.Notebook(outer)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook.pack(fill="x")
         self.download_tab = ttk.Frame(self.notebook, padding=12)
         self.process_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.download_tab, text="视频下载")
         self.notebook.add(self.process_tab, text="处理")
-        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._refresh_jobs())
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._build_download_tab()
         self._build_process_tab()
+        self.after_idle(self._resize_notebook_to_current_tab)
 
         log_box = ttk.LabelFrame(outer, text="运行日志", padding=7)
-        log_box.pack(fill="both", pady=(10, 0))
+        log_box.pack(fill="both", expand=True, pady=(10, 0))
         self.log = tk.Text(
             log_box,
             height=8,
@@ -201,6 +237,21 @@ class VideoDubApp(tk.Tk):
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+    def _on_tab_changed(self, _event: object = None) -> None:
+        self._refresh_jobs()
+        self.after_idle(self._resize_notebook_to_current_tab)
+        # Do not leave the first control (the Refresh button on macOS) as the
+        # key-window default when entering the processing page.
+        self.after_idle(self.focus_set)
+
+    def _resize_notebook_to_current_tab(self) -> None:
+        selected = self.notebook.select()
+        if not selected:
+            return
+        tab = self.nametowidget(selected)
+        tab.update_idletasks()
+        self.notebook.configure(height=tab.winfo_reqheight())
 
     def _build_download_tab(self) -> None:
         link_box = ttk.LabelFrame(self.download_tab, text="链接", padding=10)
@@ -234,13 +285,24 @@ class VideoDubApp(tk.Tk):
         settings.columnconfigure(3, weight=1)
         controls = ttk.Frame(self.download_tab)
         controls.pack(fill="x", pady=(10, 0))
-        self.download_button = ttk.Button(controls, text="下载", command=self._start_download)
+        self.download_button = ttk.Button(
+            controls,
+            text="下载",
+            command=self._start_download,
+            style="Main.TButton",
+        )
         self.download_button.pack(side="right")
 
     def _build_process_tab(self) -> None:
         selection = ttk.LabelFrame(self.process_tab, text="选择视频", padding=8)
         selection.pack(fill="x")
-        ttk.Button(selection, text="刷新", command=self._refresh_jobs).pack(
+        ttk.Button(
+            selection,
+            text="刷新",
+            command=self._refresh_jobs,
+            style="Main.TButton",
+            takefocus=False,
+        ).pack(
             anchor="e", pady=(0, 5)
         )
         columns = ("video", "downloaded", "asr", "corrected", "chinese")
@@ -297,7 +359,12 @@ class VideoDubApp(tk.Tk):
             justify="center",
         )
         self.parallel_entry.pack(side="left")
-        self.process_button = ttk.Button(controls, text="运行", command=self._start_processing)
+        self.process_button = ttk.Button(
+            controls,
+            text="运行",
+            command=self._start_processing,
+            style="Main.TButton",
+        )
         self.process_button.pack(side="right")
         self._refresh_jobs()
 
@@ -518,6 +585,18 @@ class VideoDubApp(tk.Tk):
                 raise ValueError("请先在“模型 → 语言模型”中完成配置。")
             if stages[0] and not config.asr_model_path:
                 raise ValueError("请先在“模型 → 语音识别模型”中安装并选择模型。")
+            if stages[3] and not config.tts_model_path:
+                raise ValueError("请先在“模型 → 语音生成模型”中安装并选择模型。")
+            if stages[3]:
+                tts_model = read_installed_model(config.tts_model_path)
+                if tts_model and tts_model.variant == "base":
+                    if (
+                        not Path(config.tts_reference_audio).is_file()
+                        or not config.tts_reference_text.strip()
+                    ):
+                        raise ValueError(
+                            "当前 Base TTS 模型需要参考音频 WAV 和对应文本。"
+                        )
             parallel = 1
             if self.parallel_enabled.get():
                 raw_parallel = self.parallel_count.get().strip()
@@ -623,17 +702,15 @@ class VideoDubApp(tk.Tk):
                         or api_key_from_runtime(config=config),
                     ).process_job(job, repair=repair, translate=translate)
                 if dubbing:
-                    tts_url = ""
-                    if config.tts_provider == "qwen":
-                        tts_service = stack.enter_context(
-                            ManagedModelService(
-                                config,
-                                runner,
-                                "tts",
-                                port=12001 + slot * 2,
-                            )
+                    tts_service = stack.enter_context(
+                        ManagedModelService(
+                            config,
+                            runner,
+                            "tts",
+                            port=12001 + slot * 2,
                         )
-                        tts_url = tts_service.base_url
+                    )
+                    tts_url = tts_service.base_url
                     speech = SpeechSubtitleWorkflow(
                         config,
                         runner,
@@ -704,7 +781,12 @@ class VideoDubApp(tk.Tk):
         buttons = ttk.Frame(frame)
         buttons.grid(row=4, column=0, columnspan=2, sticky="e")
         ttk.Button(buttons, text="保存", command=commit).pack(side="left")
-        self._center_dialog(dialog, 620, 250)
+        dialog.update_idletasks()
+        self._center_dialog(
+            dialog,
+            dialog.winfo_reqwidth(),
+            dialog.winfo_reqheight(),
+        )
 
     def _show_model_dialog(self, kind: str) -> None:
         title = "语音识别模型" if kind == "asr" else "语音生成模型"
@@ -715,10 +797,14 @@ class VideoDubApp(tk.Tk):
         frame.pack(fill="both", expand=True)
         choices = model_choices(kind)
         selected_model = tk.StringVar()
-        install_choice = tk.StringVar(value=choices[0].label if choices else "")
-        custom = tk.StringVar()
         installed_map: dict[str, InstalledModel] = {}
         locked = tk.BooleanVar(value=False)
+        reference_audio = tk.StringVar(
+            value=self.config_data.tts_reference_audio
+        )
+        reference_text = tk.StringVar(
+            value=self.config_data.tts_reference_text
+        )
 
         ttk.Label(frame, text="模型选择").grid(row=0, column=0, sticky="w")
         selected_combo = ttk.Combobox(
@@ -727,8 +813,10 @@ class VideoDubApp(tk.Tk):
             state="readonly",
         )
         selected_combo.grid(row=0, column=1, sticky="ew", padx=(10, 8))
+        install_open_button = ttk.Button(frame, text="安装")
+        install_open_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         lock_button = ttk.Button(frame)
-        lock_button.grid(row=0, column=2, sticky="e")
+        lock_button.grid(row=0, column=3, sticky="e")
         ToolTip(
             selected_combo,
             lambda: installed_map.get(selected_model.get()).path
@@ -736,40 +824,52 @@ class VideoDubApp(tk.Tk):
             else "",
         )
 
-        ttk.Label(frame, text="模型安装").grid(
+        reference_frame = ttk.Frame(frame)
+        reference_frame.grid(
+            row=1,
+            column=0,
+            columnspan=4,
+            sticky="ew",
+            pady=(10, 0),
+        )
+        ttk.Label(reference_frame, text="参考音频 WAV").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        reference_entry = ttk.Entry(
+            reference_frame,
+            textvariable=reference_audio,
+            state="readonly",
+        )
+        reference_entry.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(10, 8),
+        )
+        reference_browse = ttk.Button(reference_frame, text="选择")
+        reference_browse.grid(row=0, column=2, sticky="e")
+        ttk.Label(reference_frame, text="对应文本").grid(
             row=1,
             column=0,
             sticky="w",
-            pady=(12, 0),
+            pady=(8, 0),
         )
-        install_combo = ttk.Combobox(
-            frame,
-            textvariable=install_choice,
-            values=[item.label for item in choices],
-            state="readonly",
+        reference_text_entry = ttk.Entry(
+            reference_frame,
+            textvariable=reference_text,
         )
-        install_combo.grid(
+        reference_text_entry.grid(
             row=1,
             column=1,
             columnspan=2,
             sticky="ew",
             padx=(10, 0),
-            pady=(12, 0),
-        )
-        custom_entry = ttk.Entry(frame, textvariable=custom, state="disabled")
-        custom_entry.grid(
-            row=2,
-            column=1,
-            sticky="ew",
-            padx=(10, 8),
             pady=(8, 0),
         )
-        install_actions = ttk.Frame(frame)
-        install_actions.grid(row=2, column=2, sticky="e", pady=(8, 0))
-        install_button = ttk.Button(install_actions, text="安装")
-        install_button.pack(side="left")
-        uninstall_button = ttk.Button(install_actions, text="卸载")
-        uninstall_button.pack(side="left", padx=(6, 0))
+        reference_frame.columnconfigure(1, weight=1)
+        reference_frame.grid_remove()
 
         log = tk.Text(
             frame,
@@ -780,9 +880,9 @@ class VideoDubApp(tk.Tk):
             background="#111827",
             foreground="#e5e7eb",
         )
-        log.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        log.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(12, 0))
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(2, weight=1)
 
         def current_path() -> str:
             return (
@@ -791,8 +891,47 @@ class VideoDubApp(tk.Tk):
                 else self.config_data.tts_model_path
             )
 
+        def selected_installed() -> InstalledModel | None:
+            return installed_map.get(selected_model.get())
+
+        def apply_installed(installed: InstalledModel) -> None:
+            if kind == "asr":
+                self.config_data.asr_backend = installed.backend
+                self.config_data.asr_model_id = installed.repo_id
+                self.config_data.asr_model_path = installed.path
+            else:
+                self.config_data.tts_backend = installed.backend
+                self.config_data.tts_model_id = installed.repo_id
+                self.config_data.tts_model_path = installed.path
+                self.config_data.tts_codec_path = installed.codec_path
+            self._persist_config()
+
+        def save_reference() -> None:
+            if kind != "tts":
+                return
+            self.config_data.tts_reference_audio = (
+                reference_audio.get().strip()
+            )
+            self.config_data.tts_reference_text = (
+                reference_text.get().strip()
+            )
+            self._persist_config()
+
+        def refresh_reference_state() -> None:
+            installed = selected_installed()
+            show = (
+                kind == "tts"
+                and locked.get()
+                and installed is not None
+                and installed.variant == "base"
+            )
+            if show:
+                reference_frame.grid()
+            else:
+                reference_frame.grid_remove()
+
         def refresh_lock_state() -> None:
-            has_selection = selected_model.get() in installed_map
+            has_selection = selected_installed() is not None
             selected_combo.configure(
                 state="disabled" if locked.get() else "readonly"
             )
@@ -800,9 +939,7 @@ class VideoDubApp(tk.Tk):
                 text="解锁选择" if locked.get() else "锁定选择",
                 state="normal" if has_selection else "disabled",
             )
-            uninstall_button.configure(
-                state="normal" if has_selection else "disabled"
-            )
+            refresh_reference_state()
 
         def reload_installed(
             prefer_path: str = "",
@@ -812,18 +949,35 @@ class VideoDubApp(tk.Tk):
             installed_map.clear()
             labels: list[str] = []
             for item in list_installed_models(kind):
-                label = f"{item.repo_id}（已安装）"
+                source = {
+                    "modelscope": "ModelScope",
+                    "huggingface": "Hugging Face",
+                    "imported": "已迁移",
+                }.get(item.source, item.source)
+                label = f"{item.repo_id}（{source}）"
                 labels.append(label)
                 installed_map[label] = item
             selected_combo.configure(values=labels)
             target = prefer_path or current_path()
+            target_id = (
+                self.config_data.asr_model_id
+                if kind == "asr"
+                else self.config_data.tts_model_id
+            )
             matched = ""
             for label, item in installed_map.items():
                 if Path(item.path) == Path(target):
                     matched = label
                     break
+            if not matched and target_id:
+                for label, item in installed_map.items():
+                    if item.repo_id == target_id:
+                        matched = label
+                        break
             selected_model.set(matched or (labels[0] if labels else ""))
             locked.set(bool(matched) if keep_locked else False)
+            if matched and keep_locked:
+                apply_installed(installed_map[matched])
             refresh_lock_state()
 
         def model_log(text: str) -> None:
@@ -837,13 +991,6 @@ class VideoDubApp(tk.Tk):
 
             self.after(0, write)
 
-        def update_custom(_event: object = None) -> None:
-            choice = choice_by_label(kind, install_choice.get())
-            custom_entry.configure(
-                state="normal" if choice.key == "other" else "disabled"
-            )
-
-        install_combo.bind("<<ComboboxSelected>>", update_custom)
         selected_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event: refresh_lock_state(),
@@ -851,80 +998,225 @@ class VideoDubApp(tk.Tk):
 
         def toggle_lock() -> None:
             if locked.get():
+                save_reference()
                 locked.set(False)
                 refresh_lock_state()
                 return
-            installed = installed_map.get(selected_model.get())
+            installed = selected_installed()
             if not installed:
                 return
-            if kind == "asr":
-                self.config_data.asr_backend = installed.backend
-                self.config_data.asr_model_id = installed.repo_id
-                self.config_data.asr_model_path = installed.path
-            else:
-                self.config_data.tts_backend = installed.backend
-                self.config_data.tts_model_id = installed.repo_id
-                self.config_data.tts_model_path = installed.path
-                self.config_data.tts_codec_path = installed.codec_path
-                self.config_data.tts_provider = "qwen"
-            self._persist_config()
+            apply_installed(installed)
             locked.set(True)
             refresh_lock_state()
 
-        def install_selected() -> None:
-            choice = choice_by_label(kind, install_choice.get())
-            install_button.configure(state="disabled")
+        def clear_uninstalled(installed: InstalledModel) -> None:
+            if kind == "asr" and Path(
+                self.config_data.asr_model_path
+            ) == Path(installed.path):
+                self.config_data.asr_backend = ""
+                self.config_data.asr_model_id = ""
+                self.config_data.asr_model_path = ""
+            elif kind == "tts" and Path(
+                self.config_data.tts_model_path
+            ) == Path(installed.path):
+                self.config_data.tts_backend = ""
+                self.config_data.tts_model_id = ""
+                self.config_data.tts_model_path = ""
+                self.config_data.tts_codec_path = ""
+            self._persist_config()
 
-            def worker() -> None:
-                local_runner = ProcessRunner(model_log)
-                try:
-                    installed = install_model(self.config_data, kind, choice, custom.get(), local_runner)
-                    self.after(
-                        0,
-                        lambda: reload_installed(
-                            installed.path,
-                            keep_locked=False,
-                        ),
-                    )
-                except Exception as exc:
-                    model_log(f"安装失败：{exc}")
-                finally:
-                    self.after(
-                        0,
-                        lambda: install_button.configure(state="normal")
-                        if dialog.winfo_exists()
-                        else None,
-                    )
+        def browse_reference() -> None:
+            selected = filedialog.askopenfilename(
+                parent=dialog,
+                title="选择参考音频",
+                filetypes=(("WAV 音频", "*.wav"), ("所有文件", "*.*")),
+            )
+            if selected:
+                reference_audio.set(selected)
+                save_reference()
 
-            threading.Thread(target=worker, daemon=True).start()
+        def show_install_dialog() -> None:
+            installer = tk.Toplevel(dialog)
+            installer.title(f"{title}安装")
+            installer.transient(dialog)
+            installer.grab_set()
+            install_frame = ttk.Frame(installer, padding=14)
+            install_frame.pack(fill="both", expand=True)
+            install_choice = tk.StringVar(
+                value=choices[0].label if choices else ""
+            )
+            custom = tk.StringVar()
 
-        def uninstall_selected() -> None:
-            installed = installed_map.get(selected_model.get())
-            if not installed:
-                return
-            if not messagebox.askyesno("确认卸载", f"删除模型 {installed.repo_id}？", parent=dialog):
-                return
-            try:
-                uninstall_model(installed, ProcessRunner(model_log))
-                if kind == "asr" and Path(self.config_data.asr_model_path) == Path(installed.path):
-                    self.config_data.asr_backend = ""
-                    self.config_data.asr_model_id = ""
-                    self.config_data.asr_model_path = ""
-                elif kind == "tts" and Path(self.config_data.tts_model_path) == Path(installed.path):
-                    self.config_data.tts_backend = ""
-                    self.config_data.tts_model_id = ""
-                    self.config_data.tts_model_path = ""
-                    self.config_data.tts_codec_path = ""
-                    self.config_data.tts_provider = "edge"
-                self._persist_config()
-                reload_installed()
-            except Exception as exc:
-                messagebox.showerror("卸载失败", str(exc), parent=dialog)
+            ttk.Label(install_frame, text="模型").grid(
+                row=0,
+                column=0,
+                sticky="w",
+            )
+            install_combo = ttk.Combobox(
+                install_frame,
+                textvariable=install_choice,
+                values=[item.label for item in choices],
+                state="readonly",
+            )
+            install_combo.grid(
+                row=0,
+                column=1,
+                sticky="ew",
+                padx=(10, 0),
+            )
+            ttk.Label(install_frame, text="模型名称").grid(
+                row=1,
+                column=0,
+                sticky="w",
+                pady=(8, 0),
+            )
+            custom_entry = ttk.Entry(
+                install_frame,
+                textvariable=custom,
+                state="disabled",
+            )
+            custom_entry.grid(
+                row=1,
+                column=1,
+                sticky="ew",
+                padx=(10, 0),
+                pady=(8, 0),
+            )
+            actions = ttk.Frame(install_frame)
+            actions.grid(
+                row=2,
+                column=0,
+                columnspan=2,
+                sticky="e",
+                pady=(10, 0),
+            )
+            install_button = ttk.Button(actions, text="安装")
+            install_button.pack(side="left")
+            uninstall_button = ttk.Button(actions, text="卸载")
+            uninstall_button.pack(side="left", padx=(6, 0))
+            install_frame.columnconfigure(1, weight=1)
 
+            def update_custom(_event: object = None) -> None:
+                choice = choice_by_label(kind, install_choice.get())
+                custom_entry.configure(
+                    state="normal" if choice.key == "other" else "disabled"
+                )
+
+            def finish_install(installed: InstalledModel) -> None:
+                if not dialog.winfo_exists():
+                    return
+                reload_installed(installed.path, keep_locked=False)
+                if installer.winfo_exists():
+                    installer.destroy()
+
+            def install_selected() -> None:
+                choice = choice_by_label(kind, install_choice.get())
+                install_button.configure(state="disabled")
+                uninstall_button.configure(state="disabled")
+
+                def worker() -> None:
+                    try:
+                        installed = install_model(
+                            self.config_data,
+                            kind,
+                            choice,
+                            custom.get(),
+                            ProcessRunner(model_log),
+                        )
+                        self.after(0, lambda: finish_install(installed))
+                    except Exception as exc:
+                        model_log(f"安装失败：{exc}")
+                        self.after(
+                            0,
+                            lambda: install_button.configure(state="normal")
+                            if installer.winfo_exists()
+                            else None,
+                        )
+                        self.after(
+                            0,
+                            lambda: uninstall_button.configure(
+                                state=(
+                                    "normal"
+                                    if selected_installed()
+                                    else "disabled"
+                                )
+                            )
+                            if installer.winfo_exists()
+                            else None,
+                        )
+
+                threading.Thread(target=worker, daemon=True).start()
+
+            def uninstall_selected() -> None:
+                installed = selected_installed()
+                if not installed:
+                    return
+                if not messagebox.askyesno(
+                    "确认卸载",
+                    f"删除模型 {installed.repo_id}？",
+                    parent=installer,
+                ):
+                    return
+                install_button.configure(state="disabled")
+                uninstall_button.configure(state="disabled")
+
+                def worker() -> None:
+                    try:
+                        uninstall_model(
+                            installed,
+                            ProcessRunner(model_log),
+                        )
+
+                        def finish() -> None:
+                            clear_uninstalled(installed)
+                            reload_installed()
+                            if installer.winfo_exists():
+                                installer.destroy()
+
+                        self.after(0, finish)
+                    except Exception as exc:
+                        model_log(f"卸载失败：{exc}")
+                        self.after(
+                            0,
+                            lambda: install_button.configure(state="normal")
+                            if installer.winfo_exists()
+                            else None,
+                        )
+                        self.after(
+                            0,
+                            lambda: uninstall_button.configure(state="normal")
+                            if installer.winfo_exists()
+                            else None,
+                        )
+
+                threading.Thread(target=worker, daemon=True).start()
+
+            install_combo.bind("<<ComboboxSelected>>", update_custom)
+            install_button.configure(command=install_selected)
+            uninstall_button.configure(
+                command=uninstall_selected,
+                state="normal" if selected_installed() else "disabled",
+            )
+            update_custom()
+            installer.update_idletasks()
+            self._center_dialog(
+                installer,
+                max(560, installer.winfo_reqwidth()),
+                installer.winfo_reqheight(),
+            )
+
+        def close_dialog() -> None:
+            save_reference()
+            dialog.destroy()
+
+        reference_browse.configure(command=browse_reference)
+        reference_text_entry.bind(
+            "<FocusOut>",
+            lambda _event: save_reference(),
+        )
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
         lock_button.configure(command=toggle_lock)
-        install_button.configure(command=install_selected)
-        uninstall_button.configure(command=uninstall_selected)
-        update_custom()
+        install_open_button.configure(command=show_install_dialog)
         reload_installed()
         self._center_dialog(dialog, 780, 510)
 

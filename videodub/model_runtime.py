@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .config import AppConfig
-from .model_manager import env_python, read_installed_model
+from .model_manager import read_installed_model, uv_runtime_prefix
 from .qwen_speech import check_qwen_service
 from .runner import ProcessRunner
 
@@ -45,11 +45,9 @@ class ManagedModelService:
             raise RuntimeError(
                 f"端口 {self.port} 已有 {self.kind.upper()} 服务运行，请先关闭后重试"
             )
-        python = env_python(backend, self.kind)
-        if not python.is_file():
-            raise RuntimeError(f"模型运行环境不存在：{python}")
         command = [
-            str(python),
+            *uv_runtime_prefix(self.kind, backend),
+            "python",
             "-m",
             "videodub.qwen_service",
             self.kind,
@@ -65,6 +63,10 @@ class ManagedModelService:
         if self.kind == "tts":
             command.extend(
                 [
+                    "--variant",
+                    installed.variant or "custom_voice",
+                    "--speaker",
+                    self.config.tts_speaker,
                     "--reference-audio",
                     self.config.tts_reference_audio,
                     "--reference-text",

@@ -7,6 +7,35 @@ import sys
 from pathlib import Path
 
 
+APP_DIRECTORY_NAME = "YouTube Video Localizer"
+
+
+def user_config_dir() -> Path:
+    if os.name == "nt":
+        root = Path(
+            os.environ.get("APPDATA")
+            or Path.home() / "AppData" / "Roaming"
+        )
+        return root / APP_DIRECTORY_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_DIRECTORY_NAME
+    root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "youtube-video-localizer"
+
+
+def user_cache_dir() -> Path:
+    if os.name == "nt":
+        root = Path(
+            os.environ.get("LOCALAPPDATA")
+            or Path.home() / "AppData" / "Local"
+        )
+        return root / APP_DIRECTORY_NAME / "Cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / APP_DIRECTORY_NAME
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return root / "youtube-video-localizer"
+
+
 def _tool_candidates(command: str) -> list[Path]:
     executable = command + (".exe" if os.name == "nt" else "")
     candidates = [Path(sys.executable).resolve().parent / executable]

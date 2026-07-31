@@ -1,4 +1,4 @@
-# YouTube Video Localizer 2.1
+# YouTube Video Localizer 2.1.1
 
 一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 
@@ -15,7 +15,7 @@ ASR 不会被当作 YouTube 字幕缺失时的自动后备。修复步骤同时�
 
 ### 1. 基础安装
 
-基础安装只包含界面、下载、轻量配置和 Edge TTS，可直接打开查看程序，不会安装大模型环境。
+基础安装只包含界面、下载和轻量配置，可直接打开查看程序，不会安装大模型环境。
 
 需要：
 
@@ -39,13 +39,15 @@ uv run python -m videodub
 
 打开顶部“模型”菜单：
 
-- “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入 `external/settings.json`。
-- “语音识别模型”：选择、安装或卸载 ASR 模型。
-- “语音生成模型”：选择、安装或卸载 TTS 模型。
+- “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入系统用户配置目录中的 `settings.json`。
+- “语音识别模型”：选择并锁定 ASR 模型；点击“安装”进入独立的安装与卸载窗口。
+- “语音生成模型”：选择并锁定 TTS 模型；点击“安装”进入独立的安装与卸载窗口。
 
-模型、各自独立的 Python 环境和 GGUF 运行时都在 `external` 下。主程序基础环境不会被 PyTorch、MLX 或 GGUF 依赖污染。将鼠标放在已安装模型选项上可查看实际路径。配音默认仍可直接使用轻量的 Edge TTS；选择已安装的 Qwen3-TTS 后自动切换到本地模型，Piper 保留为离线后备。
+应用直接发现 Hugging Face 与 ModelScope 的标准模型缓存，不在项目目录内复制模型。将鼠标放在已安装模型选项上可查看实际路径。模型运行依赖由 uv 放入自己的缓存和隔离环境，主程序不会创建或维护项目内的模型 venv，也不会被 PyTorch、MLX 或 GGUF 依赖污染。
 
-在中国大陆网络环境中，下载 Hugging Face 模型前可先设置镜像：
+Qwen 官方模型从 ModelScope 下载；MLX、GGUF 和“其他模型”使用 Hugging Face 官方 `hf download`。两者都使用各自的默认缓存和标准命令，已有模型不会重复下载。Hugging Face 默认缓存通常是 `~/.cache/huggingface/hub`，ModelScope 默认缓存通常是 `~/.cache/modelscope`。
+
+在中国大陆网络环境中，下载非 Qwen 官方的 Hugging Face 模型前可设置镜像：
 
 macOS / Linux：
 
@@ -67,12 +69,13 @@ uv run python -m videodub
 
 ### macOS Apple Silicon
 
-程序直接使用 MLX 模型及 `mlx-audio` 的调用方式，不依赖第三方 qwen-speech-mlx 包：
+程序直接使用 MLX 模型及 `mlx-audio` 的调用方式：
 
 - ASR：`mlx-community/Qwen3-ASR-0.6B-8bit`
-- TTS：`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit`
+- TTS Base：`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit`
+- TTS CustomVoice：`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`
 
-安装按钮会用 uv 建立独立 Python 3.13 环境。实现参考了
+uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 [royisme/qwen-speech-mlx](https://github.com/royisme/qwen-speech-mlx)
 的加载与推理流程，并配合两个模型仓库的接口。
 
@@ -80,14 +83,33 @@ uv run python -m videodub
 
 每种模型都可选择官方版本或 GGUF 版本：
 
-- 官方 ASR：`Qwen/Qwen3-ASR-0.6B`，同时安装 `Qwen/Qwen3-ForcedAligner-0.6B` 生成时间轴。
+- 官方 ASR：ModelScope 的 `Qwen/Qwen3-ASR-0.6B`，同时安装 `Qwen/Qwen3-ForcedAligner-0.6B` 生成时间轴。
 - GGUF ASR：`handy-computer/Qwen3-ASR-0.6B-gguf`。
-- 官方 TTS：`Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
-- GGUF TTS：`cstr/qwen3-tts-0.6b-base-GGUF`，同时安装配套 tokenizer。
+- 官方 TTS Base：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
+- 官方 TTS CustomVoice：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
+- GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。
 
-官方模型分别安装在隔离的 uv 环境中。GGUF 使用按当前系统下载的 CrispASR 预编译运行时。选择“其他模型”后可输入 `owner/model`，例如 `seanghay/Qwen3-ASR-0.6B-Khmer`。
+GGUF 使用按当前系统下载的 CrispASR 预编译运行时。选择“其他模型”后可输入 Hugging Face 的 `owner/model`，例如 `seanghay/Qwen3-ASR-0.6B-Khmer`。
 
 模型若以本机服务运行，会在任务开始前启动、就绪后执行，并在任务完成、失败或取消后终止；无需用户手动管理服务。
+
+Qwen3-TTS CustomVoice 使用内置中文音色 Vivian。Base 模型用于声音克隆，锁定 Base 后必须在语音生成模型窗口选择参考 WAV，并填写与音频内容一致的文本；该配置跟随锁定的模型保存。
+
+## 应用数据位置
+
+项目不再使用 `external`。少量运行设置写入操作系统的用户配置目录：
+
+- Windows：`%APPDATA%\YouTube Video Localizer\settings.json`
+- macOS：`~/Library/Application Support/YouTube Video Localizer/settings.json`
+- Linux：`${XDG_CONFIG_HOME:-~/.config}/youtube-video-localizer/settings.json`
+
+CrispASR 属于可以重新下载的 GGUF 运行组件，写入操作系统的用户缓存目录：
+
+- Windows：`%LOCALAPPDATA%\YouTube Video Localizer\Cache\runtimes`
+- macOS：`~/Library/Caches/YouTube Video Localizer/runtimes`
+- Linux：`${XDG_CACHE_HOME:-~/.cache}/youtube-video-localizer/runtimes`
+
+2.1.1 不再读取或维护项目内的 `external`；模型可按需从标准缓存重新发现或下载。
 
 ## 工作目录
 

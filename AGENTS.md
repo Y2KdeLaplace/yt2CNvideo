@@ -7,7 +7,7 @@
 - Subtitle AI uses one model field. `subtitle_use_vision` only controls whether suspect screenshots are attached to that same model.
 - Keep the default UI simple. Batch size, context radius, confidence threshold, and screenshot count are internal defaults, not normal user controls.
 - The application must remain usable on Windows, macOS, and Linux. Do not introduce an OS-only dependency without a portable fallback.
-- TTS defaults to Edge TTS. Piper is the offline fallback. Avoid large model stacks such as CosyVoice.
+- TTS uses Qwen3-TTS Base or CustomVoice. Avoid unrelated model stacks such as Edge TTS, Piper, or CosyVoice.
 - Never commit downloaded videos, generated subtitles, API keys, runtime settings, TTS models, or output videos.
 
 ## Read only what the task needs

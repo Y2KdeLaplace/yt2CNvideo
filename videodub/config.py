@@ -11,14 +11,19 @@ import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from .platform_utils import executable_exists, resolve_executable
+from .platform_utils import (
+    executable_exists,
+    resolve_executable,
+    user_config_dir,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = PROJECT_ROOT / "work"
-EXTERNAL_DIR = PROJECT_ROOT / "external"
-SETTINGS_FILE = EXTERNAL_DIR / "settings.json"
-LEGACY_SETTINGS_FILE = PROJECT_ROOT / "settings.json"
+SETTINGS_FILE = user_config_dir() / "settings.json"
+LEGACY_SETTINGS_FILES = (
+    PROJECT_ROOT / "settings.json",
+)
 LEGACY_SUBTITLE_LANGUAGES = "en-orig,en.*,zh-Hans,zh-CN,zh,-live_chat"
 DEFAULT_SUBTITLE_LANGUAGES = "en-orig,en"
 
@@ -167,14 +172,10 @@ class AppConfig:
     tts_model_id: str = ""
     tts_model_path: str = ""
     tts_codec_path: str = ""
+    tts_speaker: str = "Vivian"
     tts_reference_audio: str = ""
-    tts_reference_text: str = "请告诉我 prompt。"
+    tts_reference_text: str = ""
 
-    # Retained lightweight fallback settings.
-    tts_provider: str = "edge"
-    tts_voice: str = "zh-CN-XiaoxiaoNeural"
-    tts_rate: int = 0
-    piper_model_path: str = ""
     audio_mode: str = "replace"
     original_volume: float = 0.12
     embed_subtitles: bool = True
@@ -219,11 +220,8 @@ class AppConfig:
         self.subtitle_screenshot_count = max(
             1, min(int(self.subtitle_screenshot_count), 5)
         )
-        self.tts_rate = max(-50, min(int(self.tts_rate), 50))
         self.original_volume = max(0.0, min(float(self.original_volume), 1.0))
         self.subtitle_api_base_url = self.subtitle_api_base_url.rstrip("/")
-        if self.tts_provider not in {"edge", "piper", "qwen"}:
-            self.tts_provider = "edge"
         return self
 
     def validate_core(self) -> list[str]:
@@ -241,13 +239,17 @@ class AppConfig:
         DEFAULT_WORK_DIR.mkdir(parents=True, exist_ok=True)
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-        EXTERNAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
     source = path
     if source is None:
-        source = SETTINGS_FILE if SETTINGS_FILE.exists() else LEGACY_SETTINGS_FILE
+        source = SETTINGS_FILE
+        if not source.exists():
+            source = next(
+                (item for item in LEGACY_SETTINGS_FILES if item.exists()),
+                SETTINGS_FILE,
+            )
     config = AppConfig()
     if not source.exists():
         config.normalize()
@@ -289,7 +291,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         except OSError:
             config.work_dir = str(DEFAULT_WORK_DIR.resolve())
             config.ensure_directories()
-        if source == LEGACY_SETTINGS_FILE and path is None:
+        if source in LEGACY_SETTINGS_FILES and path is None:
             save_config(config)
         return config
     except (OSError, ValueError, TypeError):

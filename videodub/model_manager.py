@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import platform
@@ -10,16 +9,15 @@ import tarfile
 import tempfile
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
-from .config import AppConfig, EXTERNAL_DIR
+from .config import AppConfig
+from .platform_utils import user_cache_dir
 from .runner import ProcessRunner
 
 
-MODELS_DIR = EXTERNAL_DIR / "models"
-ENVS_DIR = EXTERNAL_DIR / "envs"
-RUNTIMES_DIR = EXTERNAL_DIR / "runtimes"
+RUNTIMES_DIR = user_cache_dir() / "runtimes"
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
 
 
@@ -29,6 +27,7 @@ class ModelChoice:
     label: str
     repo_id: str
     backend: str
+    source: str = "huggingface"
     include: tuple[str, ...] = ()
 
 
@@ -40,15 +39,20 @@ class InstalledModel:
     path: str
     codec_path: str = ""
     aligner_path: str = ""
+    source: str = "huggingface"
+    variant: str = ""
 
 
-def model_choices(kind: str) -> tuple[ModelChoice, ...]:
-    mac = platform.system() == "Darwin" and platform.machine().lower() in {
+def _is_apple_silicon() -> bool:
+    return platform.system() == "Darwin" and platform.machine().lower() in {
         "arm64",
         "aarch64",
     }
+
+
+def model_choices(kind: str) -> tuple[ModelChoice, ...]:
     if kind == "asr":
-        if mac:
+        if _is_apple_silicon():
             return (
                 ModelChoice(
                     "mlx",
@@ -56,7 +60,7 @@ def model_choices(kind: str) -> tuple[ModelChoice, ...]:
                     "mlx-community/Qwen3-ASR-0.6B-8bit",
                     "mlx",
                 ),
-                ModelChoice("other", "其他模型", "", "mlx"),
+                ModelChoice("other", "其他 Hugging Face 模型", "", "mlx"),
             )
         return (
             ModelChoice(
@@ -64,41 +68,63 @@ def model_choices(kind: str) -> tuple[ModelChoice, ...]:
                 "Qwen3-ASR 0.6B（官方）",
                 "Qwen/Qwen3-ASR-0.6B",
                 "hf",
+                "modelscope",
             ),
             ModelChoice(
                 "gguf",
-                "Qwen3-ASR 0.6B（GGUF）",
+                "Qwen3-ASR 0.6B Q8（GGUF）",
                 "handy-computer/Qwen3-ASR-0.6B-gguf",
                 "gguf",
-                ("*.gguf",),
+                include=("Qwen3-ASR-0.6B-Q8_0.gguf",),
             ),
-            ModelChoice("other", "其他模型", "", "hf"),
+            ModelChoice("other", "其他 Hugging Face 模型", "", "hf"),
         )
-    if mac:
+    if _is_apple_silicon():
         return (
             ModelChoice(
-                "mlx",
+                "mlx-base",
                 "Qwen3-TTS 0.6B Base 8bit（MLX）",
                 "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
                 "mlx",
             ),
-            ModelChoice("other", "其他模型", "", "mlx"),
+            ModelChoice(
+                "mlx-custom",
+                "Qwen3-TTS 0.6B CustomVoice 8bit（MLX）",
+                "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+                "mlx",
+            ),
+            ModelChoice("other", "其他 Hugging Face 模型", "", "mlx"),
         )
     return (
         ModelChoice(
-            "official",
+            "official-base",
             "Qwen3-TTS 0.6B Base（官方）",
             "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
             "hf",
+            "modelscope",
         ),
         ModelChoice(
-            "gguf",
+            "official-custom",
+            "Qwen3-TTS 0.6B CustomVoice（官方）",
+            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            "hf",
+            "modelscope",
+        ),
+        ModelChoice(
+            "gguf-base",
             "Qwen3-TTS 0.6B Base Q8（GGUF）",
             "cstr/qwen3-tts-0.6b-base-GGUF",
             "gguf",
-            ("qwen3-tts-12hz-0.6b-base-q8_0.gguf",),
+            include=("qwen3-tts-12hz-0.6b-base-q8_0.gguf",),
         ),
-        ModelChoice("other", "其他模型", "", "hf"),
+        ModelChoice(
+            "gguf-custom",
+            "Qwen3-TTS 0.6B CustomVoice Q8（GGUF）",
+            "cstr/qwen3-tts-0.6b-customvoice-GGUF",
+            "gguf",
+            include=("qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",),
+        ),
+        ModelChoice("other", "其他 Hugging Face 模型", "", "hf"),
     )
 
 
@@ -109,126 +135,364 @@ def choice_by_label(kind: str, label: str) -> ModelChoice:
     return model_choices(kind)[0]
 
 
-def _safe_repo_name(repo_id: str) -> str:
-    return repo_id.replace("/", "--").replace("\\", "--").replace(":", "-")
+def huggingface_cache_root() -> Path:
+    explicit = os.environ.get("HF_HUB_CACHE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = os.environ.get("HF_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def model_path(kind: str, backend: str, repo_id: str) -> Path:
-    return MODELS_DIR / kind / backend / _safe_repo_name(repo_id)
+def modelscope_cache_root() -> Path:
+    explicit = os.environ.get("MODELSCOPE_CACHE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".cache" / "modelscope"
 
 
-def manifest_path(path: Path) -> Path:
-    return path / ".videodub-model.json"
+def _hf_repo_root(repo_id: str) -> Path:
+    return huggingface_cache_root() / (
+        "models--" + repo_id.replace("/", "--")
+    )
 
 
-def read_installed_model(path: str | Path) -> InstalledModel | None:
-    file = manifest_path(Path(path))
-    if not file.is_file():
-        return None
+def _has_model_content(path: Path) -> bool:
+    """Confirm model weights with a bounded scan of the cache entry."""
+    if not path.is_dir():
+        return False
+    weight_suffixes = {
+        ".bin",
+        ".gguf",
+        ".mlx",
+        ".npz",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".safetensors",
+    }
+    pending = [(path, 0)]
     try:
-        return InstalledModel(**json.loads(file.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError):
+        while pending:
+            current, depth = pending.pop()
+            for item in current.iterdir():
+                if item.is_file() and item.suffix.casefold() in weight_suffixes:
+                    return True
+                if depth < 1 and item.is_dir():
+                    pending.append((item, depth + 1))
+    except OSError:
+        return False
+    return False
+
+
+def resolve_huggingface_model(repo_id: str) -> Path | None:
+    root = _hf_repo_root(repo_id)
+    snapshots = root / "snapshots"
+    candidates: list[Path] = []
+    reference = root / "refs" / "main"
+    if reference.is_file():
+        revision = reference.read_text(encoding="utf-8").strip()
+        if revision:
+            candidates.append(snapshots / revision)
+    if snapshots.is_dir():
+        candidates.extend(
+            sorted(
+                (item for item in snapshots.iterdir() if item.is_dir()),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    for candidate in candidates:
+        if _has_model_content(candidate):
+            return candidate.resolve()
+    return None
+
+
+def resolve_modelscope_model(repo_id: str) -> Path | None:
+    owner, name = repo_id.split("/", 1)
+    root = modelscope_cache_root()
+    repository = root / "models" / f"{owner}--{name}"
+    snapshots = repository / "snapshots"
+    if snapshots.is_dir():
+        for candidate in sorted(
+            (item for item in snapshots.iterdir() if item.is_dir()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        ):
+            if _has_model_content(candidate):
+                return candidate.resolve()
+    legacy_candidates = (
+        root / "models" / owner / name,
+        root / owner / name,
+        root / "hub" / "models" / owner / name,
+        root / "models" / owner.lower() / name,
+        root / owner.lower() / name,
+    )
+    for candidate in legacy_candidates:
+        if _has_model_content(candidate):
+            return candidate.resolve()
+    return None
+
+
+def _variant(repo_id: str) -> str:
+    lowered = repo_id.casefold()
+    if "customvoice" in lowered or "custom-voice" in lowered:
+        return "custom_voice"
+    if "tts" in lowered and "base" in lowered:
+        return "base"
+    return ""
+
+
+def _resolve_choice(choice: ModelChoice) -> Path | None:
+    if choice.source == "modelscope":
+        return (
+            resolve_modelscope_model(choice.repo_id)
+            or resolve_huggingface_model(choice.repo_id)
+        )
+    return resolve_huggingface_model(choice.repo_id)
+
+
+def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
+    codec_path = ""
+    aligner_path = ""
+    if kind == "asr" and backend == "hf":
+        aligner = (
+            resolve_modelscope_model("Qwen/Qwen3-ForcedAligner-0.6B")
+            or resolve_huggingface_model("Qwen/Qwen3-ForcedAligner-0.6B")
+        )
+        aligner_path = str(aligner or "")
+    if kind == "tts" and backend == "gguf":
+        codec = resolve_huggingface_model(
+            "cstr/qwen3-tts-tokenizer-12hz-GGUF"
+        )
+        if codec:
+            files = sorted(codec.rglob("*.gguf"))
+            codec_path = str(files[0]) if files else ""
+    return codec_path, aligner_path
+
+
+def _installed_from_choice(
+    kind: str,
+    choice: ModelChoice,
+) -> InstalledModel | None:
+    if not choice.repo_id:
         return None
+    source = choice.source
+    path = _resolve_choice(choice)
+    if path is None:
+        return None
+    if (
+        choice.source == "modelscope"
+        and resolve_modelscope_model(choice.repo_id) is None
+    ):
+        source = "huggingface"
+    if choice.include and not any(
+        list(path.rglob(pattern)) for pattern in choice.include
+    ):
+        return None
+    codec_path, aligner_path = _companion_paths(kind, choice.backend)
+    return InstalledModel(
+        kind,
+        choice.backend,
+        choice.repo_id,
+        str(path),
+        codec_path,
+        aligner_path,
+        source,
+        _variant(choice.repo_id),
+    )
 
 
-def is_model_installed(kind: str, backend: str, repo_id: str) -> bool:
-    return read_installed_model(model_path(kind, backend, repo_id)) is not None
+def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
+    root = huggingface_cache_root()
+    if not root.is_dir():
+        return []
+    marker = "asr" if kind == "asr" else "tts"
+    result: list[InstalledModel] = []
+    for repo_root in root.glob("models--*--*"):
+        raw = repo_root.name.removeprefix("models--")
+        owner, name = raw.split("--", 1)
+        repo_id = f"{owner}/{name}"
+        if marker not in repo_id.casefold():
+            continue
+        path = resolve_huggingface_model(repo_id)
+        if path is None:
+            continue
+        backend = (
+            "mlx"
+            if owner.casefold() == "mlx-community"
+            else "gguf"
+            if "gguf" in repo_id.casefold()
+            else "hf"
+        )
+        codec_path, aligner_path = _companion_paths(kind, backend)
+        result.append(
+            InstalledModel(
+                kind,
+                backend,
+                repo_id,
+                str(path),
+                codec_path,
+                aligner_path,
+                "huggingface",
+                _variant(repo_id),
+            )
+        )
+    return result
 
 
 def list_installed_models(kind: str) -> list[InstalledModel]:
-    root = MODELS_DIR / kind
-    if not root.exists():
-        return []
-    result: list[InstalledModel] = []
-    for file in root.rglob(".videodub-model.json"):
-        installed = read_installed_model(file.parent)
-        if installed:
-            result.append(installed)
-    return sorted(result, key=lambda item: (item.backend, item.repo_id.lower()))
+    result = [
+        installed
+        for choice in model_choices(kind)
+        if (installed := _installed_from_choice(kind, choice)) is not None
+    ]
+    result.extend(_cached_huggingface_repositories(kind))
+    unique: dict[tuple[str, str], InstalledModel] = {}
+    for item in result:
+        unique[(item.repo_id.casefold(), str(Path(item.path)))] = item
+    return sorted(
+        unique.values(),
+        key=lambda item: (item.backend, item.repo_id.casefold()),
+    )
 
 
-def env_python(backend: str, kind: str) -> Path:
-    name = "mlx" if backend == "mlx" else f"{kind}-hf"
-    root = ENVS_DIR / name
-    if os.name == "nt":
-        return root / "Scripts" / "python.exe"
-    return root / "bin" / "python"
+def read_installed_model(path: str | Path) -> InstalledModel | None:
+    target = Path(path)
+    for kind in ("asr", "tts"):
+        for item in list_installed_models(kind):
+            if Path(item.path) == target:
+                return item
+    return None
+
+
+def is_model_installed(kind: str, backend: str, repo_id: str) -> bool:
+    return any(
+        item.backend == backend and item.repo_id == repo_id
+        for item in list_installed_models(kind)
+    )
+
+
+def runtime_packages(kind: str, backend: str) -> tuple[str, tuple[str, ...]]:
+    if backend == "mlx":
+        return (
+            "3.13",
+            (
+                "fastapi>=0.128",
+                "huggingface-hub[hf_xet]",
+                "mlx-audio>=0.3",
+                "numpy",
+                "python-multipart",
+                "soundfile",
+                "uvicorn>=0.40",
+            ),
+        )
+    if kind == "asr":
+        return (
+            "3.12",
+            (
+                "fastapi>=0.128",
+                "python-multipart",
+                "qwen-asr",
+                "uvicorn>=0.40",
+            ),
+        )
+    return (
+        "3.12",
+        (
+            "fastapi>=0.128",
+            "numpy",
+            "qwen-tts",
+            "soundfile",
+            "uvicorn>=0.40",
+        ),
+    )
+
+
+def uv_runtime_prefix(kind: str, backend: str) -> list[str]:
+    version, packages = runtime_packages(kind, backend)
+    command = ["uv", "run", "--no-project", "--python", version]
+    for package in packages:
+        command.extend(["--with", package])
+    return command
 
 
 def _install_runtime(kind: str, backend: str, runner: ProcessRunner) -> None:
     if backend == "gguf":
         _install_crispasr(runner)
         return
-    python_path = env_python(backend, kind)
-    if not python_path.is_file():
-        version = "3.13" if backend == "mlx" else "3.12"
-        runner.logger(f"正在创建 {kind.upper()} 模型环境（Python {version}）…")
-        runner.run(["uv", "venv", python_path.parent.parent, "--python", version])
-    if backend == "mlx":
-        packages = [
-            "fastapi>=0.128",
-            "huggingface-hub[hf_xet]",
-            "mlx-audio>=0.3",
-            "numpy",
-            "python-multipart",
-            "soundfile",
-            "uvicorn>=0.40",
-        ]
-    elif kind == "asr":
-        packages = [
-            "fastapi>=0.128",
-            "python-multipart",
-            "qwen-asr",
-            "uvicorn>=0.40",
-        ]
-    else:
-        packages = [
-            "fastapi>=0.128",
-            "numpy",
-            "qwen-tts",
-            "soundfile",
-            "uvicorn>=0.40",
-        ]
-    runner.logger("正在安装模型运行环境…")
-    runner.run(["uv", "pip", "install", "--python", python_path, *packages])
+    runner.logger("正在由 uv 准备模型运行环境…")
+    imports = (
+        "import fastapi, mlx_audio, uvicorn"
+        if backend == "mlx"
+        else "import fastapi, qwen_asr, uvicorn"
+        if kind == "asr"
+        else "import fastapi, qwen_tts, uvicorn"
+    )
+    runner.run([*uv_runtime_prefix(kind, backend), "python", "-c", imports])
 
 
-def _download_hf(
+def _download_huggingface(
     repo_id: str,
-    target: Path,
     runner: ProcessRunner,
     include: tuple[str, ...] = (),
-) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    command: list[str | Path] = [
-        "uv",
-        "tool",
-        "run",
+) -> Path:
+    command: list[str] = [
+        "uvx",
         "--from",
         "huggingface-hub[hf_xet]",
         "hf",
         "download",
         repo_id,
-        "--local-dir",
-        target,
     ]
     for pattern in include:
         command.extend(["--include", pattern])
     runner.logger(f"正在从 Hugging Face 下载：{repo_id}")
     runner.run(command)
+    path = resolve_huggingface_model(repo_id)
+    if path is None:
+        raise RuntimeError(f"Hugging Face 下载完成后未找到模型缓存：{repo_id}")
+    return path
 
 
-def _download_file(
-    url: str,
-    target: Path,
+def _download_modelscope(repo_id: str, runner: ProcessRunner) -> Path:
+    runner.logger(f"正在从 ModelScope 下载：{repo_id}")
+    runner.run(
+        [
+            "uvx",
+            "--from",
+            "modelscope-hub",
+            "ms-hub",
+            "download",
+            repo_id,
+        ]
+    )
+    path = resolve_modelscope_model(repo_id)
+    if path is None:
+        raise RuntimeError(f"ModelScope 下载完成后未找到模型缓存：{repo_id}")
+    return path
+
+
+def _download_choice(
+    choice: ModelChoice,
+    repo_id: str,
     runner: ProcessRunner,
-) -> None:
+) -> Path:
+    if choice.source == "modelscope" and choice.key != "other":
+        return _download_modelscope(repo_id, runner)
+    return _download_huggingface(repo_id, runner, choice.include)
+
+
+def _download_file(url: str, target: Path, runner: ProcessRunner) -> None:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "youtube-video-localizer/2.1"},
+        headers={"User-Agent": "youtube-video-localizer/2.1.1"},
     )
     target.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(request, timeout=60) as response, target.open("wb") as out:
+    with urllib.request.urlopen(request, timeout=60) as response, target.open(
+        "wb"
+    ) as out:
         while True:
             runner.check_cancelled()
             chunk = response.read(1024 * 1024)
@@ -240,16 +504,14 @@ def _download_file(
 def _safe_extract_zip(archive: Path, target: Path) -> None:
     with zipfile.ZipFile(archive) as package:
         for item in package.infolist():
-            resolved = (target / item.filename).resolve()
-            resolved.relative_to(target.resolve())
+            (target / item.filename).resolve().relative_to(target.resolve())
         package.extractall(target)
 
 
 def _safe_extract_tar(archive: Path, target: Path) -> None:
     with tarfile.open(archive) as package:
         for item in package.getmembers():
-            resolved = (target / item.name).resolve()
-            resolved.relative_to(target.resolve())
+            (target / item.name).resolve().relative_to(target.resolve())
         package.extractall(target)
 
 
@@ -257,12 +519,10 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
     existing = crispasr_executable()
     if existing:
         return existing
-    api = (
-        f"https://api.github.com/repos/{CRISPASR_REPOSITORY}/releases/latest"
-    )
+    api = f"https://api.github.com/repos/{CRISPASR_REPOSITORY}/releases/latest"
     request = urllib.request.Request(
         api,
-        headers={"User-Agent": "youtube-video-localizer/2.1"},
+        headers={"User-Agent": "youtube-video-localizer/2.1.1"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         release = json.loads(response.read().decode("utf-8"))
@@ -273,11 +533,12 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
         if machine in {"arm64", "aarch64"}
         else ("x86_64", "x64", "amd64")
     )
-    assets = release.get("assets") or []
 
     def score(asset: dict[str, object]) -> int:
-        name = str(asset.get("name") or "").lower()
-        if system_token not in name or not any(token in name for token in arch_tokens):
+        name = str(asset.get("name") or "").casefold()
+        if system_token not in name or not any(
+            token in name for token in arch_tokens
+        ):
             return -100
         value = 10
         if "cpu" in name:
@@ -288,16 +549,15 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
             value += 2
         return value
 
-    candidates = sorted(assets, key=score, reverse=True)
-    if not candidates or score(candidates[0]) < 0:
+    assets = sorted(release.get("assets") or [], key=score, reverse=True)
+    if not assets or score(assets[0]) < 0:
         raise RuntimeError("CrispASR 最新版本没有适合当前系统的预编译文件")
-    asset = candidates[0]
+    asset = assets[0]
     name = str(asset["name"])
-    url = str(asset["browser_download_url"])
     runner.logger(f"正在安装 CrispASR：{release.get('tag_name')} / {name}")
     with tempfile.TemporaryDirectory(prefix="videodub-crispasr-") as temp:
         archive = Path(temp) / name
-        _download_file(url, archive, runner)
+        _download_file(str(asset["browser_download_url"]), archive, runner)
         RUNTIMES_DIR.mkdir(parents=True, exist_ok=True)
         if name.endswith(".zip"):
             _safe_extract_zip(archive, RUNTIMES_DIR)
@@ -308,53 +568,23 @@ def _install_crispasr(runner: ProcessRunner) -> Path:
             shutil.copy2(archive, target)
             target.chmod(target.stat().st_mode | stat.S_IEXEC)
     result = crispasr_executable()
-    if not result:
+    if result is None:
         raise RuntimeError("CrispASR 已下载，但未找到可执行文件")
     return result
 
 
 def crispasr_executable() -> Path | None:
-    if not RUNTIMES_DIR.exists():
+    try:
+        if not RUNTIMES_DIR.is_dir():
+            return None
+        candidates = list(RUNTIMES_DIR.rglob("*"))
+    except OSError:
         return None
     names = {"crispasr.exe"} if os.name == "nt" else {"crispasr"}
-    for item in RUNTIMES_DIR.rglob("*"):
-        if item.is_file() and item.name.lower() in names:
+    for item in candidates:
+        if item.is_file() and item.name.casefold() in names:
             return item
     return None
-
-
-def ensure_reference_audio(config: AppConfig, runner: ProcessRunner) -> Path:
-    target = EXTERNAL_DIR / "voices" / "default-reference.wav"
-    if target.is_file():
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    mp3 = target.with_suffix(".mp3")
-    try:
-        import edge_tts
-    except ImportError as exc:
-        raise RuntimeError("基础环境缺少 edge-tts，无法建立默认参考声音") from exc
-    runner.logger("正在生成默认中文参考声音…")
-    asyncio.run(
-        edge_tts.Communicate(
-            config.tts_reference_text,
-            config.tts_voice,
-        ).save(str(mp3))
-    )
-    runner.run(
-        [
-            config.ffmpeg_path,
-            "-y",
-            "-i",
-            mp3,
-            "-ar",
-            "24000",
-            "-ac",
-            "1",
-            target,
-        ]
-    )
-    mp3.unlink(missing_ok=True)
-    return target
 
 
 def install_model(
@@ -366,51 +596,73 @@ def install_model(
 ) -> InstalledModel:
     repo_id = custom_repo.strip() if choice.key == "other" else choice.repo_id
     if not repo_id or "/" not in repo_id:
-        raise ValueError("请输入有效的 Hugging Face 模型名称，例如 owner/model")
-    backend = choice.backend
-    _install_runtime(kind, backend, runner)
-    target = model_path(kind, backend, repo_id)
-    _download_hf(repo_id, target, runner, choice.include)
+        raise ValueError("请输入有效的模型名称，例如 owner/model")
+    _install_runtime(kind, choice.backend, runner)
+    target = _download_choice(choice, repo_id, runner)
     codec_path = ""
     aligner_path = ""
-    if kind == "asr" and backend == "hf":
-        aligner = MODELS_DIR / "asr" / "hf" / "Qwen--Qwen3-ForcedAligner-0.6B"
-        _download_hf("Qwen/Qwen3-ForcedAligner-0.6B", aligner, runner)
-        aligner_path = str(aligner)
-    if kind == "tts":
-        reference = ensure_reference_audio(config, runner)
-        config.tts_reference_audio = str(reference)
-        if backend == "gguf":
-            codec = MODELS_DIR / "tts" / "gguf" / "qwen3-tts-tokenizer-12hz"
-            _download_hf(
-                "cstr/qwen3-tts-tokenizer-12hz-GGUF",
-                codec,
-                runner,
-                ("qwen3-tts-tokenizer-12hz.gguf",),
-            )
-            codec_files = sorted(codec.rglob("*.gguf"))
-            if not codec_files:
-                raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
-            codec_path = str(codec_files[0])
+    if kind == "asr" and choice.backend == "hf":
+        aligner_choice = ModelChoice(
+            "aligner",
+            "",
+            "Qwen/Qwen3-ForcedAligner-0.6B",
+            "hf",
+            choice.source,
+        )
+        aligner_path = str(
+            _download_choice(aligner_choice, aligner_choice.repo_id, runner)
+        )
+    if kind == "tts" and choice.backend == "gguf":
+        codec = _download_huggingface(
+            "cstr/qwen3-tts-tokenizer-12hz-GGUF",
+            runner,
+            ("qwen3-tts-tokenizer-12hz.gguf",),
+        )
+        codec_files = sorted(codec.rglob("*.gguf"))
+        if not codec_files:
+            raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
+        codec_path = str(codec_files[0])
     installed = InstalledModel(
         kind,
-        backend,
+        choice.backend,
         repo_id,
         str(target),
         codec_path,
         aligner_path,
-    )
-    manifest_path(target).write_text(
-        json.dumps(asdict(installed), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+        choice.source,
+        _variant(repo_id),
     )
     runner.logger(f"模型安装完成：{target}")
     return installed
 
 
+def _repository_root(installed: InstalledModel) -> tuple[Path, Path]:
+    path = Path(installed.path).resolve()
+    if installed.source == "modelscope":
+        root = modelscope_cache_root().resolve()
+        current = path
+        while (
+            current != root
+            and not (
+                current.parent.name == "models"
+                and "--" in current.name
+            )
+        ):
+            current = current.parent
+        current.relative_to(root)
+        return current if current != root else path, root
+    root = huggingface_cache_root().resolve()
+    current = path
+    while current != root and not current.name.startswith("models--"):
+        current = current.parent
+    current.relative_to(root)
+    if not current.name.startswith("models--"):
+        raise RuntimeError("无法确定 Hugging Face 模型缓存目录")
+    return current, root
+
+
 def uninstall_model(installed: InstalledModel, runner: ProcessRunner) -> None:
-    target = Path(installed.path).resolve()
-    target.relative_to(MODELS_DIR.resolve())
+    target, _root = _repository_root(installed)
     if target.exists():
         shutil.rmtree(target)
     runner.logger(f"已卸载模型：{installed.repo_id}")
@@ -420,11 +672,7 @@ def first_model_file(path: str | Path, pattern: str = "*") -> Path:
     root = Path(path)
     if root.is_file():
         return root
-    files = [
-        item
-        for item in root.rglob(pattern)
-        if item.is_file() and item.name != ".videodub-model.json"
-    ]
+    files = [item for item in root.rglob(pattern) if item.is_file()]
     if not files:
         raise RuntimeError(f"模型目录中没有找到 {pattern}：{root}")
     return sorted(files)[0]

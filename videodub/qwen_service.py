@@ -199,21 +199,35 @@ def create_tts_app(args: argparse.Namespace) -> Any:
     def synthesize(request: TTSRequest) -> dict[str, Any]:
         model = state["model"]
         if args.backend == "mlx":
-            results = model.generate(
-                text=request.text,
-                ref_audio=args.reference_audio,
-                ref_text=args.reference_text,
-            )
+            if args.variant == "base":
+                results = model.generate(
+                    text=request.text,
+                    ref_audio=args.reference_audio,
+                    ref_text=args.reference_text,
+                )
+            else:
+                results = model.generate_custom_voice(
+                    text=request.text,
+                    speaker=args.speaker,
+                    language="Chinese",
+                )
             result = next(iter(results)) if hasattr(results, "__iter__") else results
             audio = getattr(result, "audio", result)
             sample_rate = int(getattr(result, "sample_rate", 24000))
         else:
-            wavs, sample_rate = model.generate_voice_clone(
-                text=request.text,
-                language="Chinese",
-                ref_audio=args.reference_audio,
-                ref_text=args.reference_text,
-            )
+            if args.variant == "base":
+                wavs, sample_rate = model.generate_voice_clone(
+                    text=request.text,
+                    language="Chinese",
+                    ref_audio=args.reference_audio,
+                    ref_text=args.reference_text,
+                )
+            else:
+                wavs, sample_rate = model.generate_custom_voice(
+                    text=request.text,
+                    language="Chinese",
+                    speaker=args.speaker,
+                )
             audio = wavs[0]
         return {"audio_base64": _audio_bytes(audio, sample_rate), "model": args.model}
 
@@ -226,8 +240,10 @@ def main() -> None:
     parser.add_argument("--backend", choices=("hf", "mlx"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--aligner", default="")
+    parser.add_argument("--variant", choices=("base", "custom_voice"), default="custom_voice")
+    parser.add_argument("--speaker", default="Vivian")
     parser.add_argument("--reference-audio", default="")
-    parser.add_argument("--reference-text", default="请告诉我 prompt。")
+    parser.add_argument("--reference-text", default="")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int)
     args = parser.parse_args()

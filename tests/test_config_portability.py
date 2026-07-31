@@ -6,6 +6,8 @@ from pathlib import Path
 
 from videodub.config import (
     DEFAULT_WORK_DIR,
+    PROJECT_ROOT,
+    SETTINGS_FILE,
     AppConfig,
     api_key_from_runtime,
     encrypt_api_key,
@@ -49,6 +51,25 @@ class ConfigPortabilityTests(unittest.TestCase):
         self.assertEqual(Path(config.work_dir).name, "work")
         self.assertEqual(Path(config.output_dir), Path(config.work_dir) / "output")
         self.assertTrue(config.overwrite)
+        self.assertEqual(config.tts_speaker, "Vivian")
+        self.assertNotEqual(SETTINGS_FILE.parent, PROJECT_ROOT)
+
+    def test_retired_tts_provider_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Path(temp) / "settings.json"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "work_dir": temp,
+                        "tts_provider": "retired-provider",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings)
+
+            self.assertFalse(hasattr(config, "tts_provider"))
 
     def test_work_directory_migration_merges_and_overwrites_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -270,23 +270,41 @@ def synthesize_qwen(
         if executable is None or installed is None:
             raise RuntimeError("Qwen3-TTS GGUF 运行环境或模型不存在")
         runner.run(
-            [
+            (
+                [
+                    executable,
+                    "--backend",
+                    "qwen3-tts",
+                    "-m",
+                    first_model_file(config.tts_model_path, "*.gguf"),
+                    "--codec-model",
+                    installed.codec_path,
+                    "--voice",
+                    config.tts_reference_audio,
+                    "--ref-text",
+                    config.tts_reference_text,
+                    "--tts",
+                    text,
+                    "--tts-output",
+                    output,
+                ]
+                if installed.variant == "base"
+                else [
                 executable,
                 "--backend",
-                "qwen3-tts",
+                "qwen3-tts-customvoice",
                 "-m",
                 first_model_file(config.tts_model_path, "*.gguf"),
                 "--codec-model",
                 installed.codec_path,
                 "--voice",
-                config.tts_reference_audio,
-                "--ref-text",
-                config.tts_reference_text,
+                config.tts_speaker,
                 "--tts",
                 text,
                 "--tts-output",
                 output,
-            ],
+                ]
+            ),
             quiet=True,
         )
         return

@@ -10,8 +10,6 @@ dist/
 .tmp-*/
 .tmp-*
 settings.json
-external/*
-!external/.gitkeep
 startup-error.log
 .subtitle-evidence/
 *.subtitle-report.json
