@@ -4,8 +4,6 @@ The desktop app starts this module with the Python interpreter belonging to an
 installed model, waits for /health, runs one task, and always terminates it.
 """
 
-from __future__ import annotations
-
 import argparse
 import base64
 import io

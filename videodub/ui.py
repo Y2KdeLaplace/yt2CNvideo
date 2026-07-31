@@ -1002,13 +1002,13 @@ class VideoDubApp(tk.Tk):
 
         progress_line_active = False
 
-        def model_log(text: str) -> None:
+        def write_model_log(text: str, *, force_progress: bool = False) -> None:
             def write() -> None:
                 nonlocal progress_line_active
                 if not dialog.winfo_exists():
                     return
                 message = text.rstrip()
-                is_progress = message.startswith("下载进度（")
+                is_progress = force_progress or message.startswith("下载进度（")
                 log.configure(state="normal")
                 if is_progress and progress_line_active:
                     log.delete("model_progress_start", "end-1c")
@@ -1023,6 +1023,12 @@ class VideoDubApp(tk.Tk):
                 log.configure(state="disabled")
 
             self.after(0, write)
+
+        def model_log(text: str) -> None:
+            write_model_log(text)
+
+        def model_progress_log(text: str) -> None:
+            write_model_log(text, force_progress=True)
 
         selected_combo.bind(
             "<<ComboboxSelected>>",
@@ -1330,7 +1336,10 @@ class VideoDubApp(tk.Tk):
                     return
                 download_button.configure(state="disabled")
                 uninstall_button.configure(state="disabled")
-                runner = ProcessRunner(model_log)
+                runner = ProcessRunner(
+                    model_log,
+                    progress_logger=model_progress_log,
+                )
                 download_state["busy"] = True
                 download_state["runner"] = runner
                 self.model_download_runner = runner
@@ -1626,6 +1635,7 @@ class VideoDubApp(tk.Tk):
             if not messagebox.askyesno("退出", "任务仍在运行，停止并退出？", parent=self):
                 return
             self.runner.cancel()
+            self._cancel_active_runners()
         try:
             self._persist_config()
         finally:

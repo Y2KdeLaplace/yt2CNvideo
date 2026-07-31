@@ -5,7 +5,11 @@ from unittest.mock import patch
 
 from videodub.config import AppConfig
 from videodub.model_manager import InstalledModel
-from videodub.qwen_speech import _segments_to_cues, synthesize_qwen
+from videodub.qwen_speech import (
+    _segments_to_cues,
+    _validate_crispasr_asr_model,
+    synthesize_qwen,
+)
 
 
 class RecordingRunner:
@@ -35,6 +39,20 @@ class QwenSpeechTests(unittest.TestCase):
         self.assertEqual(len(cues), 1)
         self.assertEqual(cues[0].text, "Fallback")
         self.assertEqual(cues[0].end_ms, 4200)
+
+    def test_old_gguf_conversion_is_rejected_before_crispasr_crashes(self) -> None:
+        installed = InstalledModel(
+            "asr",
+            "gguf",
+            "handy-computer/Qwen3-ASR-0.6B-gguf",
+            "model.gguf",
+        )
+        with patch(
+            "videodub.qwen_speech.read_installed_model",
+            return_value=installed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cstr/qwen3-asr-0.6b-GGUF"):
+                _validate_crispasr_asr_model(Path("model.gguf"))
 
     def test_gguf_tts_uses_custom_voice_speaker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

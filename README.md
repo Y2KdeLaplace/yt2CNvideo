@@ -84,7 +84,7 @@ uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 每种模型都可选择官方版本或 GGUF 版本：
 
 - 官方 ASR：ModelScope 的 `Qwen/Qwen3-ASR-0.6B`，同时安装 `Qwen/Qwen3-ForcedAligner-0.6B` 生成时间轴。
-- GGUF ASR：`handy-computer/Qwen3-ASR-0.6B-gguf`。
+- GGUF ASR：`cstr/qwen3-asr-0.6b-GGUF`（CrispASR 兼容转换）。
 - 官方 TTS Base：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
 - 官方 TTS CustomVoice：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
 - GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。

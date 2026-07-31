@@ -399,6 +399,10 @@ class ModelManagerTests(unittest.TestCase):
         self.assertTrue(any("base" in key for key in variants))
         self.assertTrue(any("custom" in key for key in variants))
 
+    def test_gguf_asr_choice_uses_crispasr_conversion(self) -> None:
+        choice = next(item for item in model_choices("asr") if item.key == "gguf")
+        self.assertEqual(choice.repo_id, "cstr/qwen3-asr-0.6b-GGUF")
+
     def test_macos_discovers_existing_mlx_models(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ,

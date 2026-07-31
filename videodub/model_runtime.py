@@ -29,6 +29,7 @@ class ManagedModelService:
         self.port = port or (9956 if kind == "asr" else 9955)
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.process: subprocess.Popen[str] | None = None
+        self._stop_lock = threading.Lock()
 
     def __enter__(self) -> "ManagedModelService":
         path = self.config.asr_model_path if self.kind == "asr" else self.config.tts_model_path
@@ -84,6 +85,7 @@ class ManagedModelService:
             errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
+        self.runner.add_cancel_callback(self._terminate)
         threading.Thread(target=self._relay_output, daemon=True).start()
         try:
             for _ in range(180):
@@ -112,11 +114,17 @@ class ManagedModelService:
         self._terminate()
 
     def _terminate(self) -> None:
-        if self.process and self.process.poll() is None:
+        self.runner.remove_cancel_callback(self._terminate)
+        with self._stop_lock:
+            process = self.process
+            if process is None or process.poll() is not None:
+                return
             self.runner.logger(f"正在停止 {self.kind.upper()} 模型…")
-            self.process.terminate()
+            process.terminate()
             try:
-                self.process.wait(timeout=10)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                process.kill()
+                process.wait(timeout=5)
+            finally:
+                self.process = None

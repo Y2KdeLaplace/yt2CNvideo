@@ -27,11 +27,18 @@ class CommandError(RuntimeError):
 
 
 class ProcessRunner:
-    def __init__(self, logger: LogFn | None = None):
+    def __init__(
+        self,
+        logger: LogFn | None = None,
+        *,
+        progress_logger: LogFn | None = None,
+    ):
         self.logger = logger or (lambda _message: None)
+        self.progress_logger = progress_logger or self.logger
         self.cancel_event = threading.Event()
         self._process: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
+        self._cancel_callbacks: set[Callable[[], None]] = set()
 
     def reset(self) -> None:
         self.cancel_event.clear()
@@ -40,8 +47,19 @@ class ProcessRunner:
         self.cancel_event.set()
         with self._lock:
             process = self._process
+            callbacks = tuple(self._cancel_callbacks)
         if process and process.poll() is None:
             process.terminate()
+        for callback in callbacks:
+            callback()
+
+    def add_cancel_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            self._cancel_callbacks.add(callback)
+
+    def remove_cancel_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            self._cancel_callbacks.discard(callback)
 
     def check_cancelled(self) -> None:
         if self.cancel_event.is_set():
@@ -94,7 +112,7 @@ class ProcessRunner:
             now = time.monotonic()
             if is_progress and now - last_progress_log < 0.15:
                 return
-            self.logger(line)
+            (self.progress_logger if is_progress else self.logger)(line)
             if is_progress:
                 last_progress_log = now
 

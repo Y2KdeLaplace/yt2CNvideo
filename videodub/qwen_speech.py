@@ -22,6 +22,10 @@ from .subtitles import Cue, read_srt, write_srt
 ASR_SERVICE_URL = "http://127.0.0.1:9956"
 TTS_SERVICE_URL = "http://127.0.0.1:9955"
 
+_INCOMPATIBLE_CRISPASR_ASR_REPOSITORIES = {
+    "handy-computer/qwen3-asr-0.6b-gguf",
+}
+
 
 @dataclass(frozen=True)
 class QwenServiceInfo:
@@ -168,6 +172,19 @@ def _segments_to_cues(
     return cues
 
 
+def _validate_crispasr_asr_model(model: Path) -> None:
+    installed = read_installed_model(model)
+    if (
+        installed is not None
+        and installed.repo_id.casefold()
+        in _INCOMPATIBLE_CRISPASR_ASR_REPOSITORIES
+    ):
+        raise RuntimeError(
+            "当前 GGUF 文件不是 CrispASR 所需的转换格式。请在模型菜单中卸载旧版 "
+            "handy-computer 模型，并重新下载 cstr/qwen3-asr-0.6b-GGUF。"
+        )
+
+
 def extract_asr_subtitle(
     config: AppConfig,
     runner: ProcessRunner,
@@ -203,6 +220,7 @@ def extract_asr_subtitle(
             if executable is None:
                 raise RuntimeError("CrispASR 运行环境未安装")
             model = first_model_file(config.asr_model_path, "*.gguf")
+            _validate_crispasr_asr_model(model)
             prefix = Path(temp) / "recognized"
             runner.run(
                 [

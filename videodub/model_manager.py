@@ -93,7 +93,7 @@ def model_choices(kind: str) -> tuple[ModelChoice, ...]:
             ModelChoice(
                 "gguf",
                 "Qwen3-ASR 0.6B（GGUF）",
-                "handy-computer/Qwen3-ASR-0.6B-gguf",
+                "cstr/qwen3-asr-0.6b-GGUF",
                 "gguf",
             ),
             ModelChoice("other", "其他 Hugging Face 模型", "", "hf"),
