@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import AppConfig
 from .media import VideoJob, media_duration
+from .qwen_speech import check_qwen_service, synthesize_qwen
 from .runner import ProcessRunner
 from .subtitles import Cue, read_srt
 
@@ -102,6 +103,32 @@ def _synthesize_piper(
     return outputs
 
 
+def _synthesize_qwen(
+    config: AppConfig,
+    runner: ProcessRunner,
+    cues: list[Cue],
+    raw_dir: Path,
+) -> list[Path]:
+    info = check_qwen_service(config.qwen_tts_base_url, "tts")
+    if not info.available:
+        raise RuntimeError(
+            "未检测到可用的 Qwen3-TTS 服务。请按 README 启动服务后重试。"
+            f"\n{info.error}"
+        )
+    runner.logger(f"Qwen3-TTS 模型：{info.model or '未报告'}")
+    outputs: list[Path] = []
+    for i, cue in enumerate(cues):
+        runner.check_cancelled()
+        output = raw_dir / f"raw-{i:06d}.wav"
+        synthesize_qwen(config, cue.text, output)
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError(f"Qwen3-TTS 未生成有效音频（字幕 {i + 1}）")
+        outputs.append(output)
+        if (i + 1) % 10 == 0 or i + 1 == len(cues):
+            runner.logger(f"Qwen3-TTS 配音进度：{i + 1}/{len(cues)}")
+    return outputs
+
+
 def _prepare_timed_track(
     config: AppConfig,
     runner: ProcessRunner,
@@ -185,11 +212,7 @@ def _prepare_timed_track(
 
 
 def _output_path(config: AppConfig, job: VideoJob) -> Path:
-    try:
-        relative_parent = job.video_path.parent.relative_to(Path(config.download_dir))
-    except ValueError:
-        relative_parent = Path()
-    target_dir = Path(config.output_dir) / relative_parent
+    target_dir = job.generated_dir or Path(config.output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir / f"{job.video_path.stem}.中文配音.mp4"
 
@@ -204,7 +227,7 @@ def _mux_video(
     output = _output_path(config, job)
     command: list[str | Path] = [
         config.ffmpeg_path,
-        "-y" if config.overwrite else "-n",
+        "-y",
         "-i",
         job.video_path,
         "-i",
@@ -254,15 +277,15 @@ def dub_video(
     config: AppConfig,
     runner: ProcessRunner,
     job: VideoJob,
+    *,
+    speech_subtitle_path: Path | None = None,
 ) -> Path:
     subtitle_path = job.chinese_subtitle_path
     if not subtitle_path.exists():
         raise RuntimeError(f"缺少中文字幕：{subtitle_path.name}")
     final_output = _output_path(config, job)
-    if final_output.exists() and not config.overwrite:
-        runner.logger(f"跳过已有配音视频：{final_output.name}")
-        return final_output
-    cues = read_srt(subtitle_path)
+    narration_path = speech_subtitle_path or subtitle_path
+    cues = read_srt(narration_path)
     if not cues:
         raise RuntimeError(f"中文字幕为空：{subtitle_path}")
     total_duration = media_duration(config, runner, job.video_path)
@@ -275,6 +298,8 @@ def dub_video(
             raw_files = _synthesize_edge(config, runner, cues, raw_dir)
         elif config.tts_provider == "piper":
             raw_files = _synthesize_piper(config, runner, cues, raw_dir)
+        elif config.tts_provider == "qwen":
+            raw_files = _synthesize_qwen(config, runner, cues, raw_dir)
         else:
             raise RuntimeError(f"未知配音提供方：{config.tts_provider}")
         voice_track = _prepare_timed_track(

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from videodub.config import AppConfig, load_config
+from videodub.config import AppConfig, load_config, migrate_work_directory
 from videodub.platform_utils import executable_exists, resolve_executable
 
 
@@ -38,6 +38,28 @@ class ConfigPortabilityTests(unittest.TestCase):
         self.assertEqual(config.ffmpeg_path, "ffmpeg")
         self.assertEqual(config.ffprobe_path, "ffprobe")
         self.assertFalse(config.subtitle_use_vision)
+        self.assertEqual(Path(config.work_dir).name, "work")
+        self.assertEqual(Path(config.output_dir), Path(config.work_dir) / "output")
+        self.assertTrue(config.overwrite)
+
+    def test_work_directory_migration_merges_and_overwrites_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "work"
+            target = root / "chosen"
+            (source / "output").mkdir(parents=True)
+            target.mkdir()
+            (source / "video.txt").write_text("new", encoding="utf-8")
+            (target / "video.txt").write_text("old", encoding="utf-8")
+
+            migrate_work_directory(source, target)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(
+                (target / "video.txt").read_text(encoding="utf-8"),
+                "new",
+            )
+            self.assertTrue((target / "output").is_dir())
 
 
 if __name__ == "__main__":

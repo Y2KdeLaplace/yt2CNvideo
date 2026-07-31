@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "youtube-video-localizer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Download YouTube videos, repair and translate subtitles, and create Chinese-dubbed videos."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,9 +16,32 @@ dependencies = [
 offline-tts = [
     "piper-tts>=1.4,<2",
 ]
+qwen-asr-service = [
+    "fastapi>=0.128",
+    "python-multipart>=0.0.22",
+    "qwen-asr",
+    "uvicorn>=0.40",
+]
+qwen-tts-service = [
+    "fastapi>=0.128",
+    "qwen-tts",
+    "soundfile>=0.13",
+    "uvicorn>=0.40",
+]
 
 [project.scripts]
 youtube-video-localizer = "videodub.ui:main"
+videodub-qwen-asr = "videodub.qwen_service:main_asr"
+videodub-qwen-tts = "videodub.qwen_service:main_tts"
 
 [tool.setuptools.packages.find]
 include = ["videodub*"]
+
+[tool.uv]
+package = true
+conflicts = [
+    [
+        { extra = "qwen-asr-service" },
+        { extra = "qwen-tts-service" },
+    ],
+]

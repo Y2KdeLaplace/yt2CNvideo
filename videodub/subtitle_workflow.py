@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,57 +13,43 @@ from .runner import ProcessRunner
 from .subtitles import Cue, extract_json_array, find_source_subtitle, read_srt, write_srt
 
 
-DOMAIN_SYSTEM = """你是视频内容分析与术语规划专家。
-根据标题、简介和字幕样本判断视频所属领域，并为后续英文字幕校正和简体中文翻译建立术语表。
-只返回 JSON 对象，不要使用 Markdown。不要臆造字幕中没有依据的专有名词。"""
+DOMAIN_SYSTEM = """你是视频内容与专业术语分析专家。
+输入包含视频信息、YouTube 字幕样本和 Qwen3-ASR 字幕样本。
+判断主题和专业领域，整理专有名词、缩写、符号与公式的规范写法。
+只返回 JSON 对象，不要使用 Markdown，不要臆造原内容中没有依据的信息。"""
 
-DETECTION_SYSTEM = """你是英文字幕质量审查员。输入来自 YouTube 字幕。
-你的任务只是定位很可能存在语音识别错误、专有名词错误、明显语法断裂或上下文不通的字幕。
-正常的口语、省略、重复、填充词和不完美断句不应标记。宁可少报，不要把风格优化当作错误。
-只返回 JSON 数组，不要修复，不要输出未被要求的字幕。"""
-
-REPAIR_SYSTEM = """你是谨慎的英文字幕校对专家。
-结合领域信息、上下文和按字幕时间截取的视频画面，只修复有充分依据的识别错误。
-截图可能包含幻灯片标题、公式、术语、人物或屏幕文字，也可能与口语无关。
-不得扩写、润色、翻译或改变原意；证据不足时保持原文。
-只返回 JSON 数组，不要使用 Markdown。"""
+COMPARE_REPAIR_SYSTEM = """你是严格的视频字幕校对专家。
+以 YouTube 字幕的 id 和时间轴为准，逐条比对同时间段的 Qwen3-ASR 识别文本，并结合主题与术语表生成正确的原语言字幕。
+两个来源互相印证：不要把 ASR 当作绝对正确；证据冲突时选择符合语境、语法和专业知识的版本。
+修正错词、专有名词、断裂文本和明显漏字，但不得扩写、翻译或改变原意。
+数学表达可以使用清晰的 LaTeX 行内公式，例如 $\\sum_{i=1}^{10}x_i$。
+必须保留输入的每个 id，不能合并、拆分或遗漏。只返回 JSON 数组，每项格式为 {"id": 1, "corrected_text": "..."}。"""
 
 TRANSLATION_SYSTEM = """你是专业的简体中文字幕译者。
-根据视频领域和术语表翻译英文字幕。保持每个 id 独立，不合并、不拆分、不遗漏。
-译文要准确、自然、简洁，适合字幕显示；术语、人名、公式和缩写保持全片一致。
-只返回 JSON 数组，不要使用 Markdown。"""
+根据视频领域和术语表翻译原语言字幕。保持每个 id 独立，不合并、不拆分、不遗漏。
+译文要准确、自然、简洁，术语、人名、缩写和公式全片一致；公式可以保留为 LaTeX。
+只返回 JSON 数组，每项格式为 {"id": 1, "zh": "..."}，不要使用 Markdown。"""
+
+SPEECH_REWRITE_SYSTEM = """你是中文讲解稿改写专家。
+把中文字幕逐条改写成适合语音朗读、同时不改变信息内容的中文。
+把公式、数学符号、英文缩写和无法直接朗读的写法改成自然口语。例如公式应表达其运算关系，而不是逐字符念出。
+不要增加解释、总结或过渡句；保持每个 id 独立，不合并、不拆分、不遗漏。
+只返回 JSON 数组，每项格式为 {"id": 1, "speech_text": "..."}。"""
 
 
 @dataclass(frozen=True)
-class Suspect:
+class RepairRecord:
     cue_id: int
-    confidence: float
-    reason: str
-
-
-@dataclass(frozen=True)
-class EvidenceWindow:
-    number: int
-    cue_ids: tuple[int, ...]
-    start_ms: int
-    end_ms: int
-
-
-@dataclass(frozen=True)
-class Repair:
-    cue_id: int
-    original: str
-    corrected: str
+    youtube_text: str
+    asr_text: str
+    corrected_text: str
     changed: bool
-    confidence: float
-    evidence: str
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
     candidate = text.strip()
     if "```" in candidate:
-        start = candidate.find("```")
-        first_newline = candidate.find("\n", start)
+        first_newline = candidate.find("\n", candidate.find("```"))
         end = candidate.rfind("```")
         if first_newline >= 0 and end > first_newline:
             candidate = candidate[first_newline + 1 : end].strip()
@@ -118,41 +103,18 @@ def _read_metadata(job: VideoJob) -> dict[str, str]:
     return result
 
 
-def build_evidence_windows(
-    cues: list[Cue],
-    suspects: list[Suspect],
-    *,
-    margin_ms: int = 1500,
-    merge_gap_ms: int = 2500,
-    max_cues: int = 8,
-) -> list[EvidenceWindow]:
-    by_id = {cue.index: cue for cue in cues}
-    selected = [by_id[item.cue_id] for item in suspects if item.cue_id in by_id]
-    selected.sort(key=lambda cue: cue.start_ms)
-    if not selected:
-        return []
-    groups: list[list[Cue]] = [[selected[0]]]
-    for cue in selected[1:]:
-        current = groups[-1]
-        if (
-            cue.start_ms - current[-1].end_ms <= merge_gap_ms
-            and len(current) < max_cues
-        ):
-            current.append(cue)
-        else:
-            groups.append([cue])
-    return [
-        EvidenceWindow(
-            number=number,
-            cue_ids=tuple(cue.index for cue in group),
-            start_ms=max(0, group[0].start_ms - margin_ms),
-            end_ms=group[-1].end_ms + margin_ms,
-        )
-        for number, group in enumerate(groups, 1)
+def _overlapping_asr_text(youtube: Cue, asr_cues: list[Cue]) -> str:
+    margin_ms = 800
+    values = [
+        cue.text
+        for cue in asr_cues
+        if cue.end_ms >= youtube.start_ms - margin_ms
+        and cue.start_ms <= youtube.end_ms + margin_ms
     ]
+    return " ".join(values)
 
 
-class SubtitleRepairWorkflow:
+class _TextWorkflow:
     def __init__(
         self,
         config: AppConfig,
@@ -174,13 +136,9 @@ class SubtitleRepairWorkflow:
         self.prompt_tokens += result.prompt_tokens
         self.completion_tokens += result.completion_tokens
 
-    def _call_object(
-        self,
-        system: str,
-        prompt: str,
-    ) -> dict[str, Any]:
+    def _call_object(self, system: str, prompt: str) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(2):
+        for _attempt in range(2):
             result = self.client.chat(system, prompt, max_tokens=3000)
             self._record_usage(result)
             try:
@@ -188,8 +146,8 @@ class SubtitleRepairWorkflow:
             except (ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
                 prompt += (
-                    "\n\n上一次输出无法解析。请严格只返回一个有效 JSON 对象，"
-                    f"不要添加 Markdown。解析错误：{exc}"
+                    "\n\n上一次输出无法解析。请严格只返回有效 JSON 对象。"
+                    f"解析错误：{exc}"
                 )
         raise RuntimeError(f"模型连续返回无效 JSON：{last_error}")
 
@@ -198,373 +156,217 @@ class SubtitleRepairWorkflow:
         system: str,
         prompt: str,
         *,
-        image_paths: list[Path] | None = None,
-        max_tokens: int = 5000,
+        max_tokens: int = 6000,
     ) -> list[dict[str, Any]]:
         last_error: Exception | None = None
         for _attempt in range(2):
-            result = self.client.chat(
-                system,
-                prompt,
-                image_paths=image_paths,
-                max_tokens=max_tokens,
-            )
+            result = self.client.chat(system, prompt, max_tokens=max_tokens)
             self._record_usage(result)
             try:
                 return extract_json_array(result.text)
             except (ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
                 prompt += (
-                    "\n\n上一次输出无法解析。请严格只返回有效 JSON 数组，"
-                    f"不要添加 Markdown。解析错误：{exc}"
+                    "\n\n上一次输出无法解析。请严格只返回有效 JSON 数组。"
+                    f"解析错误：{exc}"
                 )
         raise RuntimeError(f"模型连续返回无效 JSON：{last_error}")
 
+    @staticmethod
+    def _validated_texts(
+        rows: list[dict[str, Any]],
+        expected: list[Cue],
+        field: str,
+    ) -> dict[int, str]:
+        expected_ids = {cue.index for cue in expected}
+        result: dict[int, str] = {}
+        for row in rows:
+            try:
+                cue_id = int(row["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("模型输出包含无效字幕 id") from exc
+            text = str(row.get(field) or "").strip()
+            if cue_id not in expected_ids or cue_id in result or not text:
+                raise ValueError(f"模型输出的字幕 {cue_id} 无效、重复或为空")
+            result[cue_id] = text
+        if set(result) != expected_ids:
+            missing = sorted(expected_ids - set(result))
+            raise ValueError(f"模型输出遗漏字幕 id：{missing[:20]}")
+        return result
+
+
+class SubtitleRepairWorkflow(_TextWorkflow):
     def analyze_domain(
         self,
         job: VideoJob,
-        cues: list[Cue],
+        youtube_cues: list[Cue],
+        asr_cues: list[Cue],
     ) -> dict[str, Any]:
-        metadata = _read_metadata(job)
-        prompt = (
-            "请返回以下结构：\n"
-            '{"domain":"主要领域","subdomains":["子领域"],'
-            '"summary":"内容概述","glossary":['
-            '{"term":"英文术语","preferred_zh":"建议中文","notes":"消歧说明"}]}\n\n'
-            f"标题：{metadata['title']}\n"
-            f"简介：{metadata['description']}\n"
-            "字幕样本：\n"
-            + json.dumps(_cue_payload(_sample_cues(cues)), ensure_ascii=False)
-        )
-        brief = self._call_object(DOMAIN_SYSTEM, prompt)
-        brief.setdefault("domain", "未确定")
-        brief.setdefault("subdomains", [])
-        brief.setdefault("summary", "")
-        brief.setdefault("glossary", [])
-        if not isinstance(brief["glossary"], list):
-            brief["glossary"] = []
-        brief["glossary"] = brief["glossary"][:60]
-        return brief
-
-    def detect_suspects(
-        self,
-        cues: list[Cue],
-        domain: dict[str, Any],
-    ) -> list[Suspect]:
-        size = self.config.subtitle_detection_batch_size
-        radius = self.config.subtitle_context_radius
-        suspects: dict[int, Suspect] = {}
-        total = math.ceil(len(cues) / size)
-        for batch_number, start in enumerate(range(0, len(cues), size), 1):
-            self.runner.check_cancelled()
-            targets = cues[start : start + size]
-            context = cues[max(0, start - radius) : min(len(cues), start + size + radius)]
-            target_ids = [cue.index for cue in targets]
-            prompt = (
-                '返回格式：[{"id":字幕ID,"confidence":0到1,'
-                '"reason":"为什么很可能有错"}]。没有可疑项时返回 []。\n'
-                f"只能返回这些目标 ID：{target_ids}\n"
-                "领域信息："
-                + json.dumps(domain, ensure_ascii=False)
-                + "\n字幕（含少量只供理解的前后文）：\n"
-                + json.dumps(_cue_payload(context), ensure_ascii=False)
-            )
-            items = self._call_array(
-                DETECTION_SYSTEM,
-                prompt,
-                max_tokens=3000,
-            )
-            allowed = set(target_ids)
-            for item in items:
-                try:
-                    cue_id = int(item["id"])
-                    confidence = float(item.get("confidence", 0.5))
-                    reason = str(item.get("reason", "")).strip()
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if (
-                    cue_id in allowed
-                    and confidence >= self.config.subtitle_suspect_threshold
-                ):
-                    previous = suspects.get(cue_id)
-                    candidate = Suspect(cue_id, confidence, reason)
-                    if previous is None or candidate.confidence > previous.confidence:
-                        suspects[cue_id] = candidate
-            self.runner.logger(f"可疑字幕筛查：{batch_number}/{total}")
-        return [suspects[key] for key in sorted(suspects)]
-
-    def _extract_screenshots(
-        self,
-        job: VideoJob,
-        window: EvidenceWindow,
-    ) -> list[Path]:
-        evidence_root = job.video_path.parent / ".subtitle-evidence"
-        folder = evidence_root / f"window-{window.number:04d}"
-        folder.mkdir(parents=True, exist_ok=True)
-        count = self.config.subtitle_screenshot_count
-        if count == 1:
-            positions = [(window.start_ms + window.end_ms) / 2]
-        else:
-            span = max(1, window.end_ms - window.start_ms)
-            positions = [
-                window.start_ms + span * index / (count - 1)
-                for index in range(count)
-            ]
-        paths: list[Path] = []
-        for index, position_ms in enumerate(positions, 1):
-            output = folder / f"frame-{index:02d}-{round(position_ms)}ms.jpg"
-            if self.config.overwrite or not output.exists():
-                self.runner.run(
-                    [
-                        self.config.ffmpeg_path,
-                        "-y",
-                        "-ss",
-                        f"{position_ms / 1000:.3f}",
-                        "-i",
-                        job.video_path,
-                        "-frames:v",
-                        "1",
-                        "-vf",
-                        "scale=1280:-2:force_original_aspect_ratio=decrease",
-                        "-q:v",
-                        "3",
-                        output,
+        prompt = json.dumps(
+            {
+                "video": _read_metadata(job),
+                "youtube_sample": _cue_payload(_sample_cues(youtube_cues)),
+                "qwen_asr_sample": _cue_payload(_sample_cues(asr_cues)),
+                "required_schema": {
+                    "domain": "string",
+                    "summary": "string",
+                    "glossary": [
+                        {
+                            "term": "string",
+                            "preferred_zh": "string",
+                            "notes": "string",
+                        }
                     ],
-                    quiet=True,
-                )
-            paths.append(output)
-        return paths
+                },
+            },
+            ensure_ascii=False,
+        )
+        return self._call_object(DOMAIN_SYSTEM, prompt)
 
-    def repair_suspects(
+    def repair(
         self,
-        job: VideoJob,
-        cues: list[Cue],
+        youtube_cues: list[Cue],
+        asr_cues: list[Cue],
         domain: dict[str, Any],
-        suspects: list[Suspect],
-    ) -> tuple[list[Cue], list[Repair]]:
-        by_id = {cue.index: cue for cue in cues}
-        cue_position = {cue.index: index for index, cue in enumerate(cues)}
-        repairs: dict[int, Repair] = {}
-        windows = build_evidence_windows(cues, suspects)
-        suspect_by_id = {item.cue_id: item for item in suspects}
-        for window_number, window in enumerate(windows, 1):
+    ) -> tuple[list[Cue], list[RepairRecord]]:
+        corrected: list[Cue] = []
+        records: list[RepairRecord] = []
+        batch_size = self.config.subtitle_detection_batch_size
+        for start in range(0, len(youtube_cues), batch_size):
             self.runner.check_cancelled()
-            target_ids = list(window.cue_ids)
-            positions = [cue_position[item] for item in target_ids]
-            context = cues[
-                max(0, min(positions) - self.config.subtitle_context_radius) :
-                min(len(cues), max(positions) + self.config.subtitle_context_radius + 1)
+            batch = youtube_cues[start : start + batch_size]
+            rows = [
+                {
+                    "id": cue.index,
+                    "start": round(cue.start_ms / 1000, 3),
+                    "end": round(cue.end_ms / 1000, 3),
+                    "youtube_text": cue.text,
+                    "qwen_asr_text": _overlapping_asr_text(cue, asr_cues),
+                }
+                for cue in batch
             ]
-            image_paths: list[Path] = []
-            if self.config.subtitle_use_vision:
-                image_paths = self._extract_screenshots(job, window)
-            prompt = (
-                '返回格式：[{"id":字幕ID,"corrected_text":"校正后的英文",'
-                '"changed":true或false,"confidence":0到1,'
-                '"evidence":"简短说明依据"}]。\n'
-                f"必须且只能返回这些 ID：{target_ids}\n"
-                f"截图按时间顺序取自 {window.start_ms / 1000:.3f}s 到 "
-                f"{window.end_ms / 1000:.3f}s。\n"
-                "领域和术语："
-                + json.dumps(domain, ensure_ascii=False)
-                + "\n筛查原因："
-                + json.dumps(
-                    [asdict(suspect_by_id[item]) for item in target_ids],
-                    ensure_ascii=False,
-                )
-                + "\n字幕上下文："
-                + json.dumps(_cue_payload(context), ensure_ascii=False)
+            prompt = json.dumps(
+                {"domain": domain, "subtitles": rows},
+                ensure_ascii=False,
             )
-            try:
-                items = self._call_array(
-                    REPAIR_SYSTEM,
-                    prompt,
-                    image_paths=image_paths or None,
-                    max_tokens=4000,
-                )
-            except RuntimeError as exc:
-                if image_paths:
-                    raise RuntimeError(
-                        "截图辅助修复请求失败。请确认当前模型支持图片输入，"
-                        "且兼容接口接受 image_url；"
-                        "否则取消“图像使用”。\n"
-                        f"原始错误：{exc}"
-                    ) from exc
-                raise
-            returned: set[int] = set()
-            for item in items:
-                try:
-                    cue_id = int(item["id"])
-                    corrected = str(item["corrected_text"]).strip()
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if cue_id not in target_ids or not corrected:
-                    continue
-                original = by_id[cue_id].text
-                changed = bool(item.get("changed", corrected != original))
-                repair = Repair(
-                    cue_id=cue_id,
-                    original=original,
-                    corrected=corrected if changed else original,
-                    changed=changed and corrected != original,
-                    confidence=float(item.get("confidence", 0.5)),
-                    evidence=str(item.get("evidence", "")).strip(),
-                )
-                repairs[cue_id] = repair
-                returned.add(cue_id)
-            for cue_id in target_ids:
-                if cue_id not in returned:
-                    original = by_id[cue_id].text
-                    repairs[cue_id] = Repair(
-                        cue_id, original, original, False, 0.0, "模型未返回，保留原文"
+            result = self._call_array(COMPARE_REPAIR_SYSTEM, prompt)
+            texts = self._validated_texts(result, batch, "corrected_text")
+            for cue, row in zip(batch, rows, strict=True):
+                text = texts[cue.index]
+                corrected.append(Cue(cue.index, cue.start_ms, cue.end_ms, text))
+                records.append(
+                    RepairRecord(
+                        cue.index,
+                        cue.text,
+                        row["qwen_asr_text"],
+                        text,
+                        text != cue.text,
                     )
+                )
             self.runner.logger(
-                f"证据复核与英文修复：{window_number}/{len(windows)}"
+                f"双字幕比对进度：{min(start + len(batch), len(youtube_cues))}/"
+                f"{len(youtube_cues)}"
             )
-        corrected_cues = [
-            Cue(
-                cue.index,
-                cue.start_ms,
-                cue.end_ms,
-                repairs[cue.index].corrected if cue.index in repairs else cue.text,
-            )
-            for cue in cues
-        ]
-        return corrected_cues, [repairs[key] for key in sorted(repairs)]
+        return corrected, records
 
     def translate(
         self,
         cues: list[Cue],
         domain: dict[str, Any],
     ) -> list[Cue]:
-        size = self.config.subtitle_translation_batch_size
-        radius = self.config.subtitle_context_radius
-        translated: dict[int, str] = {}
-        total = math.ceil(len(cues) / size)
-        compact_domain = {
-            "domain": domain.get("domain"),
-            "subdomains": domain.get("subdomains"),
-            "summary": domain.get("summary"),
-            "glossary": (domain.get("glossary") or [])[:60],
-        }
-        for batch_number, start in enumerate(range(0, len(cues), size), 1):
+        translated: list[Cue] = []
+        batch_size = self.config.subtitle_translation_batch_size
+        for start in range(0, len(cues), batch_size):
             self.runner.check_cancelled()
-            targets = cues[start : start + size]
-            context = cues[max(0, start - radius) : min(len(cues), start + size + radius)]
-            target_ids = [cue.index for cue in targets]
-            prompt = (
-                '返回格式：[{"id":字幕ID,"zh":"简体中文译文"}]。\n'
-                f"必须且只能返回这些目标 ID：{target_ids}\n"
-                "领域和术语表："
-                + json.dumps(compact_domain, ensure_ascii=False)
-                + "\n字幕（额外前后文只供理解，不要翻译非目标 ID）：\n"
-                + json.dumps(_cue_payload(context), ensure_ascii=False)
+            batch = cues[start : start + batch_size]
+            prompt = json.dumps(
+                {"domain": domain, "subtitles": _cue_payload(batch)},
+                ensure_ascii=False,
             )
-            items = self._call_array(
-                TRANSLATION_SYSTEM,
-                prompt,
-                max_tokens=6000,
+            result = self._call_array(TRANSLATION_SYSTEM, prompt)
+            texts = self._validated_texts(result, batch, "zh")
+            translated.extend(
+                Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
+                for cue in batch
             )
-            for attempt in range(2):
-                for item in items:
-                    try:
-                        cue_id = int(item["id"])
-                        text = str(item["zh"]).strip()
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if cue_id in target_ids and text:
-                        translated[cue_id] = text
-                missing = [
-                    cue_id for cue_id in target_ids if cue_id not in translated
-                ]
-                if not missing or attempt == 1:
-                    break
-                missing_set = set(missing)
-                missing_cues = [
-                    cue for cue in targets if cue.index in missing_set
-                ]
-                retry_prompt = (
-                    '只补全上次遗漏的字幕。返回格式：[{"id":字幕ID,'
-                    '"zh":"简体中文译文"}]。\n'
-                    f"必须且只能返回这些 ID：{missing}\n"
-                    "领域和术语表："
-                    + json.dumps(compact_domain, ensure_ascii=False)
-                    + "\n待补全字幕："
-                    + json.dumps(_cue_payload(missing_cues), ensure_ascii=False)
-                )
-                items = self._call_array(
-                    TRANSLATION_SYSTEM,
-                    retry_prompt,
-                    max_tokens=3000,
-                )
-            missing = [cue_id for cue_id in target_ids if cue_id not in translated]
-            if missing:
-                raise RuntimeError(
-                    f"翻译模型重试后仍遗漏字幕 ID：{missing}"
-                )
-            self.runner.logger(f"中文字幕翻译：{batch_number}/{total}")
-        return [
-            Cue(cue.index, cue.start_ms, cue.end_ms, translated[cue.index])
-            for cue in cues
-        ]
+            self.runner.logger(
+                f"中文翻译进度：{min(start + len(batch), len(cues))}/{len(cues)}"
+            )
+        return translated
 
     def process_job(self, job: VideoJob) -> dict[str, Any]:
-        if (
-            job.corrected_subtitle_path.exists()
-            and job.chinese_subtitle_path.exists()
-            and not self.config.overwrite
-        ):
-            self.runner.logger(f"跳过已有字幕结果：{job.title}")
-            return {"video": str(job.video_path), "skipped": True}
         source = find_source_subtitle(job.video_path)
         if source is None:
-            raise RuntimeError(f"没有找到英文字幕：{job.video_path.name}")
-        cues = read_srt(source)
-        if not cues:
-            raise RuntimeError(f"字幕文件为空：{source}")
-        prompt_tokens_before = self.prompt_tokens
-        completion_tokens_before = self.completion_tokens
-        self.runner.logger(f"开始处理：{job.title}（{len(cues)} 条字幕）")
-        domain = self.analyze_domain(job, cues)
-        self.runner.logger(f"推断领域：{domain.get('domain', '未确定')}")
-        suspects = self.detect_suspects(cues, domain)
-        self.runner.logger(f"发现 {len(suspects)} 条高可能错误字幕")
-        corrected, repairs = self.repair_suspects(
-            job, cues, domain, suspects
-        )
+            raise RuntimeError(f"缺少 YouTube 字幕：{job.video_path.name}")
+        if not job.asr_subtitle_path.is_file():
+            raise RuntimeError(f"缺少 Qwen3-ASR 字幕：{job.asr_subtitle_path.name}")
+        youtube_cues = read_srt(source)
+        asr_cues = read_srt(job.asr_subtitle_path)
+        if not youtube_cues or not asr_cues:
+            raise RuntimeError(f"字幕为空：{job.video_path.name}")
+        job.corrected_subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_before = self.prompt_tokens
+        completion_before = self.completion_tokens
+        self.runner.logger("正在判断主题并建立术语表…")
+        domain = self.analyze_domain(job, youtube_cues, asr_cues)
+        self.runner.logger("正在逐条比对 YouTube 与 Qwen3-ASR 字幕…")
+        corrected, repairs = self.repair(youtube_cues, asr_cues, domain)
         write_srt(job.corrected_subtitle_path, corrected)
         chinese = self.translate(corrected, domain)
         write_srt(job.chinese_subtitle_path, chinese)
         report = {
-            "version": 1,
+            "version": 2,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "video": str(job.video_path),
-            "source_subtitle": str(source),
+            "youtube_subtitle": str(source),
+            "asr_subtitle": str(job.asr_subtitle_path),
             "corrected_subtitle": str(job.corrected_subtitle_path),
             "chinese_subtitle": str(job.chinese_subtitle_path),
             "domain": domain,
-            "suspects": [asdict(item) for item in suspects],
             "repairs": [asdict(item) for item in repairs],
             "usage": {
-                "prompt_tokens": self.prompt_tokens - prompt_tokens_before,
-                "completion_tokens": (
-                    self.completion_tokens - completion_tokens_before
-                ),
+                "prompt_tokens": self.prompt_tokens - prompt_before,
+                "completion_tokens": self.completion_tokens - completion_before,
             },
-            "settings": {
-                "model": self.config.subtitle_model,
-                "use_images": self.config.subtitle_use_vision,
-                "suspect_threshold": self.config.subtitle_suspect_threshold,
-            },
+            "model": self.config.subtitle_model,
         }
-        report_path = job.base_path.with_name(
-            job.base_path.name + ".subtitle-report.json"
+        report_path = job.generated_base_path.with_name(
+            job.generated_base_path.name + ".subtitle-report.json"
         )
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self.runner.logger(f"英文校正字幕：{job.corrected_subtitle_path.name}")
-        self.runner.logger(f"中文字幕：{job.chinese_subtitle_path.name}")
-        self.runner.logger(f"修复报告：{report_path.name}")
+        self.runner.logger(f"修复字幕：{job.corrected_subtitle_path}")
+        self.runner.logger(f"中文字幕：{job.chinese_subtitle_path}")
         return report
+
+
+class SpeechSubtitleWorkflow(_TextWorkflow):
+    def process_job(self, job: VideoJob) -> Path:
+        source = job.chinese_subtitle_path
+        if not source.is_file():
+            raise RuntimeError(f"缺少中文字幕：{source.name}")
+        cues = read_srt(source)
+        if not cues:
+            raise RuntimeError(f"中文字幕为空：{source}")
+        spoken: list[Cue] = []
+        batch_size = self.config.subtitle_translation_batch_size
+        for start in range(0, len(cues), batch_size):
+            self.runner.check_cancelled()
+            batch = cues[start : start + batch_size]
+            result = self._call_array(
+                SPEECH_REWRITE_SYSTEM,
+                json.dumps({"subtitles": _cue_payload(batch)}, ensure_ascii=False),
+            )
+            texts = self._validated_texts(result, batch, "speech_text")
+            spoken.extend(
+                Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
+                for cue in batch
+            )
+            self.runner.logger(
+                f"配音文本改写进度：{min(start + len(batch), len(cues))}/{len(cues)}"
+            )
+        write_srt(job.speech_subtitle_path, spoken)
+        self.runner.logger(f"临时配音字幕：{job.speech_subtitle_path}")
+        return job.speech_subtitle_path

@@ -4,13 +4,12 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
 
 from videodub.config import AppConfig
 from videodub.media import VideoJob
 from videodub.openai_compatible import chat_completions_endpoint
 from videodub.runner import ProcessRunner
-from videodub.subtitle_workflow import SubtitleRepairWorkflow
+from videodub.subtitle_workflow import SpeechSubtitleWorkflow, SubtitleRepairWorkflow
 from videodub.subtitles import find_source_subtitle, read_srt
 
 
@@ -26,7 +25,7 @@ class _MockChatServer:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 owner.calls.append(payload)
                 system = payload["messages"][0]["content"]
-                if "术语规划专家" in system:
+                if "专业术语分析专家" in system:
                     content = json.dumps(
                         {
                             "domain": "computational neuroscience",
@@ -41,20 +40,17 @@ class _MockChatServer:
                             ],
                         }
                     )
-                elif "质量审查员" in system:
-                    content = json.dumps(
-                        [{"id": 1, "confidence": 0.92, "reason": "term mismatch"}]
-                    )
-                elif "校对专家" in system:
+                elif "字幕校对专家" in system:
                     content = json.dumps(
                         [
                             {
                                 "id": 1,
                                 "corrected_text": "A spike train.",
-                                "changed": True,
-                                "confidence": 0.95,
-                                "evidence": "slide text",
-                            }
+                            },
+                            {
+                                "id": 2,
+                                "corrected_text": "This is the next sentence.",
+                            },
                         ]
                     )
                 elif "中文字幕译者" in system:
@@ -62,6 +58,12 @@ class _MockChatServer:
                         [
                             {"id": 1, "zh": "一个脉冲序列。"},
                             {"id": 2, "zh": "这是下一句话。"},
+                        ]
+                    )
+                elif "中文讲解稿改写专家" in system:
+                    content = json.dumps(
+                        [
+                            {"id": 1, "speech_text": "x i 从 i 为 1 到 10 求和。"},
                         ]
                     )
                 else:
@@ -122,7 +124,7 @@ class SubtitleWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(find_source_subtitle(video), subtitle)
 
-    def test_visual_repair_and_translation_end_to_end(self) -> None:
+    def test_dual_subtitle_repair_and_translation_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temp, _MockChatServer() as mock:
             root = Path(temp)
             video = root / "Lecture [abc123].mp4"
@@ -133,22 +135,21 @@ class SubtitleWorkflowTests(unittest.TestCase):
                 "2\n00:00:01,000 --> 00:00:02,000\nThis is the next sentence.\n",
                 encoding="utf-8",
             )
-            image = root / "frame.jpg"
-            image.write_bytes(b"\xff\xd8\xff\xd9")
+            asr = root / "Lecture [abc123].asr.srt"
+            asr.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nA spike train.\n\n"
+                "2\n00:00:01,000 --> 00:00:02,000\nThis is the next sentence.\n",
+                encoding="utf-8",
+            )
             config = AppConfig(
                 subtitle_api_base_url=mock.base_url,
-                subtitle_model="mock-multimodal",
-                subtitle_use_vision=True,
+                subtitle_model="mock-text-model",
                 subtitle_detection_batch_size=10,
                 subtitle_translation_batch_size=10,
-                overwrite=True,
             )
             workflow = SubtitleRepairWorkflow(config, ProcessRunner())
-            job = VideoJob(video, title="Lecture")
-            with patch.object(
-                workflow, "_extract_screenshots", return_value=[image]
-            ):
-                report = workflow.process_job(job)
+            job = VideoJob(video, title="Lecture", generated_dir=root / "output")
+            report = workflow.process_job(job)
 
             corrected = read_srt(job.corrected_subtitle_path)
             chinese = read_srt(job.chinese_subtitle_path)
@@ -158,16 +159,42 @@ class SubtitleWorkflowTests(unittest.TestCase):
             repair_calls = [
                 call
                 for call in mock.calls
-                if "校对专家" in call["messages"][0]["content"]
+                if "字幕校对专家" in call["messages"][0]["content"]
             ]
             self.assertEqual(len(repair_calls), 1)
             self.assertTrue(
-                all(call["model"] == "mock-multimodal" for call in mock.calls)
+                all(call["model"] == "mock-text-model" for call in mock.calls)
             )
             repair_content = repair_calls[0]["messages"][1]["content"]
-            self.assertIsInstance(repair_content, list)
-            self.assertTrue(
-                any(part.get("type") == "image_url" for part in repair_content)
+            self.assertIsInstance(repair_content, str)
+            self.assertEqual(report["asr_subtitle"], str(asr))
+
+    def test_speech_subtitle_rewrites_formula_for_tts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, _MockChatServer() as mock:
+            root = Path(temp)
+            video = root / "Lecture.mp4"
+            video.touch()
+            output = root / "output"
+            output.mkdir()
+            job = VideoJob(video, generated_dir=output)
+            job.chinese_subtitle_path.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\n"
+                "$\\sum_{i=1}^{10}x_i$\n",
+                encoding="utf-8",
+            )
+            workflow = SpeechSubtitleWorkflow(
+                AppConfig(
+                    subtitle_api_base_url=mock.base_url,
+                    subtitle_model="mock-text-model",
+                ),
+                ProcessRunner(),
+            )
+
+            path = workflow.process_job(job)
+
+            self.assertEqual(
+                read_srt(path)[0].text,
+                "x i 从 i 为 1 到 10 求和。",
             )
 
 

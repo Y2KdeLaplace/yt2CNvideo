@@ -129,7 +129,14 @@ def find_source_subtitle(video_path: Path) -> Path | None:
         if item.is_file()
         and item.suffix.lower() == ".srt"
         and item.stem.startswith(stem)
-        and not item.name.endswith((".zh-CN.srt", ".corrected.srt"))
+        and not item.name.endswith(
+            (
+                ".asr.srt",
+                ".zh-CN.srt",
+                ".corrected.srt",
+                ".speech.zh-CN.srt",
+            )
+        )
     ]
     if not candidates:
         return None

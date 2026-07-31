@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.uv-cache/
 venv/
 build/
 dist/
@@ -12,11 +13,13 @@ settings.json
 startup-error.log
 .subtitle-evidence/
 *.subtitle-report.json
+*.asr.srt
 *.corrected.srt
 *.zh-CN.srt
+*.speech.zh-CN.srt
 *.onnx
 *.onnx.json
-yt-video/*
-!yt-video/.gitkeep
-bl-video/*
-!bl-video/.gitkeep
+work/
+output/
+yt-video/
+bl-video/

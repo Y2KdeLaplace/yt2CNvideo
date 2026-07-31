@@ -18,7 +18,7 @@ def build_download_command(
     include_subtitles: bool | None = None,
 ) -> list[str]:
     if include_subtitles is None:
-        include_subtitles = config.download_subtitles
+        include_subtitles = bool(config.subtitle_languages.strip())
     root = Path(config.download_dir)
     if config.link_type == "playlist":
         output = (
@@ -65,8 +65,7 @@ def build_download_command(
     elif config.link_type == "playlist":
         # A private/deleted item should not prevent the rest of a playlist downloading.
         command.append("--ignore-errors")
-    if not config.overwrite:
-        command.extend(["--no-overwrites", "--no-post-overwrites"])
+    command.extend(["--force-overwrites", "--no-continue"])
     command.append(url.strip())
     return command
 
@@ -89,12 +88,16 @@ def download(config: AppConfig, runner: ProcessRunner, url: str) -> list[VideoJo
     except CommandError as exc:
         detail = exc.tail.lower()
         subtitle_failure = (
-            config.download_subtitles
+            bool(config.subtitle_languages.strip())
             and "subtitle" in detail
-            and (
-                "unable to download" in detail
-                or "http error 429" in detail
-                or "too many requests" in detail
+            and any(
+                marker in detail
+                for marker in (
+                    "unable",
+                    "failed",
+                    "error",
+                    "too many requests",
+                )
             )
         )
         if not subtitle_failure:
@@ -113,7 +116,7 @@ def download(config: AppConfig, runner: ProcessRunner, url: str) -> list[VideoJo
             if ID_MARKER in line
         )
     )
-    all_jobs = discover_video_jobs(config.download_dir)
+    all_jobs = discover_video_jobs(config.download_dir, config.output_dir)
     if not ids:
         runner.logger("未从下载输出获得视频 ID，将处理下载目录中的视频。")
         return all_jobs

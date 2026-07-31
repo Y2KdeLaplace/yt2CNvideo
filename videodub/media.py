@@ -10,7 +10,12 @@ from .runner import ProcessRunner
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
-GENERATED_SUFFIXES = (".zh-CN.srt", ".corrected.srt")
+GENERATED_SUFFIXES = (
+    ".asr.srt",
+    ".zh-CN.srt",
+    ".corrected.srt",
+    ".speech.zh-CN.srt",
+)
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,7 @@ class VideoJob:
     info_path: Path | None = None
     video_id: str = ""
     title: str = ""
+    generated_dir: Path | None = None
 
     @property
     def base_path(self) -> Path:
@@ -26,11 +32,30 @@ class VideoJob:
 
     @property
     def chinese_subtitle_path(self) -> Path:
-        return self.base_path.with_name(self.base_path.name + ".zh-CN.srt")
+        return self.generated_base_path.with_name(
+            self.generated_base_path.name + ".zh-CN.srt"
+        )
 
     @property
     def corrected_subtitle_path(self) -> Path:
-        return self.base_path.with_name(self.base_path.name + ".corrected.srt")
+        return self.generated_base_path.with_name(
+            self.generated_base_path.name + ".corrected.srt"
+        )
+
+    @property
+    def speech_subtitle_path(self) -> Path:
+        return self.generated_base_path.with_name(
+            self.generated_base_path.name + ".speech.zh-CN.srt"
+        )
+
+    @property
+    def asr_subtitle_path(self) -> Path:
+        return self.base_path.with_name(self.base_path.name + ".asr.srt")
+
+    @property
+    def generated_base_path(self) -> Path:
+        target = self.generated_dir or self.video_path.parent
+        return target / self.video_path.stem
 
 
 def _info_for_video(video: Path) -> Path | None:
@@ -46,14 +71,24 @@ def _info_for_video(video: Path) -> Path | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
-def discover_video_jobs(root: str | Path) -> list[VideoJob]:
+def discover_video_jobs(
+    root: str | Path,
+    output_root: str | Path | None = None,
+) -> list[VideoJob]:
     root_path = Path(root)
     if not root_path.exists():
         return []
+    output_path = Path(output_root).resolve() if output_root else None
     jobs: list[VideoJob] = []
     for video in sorted(root_path.rglob("*")):
         if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
+        if output_path is not None:
+            try:
+                video.resolve().relative_to(output_path)
+                continue
+            except ValueError:
+                pass
         if video.name.endswith(".dubbed.mp4"):
             continue
         info_path = _info_for_video(video)
@@ -66,7 +101,16 @@ def discover_video_jobs(root: str | Path) -> list[VideoJob]:
                 title = str(info.get("title") or title)
             except (OSError, ValueError):
                 pass
-        jobs.append(VideoJob(video, info_path, video_id, title))
+        generated_dir = None
+        if output_path is not None:
+            try:
+                relative_parent = video.parent.resolve().relative_to(
+                    root_path.resolve()
+                )
+            except ValueError:
+                relative_parent = Path()
+            generated_dir = output_path / relative_parent
+        jobs.append(VideoJob(video, info_path, video_id, title, generated_dir))
     return jobs
 
 
