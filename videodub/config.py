@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = PROJECT_ROOT / "work"
 DEFAULT_CACHE_DIR = application_cache_dir()
 SETTINGS_FILE = user_config_dir() / "settings.json"
+LANGUAGE_MODEL_SETTINGS_NAME = "settings.json"
 DEFAULT_SUBTITLE_LANGUAGES = "en-orig,en"
 SUPPORTED_LANGUAGES = {
     "中文": "Chinese",
@@ -285,14 +286,67 @@ def save_config(config: AppConfig, path: Path = SETTINGS_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     values = asdict(config)
-    # API keys are runtime secrets. Keep the legacy field readable for old
-    # settings files, but never write a key back to disk.
     values["subtitle_api_key_encrypted"] = ""
     temporary.write_text(
         json.dumps(values, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def language_model_settings_path(config: AppConfig) -> Path:
+    return Path(config.cache_dir) / LANGUAGE_MODEL_SETTINGS_NAME
+
+
+def load_language_model_info(config: AppConfig) -> AppConfig:
+    path = language_model_settings_path(config)
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return config
+    if not isinstance(values, dict) or not values.get("save_model_info", True):
+        return config
+    config.subtitle_api_base_url = str(
+        values.get("subtitle_api_base_url") or config.subtitle_api_base_url
+    ).strip()
+    config.subtitle_model = str(
+        values.get("subtitle_model") or config.subtitle_model
+    ).strip()
+    config.subtitle_api_key_encrypted = str(
+        values.get("subtitle_api_key_encrypted") or ""
+    ).strip()
+    return config
+
+
+def save_language_model_info(config: AppConfig) -> Path:
+    path = language_model_settings_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(values, dict):
+            values = {}
+    except (OSError, ValueError, TypeError):
+        values = {}
+    enabled = bool(config.save_model_info)
+    values.update(
+        {
+            "save_model_info": enabled,
+            "subtitle_api_base_url": (
+                config.subtitle_api_base_url if enabled else ""
+            ),
+            "subtitle_model": config.subtitle_model if enabled else "",
+            "subtitle_api_key_encrypted": (
+                config.subtitle_api_key_encrypted if enabled else ""
+            ),
+        }
+    )
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(values, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
 
 
 def api_key_from_runtime(

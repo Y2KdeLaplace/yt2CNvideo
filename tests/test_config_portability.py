@@ -14,10 +14,12 @@ from videodub.config import (
     api_key_from_runtime,
     configure_cache_directory,
     encrypt_api_key,
+    load_language_model_info,
     load_config,
     migrate_work_directory,
     migrate_cache_directory,
     save_config,
+    save_language_model_info,
 )
 from videodub.platform_utils import executable_exists, resolve_executable
 
@@ -109,15 +111,35 @@ class ConfigPortabilityTests(unittest.TestCase):
             "secret-value",
         )
 
-    def test_api_key_is_never_written_to_settings(self) -> None:
+    def test_language_model_info_is_encrypted_in_cache_and_moves_with_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old_cache = root / "old-cache"
+            new_cache = root / "new-cache"
+            config = AppConfig(
+                cache_dir=str(old_cache),
+                subtitle_api_base_url="https://example.test/v1",
+                subtitle_model="example-model",
+                subtitle_api_key_encrypted=encrypt_api_key("secret-value"),
+            )
+            path = save_language_model_info(config)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotEqual(raw["subtitle_api_key_encrypted"], "secret-value")
+            migrate_cache_directory(old_cache, new_cache)
+
+            loaded = AppConfig(cache_dir=str(new_cache))
+            load_language_model_info(loaded)
+
+            self.assertEqual(loaded.subtitle_api_base_url, "https://example.test/v1")
+            self.assertEqual(loaded.subtitle_model, "example-model")
+            self.assertEqual(api_key_from_runtime(config=loaded), "secret-value")
+
+    def test_saved_voice_preset_is_reused_and_first_use_is_empty(self) -> None:
+        self.assertEqual(AppConfig().tts_voice_preset, "")
         with tempfile.TemporaryDirectory() as temp:
             settings = Path(temp) / "settings.json"
-            save_config(
-                AppConfig(subtitle_api_key_encrypted=encrypt_api_key("secret-value")),
-                settings,
-            )
-            raw = json.loads(settings.read_text(encoding="utf-8"))
-            self.assertEqual(raw["subtitle_api_key_encrypted"], "")
+            save_config(AppConfig(tts_voice_preset="Diana"), settings)
+            self.assertEqual(load_config(settings).tts_voice_preset, "Diana")
 
 
 if __name__ == "__main__":

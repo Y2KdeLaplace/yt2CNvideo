@@ -16,7 +16,7 @@ from videodub.openai_compatible import (
 )
 from videodub.runner import ProcessRunner
 from videodub.subtitle_workflow import SpeechSubtitleWorkflow, SubtitleRepairWorkflow
-from videodub.subtitles import find_source_subtitle, read_srt
+from videodub.subtitles import Cue, find_source_subtitle, read_srt
 
 
 class _MockChatServer:
@@ -86,8 +86,13 @@ class _MockChatServer:
                     )
                 elif "视频字幕译者" in system:
                     requested = json.loads(payload["messages"][1]["content"])
-                    content = json.dumps(
-                        [
+                    transcript_sentences = requested["transcript_sentences"]
+                    if (
+                        payload["model"] == "omitting-model"
+                        and "context_transcript" not in requested
+                    ):
+                        transcript_sentences = transcript_sentences[:-2]
+                    translated_rows = [
                             {
                                 "id": item["id"],
                                 "translated_text": (
@@ -96,9 +101,22 @@ class _MockChatServer:
                                     else "这是下一句话。"
                                 ),
                             }
-                            for item in requested["transcript_sentences"]
+                            for item in transcript_sentences
                         ]
-                    )
+                    if (
+                        payload["model"] == "conflicting-model"
+                        and "context_transcript" not in requested
+                    ):
+                        translated_rows = [
+                            item for item in translated_rows if item["id"] != 30
+                        ]
+                        translated_rows.extend(
+                            (
+                                {"id": 30, "translated_text": "第一个版本"},
+                                {"id": 30, "translated_text": "第二个版本"},
+                            )
+                        )
+                    content = json.dumps(translated_rows)
                 elif "讲解稿改写专家" in system:
                     content = json.dumps(
                         [
@@ -208,6 +226,65 @@ class SubtitleWorkflowTests(unittest.TestCase):
             client = OpenAICompatibleClient(mock.base_url, "kimi-k2-thinking")
             with self.assertRaisesRegex(RuntimeError, "强制使用思考模式"):
                 client.chat("system", "user")
+
+    def test_translation_retries_only_missing_ids(self) -> None:
+        with _MockChatServer() as mock:
+            workflow = SubtitleRepairWorkflow(
+                AppConfig(
+                    subtitle_api_base_url=mock.base_url,
+                    subtitle_model="omitting-model",
+                    subtitle_translation_batch_size=30,
+                ),
+                ProcessRunner(),
+            )
+            cues = [
+                Cue(index, index * 1000, (index + 1) * 1000, f"Sentence {index}.")
+                for index in range(1, 31)
+            ]
+
+            translated = workflow.translate(cues, {})
+
+            self.assertEqual([cue.index for cue in translated], list(range(1, 31)))
+            translation_calls = [
+                call
+                for call in mock.calls
+                if "视频字幕译者" in call["messages"][0]["content"]
+            ]
+            self.assertEqual(len(translation_calls), 2)
+            retry = json.loads(translation_calls[1]["messages"][1]["content"])
+            self.assertEqual(
+                [item["id"] for item in retry["transcript_sentences"]],
+                [29, 30],
+            )
+
+    def test_translation_retries_a_conflicting_duplicate_id(self) -> None:
+        with _MockChatServer() as mock:
+            workflow = SubtitleRepairWorkflow(
+                AppConfig(
+                    subtitle_api_base_url=mock.base_url,
+                    subtitle_model="conflicting-model",
+                    subtitle_translation_batch_size=30,
+                ),
+                ProcessRunner(),
+            )
+            cues = [
+                Cue(index, index * 1000, (index + 1) * 1000, f"Sentence {index}.")
+                for index in range(1, 31)
+            ]
+
+            translated = workflow.translate(cues, {})
+
+            self.assertEqual(len(translated), 30)
+            translation_calls = [
+                call
+                for call in mock.calls
+                if "视频字幕译者" in call["messages"][0]["content"]
+            ]
+            retry = json.loads(translation_calls[1]["messages"][1]["content"])
+            self.assertEqual(
+                [item["id"] for item in retry["transcript_sentences"]],
+                [30],
+            )
 
     def test_subtitle_lookup_treats_video_id_brackets_literally(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -20,10 +20,13 @@ from videodub.config import (
     SUPPORTED_LANGUAGES,
     api_key_from_runtime,
     configure_cache_directory,
+    encrypt_api_key,
+    load_language_model_info,
     load_config,
     migrate_cache_directory,
     migrate_work_directory,
     save_config,
+    save_language_model_info,
 )
 from videodub.downloader import (
     cleanup_new_download_directories,
@@ -99,6 +102,7 @@ class VideoDubApp(tk.Tk):
         self.geometry("1080x738")
         self.minsize(900, 630)
         self.config_data = load_config()
+        load_language_model_info(self.config_data)
         configure_cache_directory(self.config_data.cache_dir)
         self.config_data.ensure_directories()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -350,6 +354,12 @@ class VideoDubApp(tk.Tk):
         self.job_tree.configure(yscrollcommand=scroll.set)
         self.job_tree.bind("<Button-3>", self._show_tree_menu)
         self.job_tree.bind("<Button-2>", self._show_tree_menu)
+        self.job_tree.bind("<Control-Button-1>", self._toggle_job_selection)
+        self.job_tree.bind("<Command-Button-1>", self._toggle_job_selection)
+        self.job_tree.bind("<Control-a>", self._select_all_jobs)
+        self.job_tree.bind("<Control-A>", self._select_all_jobs)
+        self.job_tree.bind("<Command-a>", self._select_all_jobs)
+        self.job_tree.bind("<Command-A>", self._select_all_jobs)
         self.job_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
@@ -530,6 +540,7 @@ class VideoDubApp(tk.Tk):
         return self.config_data
 
     def _persist_config(self) -> None:
+        save_language_model_info(self.config_data)
         if self.config_data.save_model_info:
             save_config(self.config_data)
             return
@@ -571,6 +582,22 @@ class VideoDubApp(tk.Tk):
 
     def _selected_jobs(self) -> list[VideoJob]:
         return [self.jobs[int(item)] for item in self.job_tree.selection() if item.isdigit()]
+
+    def _toggle_job_selection(self, event: tk.Event) -> str:
+        item = self.job_tree.identify_row(event.y)
+        if not item:
+            return "break"
+        if item in self.job_tree.selection():
+            self.job_tree.selection_remove(item)
+        else:
+            self.job_tree.selection_add(item)
+            self.job_tree.focus(item)
+        return "break"
+
+    def _select_all_jobs(self, _event: tk.Event | None = None) -> str:
+        if self.job_tree.selection():
+            self.job_tree.selection_set(self.job_tree.get_children())
+        return "break"
 
     def _set_running(self, running: bool, task: str = "") -> None:
         self.current_task = task if running else ""
@@ -838,7 +865,7 @@ class VideoDubApp(tk.Tk):
             )
         ttk.Checkbutton(
             frame,
-            text="保存 API 地址和模型名（Key 仅本次运行）",
+            text="保存信息",
             variable=save,
         ).grid(
             row=3, column=1, sticky="w", padx=(10, 0), pady=(7, 10)
@@ -852,7 +879,9 @@ class VideoDubApp(tk.Tk):
             self.config_data.subtitle_model = model.get().strip()
             self.config_data.save_model_info = save.get()
             self.session_api_key = key.get().strip()
-            self.config_data.subtitle_api_key_encrypted = ""
+            self.config_data.subtitle_api_key_encrypted = (
+                encrypt_api_key(self.session_api_key) if save.get() else ""
+            )
             self._persist_config()
             dialog.destroy()
 
@@ -1068,6 +1097,9 @@ class VideoDubApp(tk.Tk):
             has_selection = selected_installed() is not None
             selected_combo.configure(
                 state="disabled" if locked.get() else "readonly"
+            )
+            install_open_button.configure(
+                state="disabled" if locked.get() else "normal"
             )
             lock_button.configure(
                 text="解锁" if locked.get() else "锁定",

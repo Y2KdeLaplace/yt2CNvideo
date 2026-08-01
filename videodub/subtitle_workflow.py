@@ -181,19 +181,34 @@ class _TextWorkflow:
         rows: list[dict[str, Any]],
         expected: list[Cue],
         field: str,
+        *,
+        allow_missing: bool = False,
     ) -> dict[int, str]:
         expected_ids = {cue.index for cue in expected}
         result: dict[int, str] = {}
+        conflicting_ids: set[int] = set()
         for row in rows:
             try:
                 cue_id = int(row["id"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("模型输出包含无效字幕 id") from exc
-            text = str(row.get(field) or "").strip()
-            if cue_id not in expected_ids or cue_id in result or not text:
+            if cue_id not in expected_ids:
                 raise ValueError(f"模型输出的字幕 {cue_id} 无效、重复或为空")
-            result[cue_id] = text
-        if set(result) != expected_ids:
+            text = str(row.get(field) or "").strip()
+            if not text:
+                if allow_missing:
+                    continue
+                raise ValueError(f"模型输出的字幕 {cue_id} 无效、重复或为空")
+            if cue_id in result:
+                if allow_missing:
+                    if result[cue_id] != text:
+                        result.pop(cue_id)
+                        conflicting_ids.add(cue_id)
+                    continue
+                raise ValueError(f"模型输出的字幕 {cue_id} 无效、重复或为空")
+            if cue_id not in conflicting_ids:
+                result[cue_id] = text
+        if not allow_missing and set(result) != expected_ids:
             missing = sorted(expected_ids - set(result))
             raise ValueError(f"模型输出遗漏字幕 id：{missing[:20]}")
         return result
@@ -301,7 +316,48 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 ensure_ascii=False,
             )
             result = self._call_array(system, prompt)
-            texts = self._validated_texts(result, batch, "translated_text")
+            texts = self._validated_texts(
+                result,
+                batch,
+                "translated_text",
+                allow_missing=True,
+            )
+            for _attempt in range(2):
+                missing = [cue for cue in batch if cue.index not in texts]
+                if not missing:
+                    break
+                self.runner.logger(
+                    f"模型遗漏 {len(missing)} 条翻译，正在补译…"
+                )
+                retry_prompt = json.dumps(
+                    {
+                        "domain": domain,
+                        "target_language": self.config.translation_language,
+                        "context_transcript": "\n".join(
+                            cue.text for cue in batch
+                        ),
+                        "transcript_sentences": [
+                            {"id": cue.index, "text": cue.text} for cue in missing
+                        ],
+                        "instruction": (
+                            "仅补译 transcript_sentences 中的缺失项，"
+                            "保留其 id，不要返回其他 id。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+                retry_result = self._call_array(system, retry_prompt)
+                texts.update(
+                    self._validated_texts(
+                        retry_result,
+                        missing,
+                        "translated_text",
+                        allow_missing=True,
+                    )
+                )
+            missing_ids = [cue.index for cue in batch if cue.index not in texts]
+            if missing_ids:
+                raise ValueError(f"模型输出遗漏字幕 id：{missing_ids[:20]}")
             translated.extend(
                 Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
                 for cue in batch
