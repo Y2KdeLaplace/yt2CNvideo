@@ -17,8 +17,8 @@ from videodub import __version__
 from videodub.config import (
     AppConfig,
     PROJECT_ROOT,
+    SUPPORTED_LANGUAGES,
     api_key_from_runtime,
-    encrypt_api_key,
     configure_cache_directory,
     load_config,
     migrate_cache_directory,
@@ -44,7 +44,11 @@ from videodub.model_manager import (
 )
 from videodub.model_runtime import ManagedModelService
 from videodub.platform_utils import open_in_file_manager
-from videodub.qwen_speech import extract_asr_subtitle
+from videodub.qwen_speech import (
+    TTS_VOICE_PRESETS,
+    extract_asr_subtitle,
+    resolve_tts_reference,
+)
 from videodub.runner import CancelledError, ProcessRunner
 from videodub.subtitle_workflow import SpeechSubtitleWorkflow, SubtitleRepairWorkflow
 from videodub.subtitles import find_source_subtitle
@@ -117,6 +121,16 @@ class VideoDubApp(tk.Tk):
         self.stage_repair = tk.BooleanVar(value=True)
         self.stage_translate = tk.BooleanVar(value=True)
         self.stage_dub = tk.BooleanVar(value=True)
+        language_labels = {value: label for label, value in SUPPORTED_LANGUAGES.items()}
+        self.asr_language = tk.StringVar(
+            value=language_labels[self.config_data.asr_language]
+        )
+        self.translation_language = tk.StringVar(
+            value=language_labels[self.config_data.translation_language]
+        )
+        self.tts_language = tk.StringVar(
+            value=language_labels[self.config_data.tts_language]
+        )
         self.parallel_enabled = tk.BooleanVar(value=False)
         self.parallel_count = tk.StringVar(value="2")
 
@@ -327,7 +341,7 @@ class VideoDubApp(tk.Tk):
             "downloaded": "下载字幕",
             "asr": "识别字幕",
             "corrected": "修复字幕",
-            "chinese": "中文字幕",
+            "chinese": "翻译字幕",
         }
         for key in columns:
             self.job_tree.heading(key, text=labels[key])
@@ -341,18 +355,58 @@ class VideoDubApp(tk.Tk):
 
         controls = ttk.Frame(self.process_tab)
         controls.pack(fill="x", pady=(10, 0))
-        for text, variable in (
-            ("提取", self.stage_asr),
-            ("修复", self.stage_repair),
-            ("翻译", self.stage_translate),
-            ("配音", self.stage_dub),
-        ):
-            ttk.Checkbutton(
-                controls,
-                text=text,
-                variable=variable,
-                style="Stage.TCheckbutton",
-            ).pack(side="left", padx=(0, 16))
+        self.extract_check = ttk.Checkbutton(
+            controls,
+            text="提取",
+            variable=self.stage_asr,
+            command=self._update_stage_language_states,
+            style="Stage.TCheckbutton",
+        )
+        self.extract_check.pack(side="left")
+        self.asr_language_combo = ttk.Combobox(
+            controls,
+            textvariable=self.asr_language,
+            values=tuple(SUPPORTED_LANGUAGES),
+            state="readonly",
+            width=7,
+        )
+        self.asr_language_combo.pack(side="left", padx=(5, 14))
+        ttk.Checkbutton(
+            controls,
+            text="修复",
+            variable=self.stage_repair,
+            style="Stage.TCheckbutton",
+        ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(
+            controls,
+            text="翻译",
+            variable=self.stage_translate,
+            command=self._update_stage_language_states,
+            style="Stage.TCheckbutton",
+        ).pack(side="left")
+        self.translation_language_combo = ttk.Combobox(
+            controls,
+            textvariable=self.translation_language,
+            values=tuple(SUPPORTED_LANGUAGES),
+            state="readonly",
+            width=7,
+        )
+        self.translation_language_combo.pack(side="left", padx=(5, 14))
+        ttk.Checkbutton(
+            controls,
+            text="配音",
+            variable=self.stage_dub,
+            command=self._update_stage_language_states,
+            style="Stage.TCheckbutton",
+        ).pack(side="left")
+        self.tts_language_combo = ttk.Combobox(
+            controls,
+            textvariable=self.tts_language,
+            values=tuple(SUPPORTED_LANGUAGES),
+            state="readonly",
+            width=7,
+        )
+        self.tts_language_combo.pack(side="left", padx=(5, 14))
         ttk.Checkbutton(
             controls,
             text="并行处理",
@@ -375,6 +429,7 @@ class VideoDubApp(tk.Tk):
             style="Main.TButton",
         )
         self.process_button.pack(side="right")
+        self._update_stage_language_states()
         self._refresh_jobs()
 
     def _append_log(self, message: str) -> None:
@@ -429,6 +484,14 @@ class VideoDubApp(tk.Tk):
             state="normal" if self.parallel_enabled.get() else "disabled"
         )
 
+    def _update_stage_language_states(self) -> None:
+        for widget, enabled in (
+            (self.asr_language_combo, self.stage_asr.get()),
+            (self.translation_language_combo, self.stage_translate.get()),
+            (self.tts_language_combo, self.stage_dub.get()),
+        ):
+            widget.configure(state="readonly" if enabled else "disabled")
+
     def _browse_work_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.work_dir.get(), parent=self)
         if not selected:
@@ -453,6 +516,11 @@ class VideoDubApp(tk.Tk):
         self.config_data.work_dir = self.work_dir.get()
         self.config_data.link_type = self.link_type.get()
         self.config_data.subtitle_languages = self.subtitle_languages.get().strip()
+        self.config_data.asr_language = SUPPORTED_LANGUAGES[self.asr_language.get()]
+        self.config_data.translation_language = SUPPORTED_LANGUAGES[
+            self.translation_language.get()
+        ]
+        self.config_data.tts_language = SUPPORTED_LANGUAGES[self.tts_language.get()]
         self.config_data.normalize()
         self.config_data.ensure_directories()
         problems = self.config_data.validate_core()
@@ -603,13 +671,7 @@ class VideoDubApp(tk.Tk):
             if stages[3]:
                 tts_model = read_installed_model(config.tts_model_path)
                 if tts_model and tts_model.variant == "base":
-                    if (
-                        not Path(config.tts_reference_audio).is_file()
-                        or not config.tts_reference_text.strip()
-                    ):
-                        raise ValueError(
-                            "当前 Base TTS 模型需要参考音频 WAV 和对应文本。"
-                        )
+                    resolve_tts_reference(config)
             parallel = 1
             if self.parallel_enabled.get():
                 raw_parallel = self.parallel_count.get().strip()
@@ -619,7 +681,7 @@ class VideoDubApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("设置错误", str(exc), parent=self)
             return
-        self._separator("字幕与中文配音")
+        self._separator("字幕与配音")
         self.runner.reset()
         self._set_running(True, "process")
         self.worker = threading.Thread(
@@ -705,6 +767,7 @@ class VideoDubApp(tk.Tk):
                         config,
                         runner,
                         job,
+                        language=config.asr_language,
                         base_url=asr_url,
                     )
                 if repair or translate:
@@ -737,7 +800,7 @@ class VideoDubApp(tk.Tk):
                         speech_subtitle_path=speech,
                         qwen_base_url=tts_url,
                     )
-                    runner.logger(f"中文配音视频：{output}")
+                    runner.logger(f"配音视频：{output}")
         finally:
             with self.runners_lock:
                 if runner in self.active_runners:
@@ -773,7 +836,11 @@ class VideoDubApp(tk.Tk):
             ttk.Entry(frame, textvariable=variable, show=show, width=56).grid(
                 row=row, column=1, sticky="ew", padx=(10, 0), pady=6
             )
-        ttk.Checkbutton(frame, text="保存信息", variable=save).grid(
+        ttk.Checkbutton(
+            frame,
+            text="保存 API 地址和模型名（Key 仅本次运行）",
+            variable=save,
+        ).grid(
             row=3, column=1, sticky="w", padx=(10, 0), pady=(7, 10)
         )
 
@@ -785,9 +852,7 @@ class VideoDubApp(tk.Tk):
             self.config_data.subtitle_model = model.get().strip()
             self.config_data.save_model_info = save.get()
             self.session_api_key = key.get().strip()
-            self.config_data.subtitle_api_key_encrypted = (
-                encrypt_api_key(self.session_api_key) if save.get() else ""
-            )
+            self.config_data.subtitle_api_key_encrypted = ""
             self._persist_config()
             dialog.destroy()
 
@@ -820,8 +885,12 @@ class VideoDubApp(tk.Tk):
         reference_audio = tk.StringVar(
             value=self.config_data.tts_reference_audio
         )
-        reference_text = tk.StringVar(
-            value=self.config_data.tts_reference_text
+        reference_text_file = tk.StringVar(
+            value=self.config_data.tts_reference_text_file
+        )
+        voice_preset = tk.StringVar(value=self.config_data.tts_voice_preset)
+        use_custom_voice = tk.BooleanVar(
+            value=self.config_data.tts_use_custom_voice
         )
 
         ttk.Label(frame, text="模型选择").grid(row=0, column=0, sticky="w")
@@ -850,13 +919,40 @@ class VideoDubApp(tk.Tk):
             sticky="ew",
             pady=(10, 0),
         )
-        ttk.Label(reference_frame, text="参考音频 WAV").grid(
+        ttk.Label(reference_frame, text="预设声音").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        voice_preset_combo = ttk.Combobox(
+            reference_frame,
+            textvariable=voice_preset,
+            values=tuple(TTS_VOICE_PRESETS),
+            state="readonly",
+        )
+        voice_preset_combo.grid(row=0, column=1, sticky="ew", padx=(10, 8))
+        custom_voice_check = ttk.Checkbutton(
+            reference_frame,
+            text="使用自定义声音",
+            variable=use_custom_voice,
+        )
+        custom_voice_check.grid(row=0, column=2, sticky="e")
+
+        custom_reference_frame = ttk.Frame(reference_frame)
+        custom_reference_frame.grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(9, 0),
+        )
+        ttk.Label(custom_reference_frame, text="参考音频 WAV").grid(
             row=0,
             column=0,
             sticky="w",
         )
         reference_entry = ttk.Entry(
-            reference_frame,
+            custom_reference_frame,
             textvariable=reference_audio,
             state="readonly",
         )
@@ -866,26 +962,32 @@ class VideoDubApp(tk.Tk):
             sticky="ew",
             padx=(10, 8),
         )
-        reference_browse = ttk.Button(reference_frame, text="选择")
+        reference_browse = ttk.Button(custom_reference_frame, text="选择")
         reference_browse.grid(row=0, column=2, sticky="e")
-        ttk.Label(reference_frame, text="对应文本").grid(
+        ttk.Label(custom_reference_frame, text="对应文本文件").grid(
             row=1,
             column=0,
             sticky="w",
             pady=(8, 0),
         )
         reference_text_entry = ttk.Entry(
-            reference_frame,
-            textvariable=reference_text,
+            custom_reference_frame,
+            textvariable=reference_text_file,
+            state="readonly",
         )
         reference_text_entry.grid(
             row=1,
             column=1,
-            columnspan=2,
             sticky="ew",
-            padx=(10, 0),
+            padx=(10, 8),
             pady=(8, 0),
         )
+        reference_text_browse = ttk.Button(
+            custom_reference_frame,
+            text="选择",
+        )
+        reference_text_browse.grid(row=1, column=2, sticky="e", pady=(8, 0))
+        custom_reference_frame.columnconfigure(1, weight=1)
         reference_frame.columnconfigure(1, weight=1)
         reference_frame.grid_remove()
 
@@ -930,10 +1032,23 @@ class VideoDubApp(tk.Tk):
             self.config_data.tts_reference_audio = (
                 reference_audio.get().strip()
             )
-            self.config_data.tts_reference_text = (
-                reference_text.get().strip()
+            self.config_data.tts_reference_text_file = (
+                reference_text_file.get().strip()
             )
+            self.config_data.tts_voice_preset = voice_preset.get().strip()
+            self.config_data.tts_use_custom_voice = use_custom_voice.get()
+            self.config_data.tts_reference_text = ""
             self._persist_config()
+
+        def refresh_custom_voice_state() -> None:
+            voice_preset_combo.configure(
+                state="disabled" if use_custom_voice.get() else "readonly"
+            )
+            if use_custom_voice.get():
+                custom_reference_frame.grid()
+            else:
+                custom_reference_frame.grid_remove()
+            save_reference()
 
         def refresh_reference_state() -> None:
             installed = selected_installed()
@@ -945,6 +1060,7 @@ class VideoDubApp(tk.Tk):
             )
             if show:
                 reference_frame.grid()
+                refresh_custom_voice_state()
             else:
                 reference_frame.grid_remove()
 
@@ -1076,6 +1192,16 @@ class VideoDubApp(tk.Tk):
             )
             if selected:
                 reference_audio.set(selected)
+                save_reference()
+
+        def browse_reference_text() -> None:
+            selected = filedialog.askopenfilename(
+                parent=dialog,
+                title="选择对应文本文件",
+                filetypes=(("所有文件", "*.*"),),
+            )
+            if selected:
+                reference_text_file.set(selected)
                 save_reference()
 
         def show_install_dialog() -> None:
@@ -1512,8 +1638,10 @@ class VideoDubApp(tk.Tk):
             dialog.destroy()
 
         reference_browse.configure(command=browse_reference)
-        reference_text_entry.bind(
-            "<FocusOut>",
+        reference_text_browse.configure(command=browse_reference_text)
+        custom_voice_check.configure(command=refresh_custom_voice_state)
+        voice_preset_combo.bind(
+            "<<ComboboxSelected>>",
             lambda _event: save_reference(),
         )
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)

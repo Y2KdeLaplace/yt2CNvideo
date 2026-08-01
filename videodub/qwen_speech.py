@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig
+from .config import AppConfig, PROJECT_ROOT
 from .media import VideoJob, media_duration
 from .model_manager import (
     InstalledModel,
@@ -26,6 +26,13 @@ from .subtitles import Cue, read_srt, write_srt
 
 ASR_SERVICE_URL = "http://127.0.0.1:9956"
 TTS_SERVICE_URL = "http://127.0.0.1:9955"
+TTS_VOICE_PRESETS = {
+    name: (
+        PROJECT_ROOT / "sample_voice" / name / f"{name}.wav",
+        PROJECT_ROOT / "sample_voice" / name / f"{name}.txt",
+    )
+    for name in ("Diana", "Eileen")
+}
 
 _INCOMPATIBLE_CRISPASR_ASR_REPOSITORIES = {
     "handy-computer/qwen3-asr-0.6b-gguf",
@@ -198,6 +205,14 @@ def _crispasr_language_code(language: str) -> str:
         "chinese": "zh",
         "mandarin": "zh",
         "cantonese": "yue",
+        "japanese": "ja",
+        "korean": "ko",
+        "german": "de",
+        "spanish": "es",
+        "french": "fr",
+        "italian": "it",
+        "portuguese": "pt",
+        "russian": "ru",
     }.get(normalized, normalized or "en")
 
 
@@ -209,6 +224,37 @@ def _crispasr_asr_runtime_options(language: str, vad_model: Path) -> list[str]:
         "-vm",
         str(vad_model),
     ]
+
+
+def _read_reference_text(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "utf-16"):
+        try:
+            return raw.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeError(f"无法识别参考文本编码：{path}")
+
+
+def resolve_tts_reference(config: AppConfig) -> tuple[str, str]:
+    if config.tts_use_custom_voice:
+        audio = Path(config.tts_reference_audio).expanduser()
+        text_file = Path(config.tts_reference_text_file).expanduser()
+        label = "自定义声音"
+    else:
+        try:
+            audio, text_file = TTS_VOICE_PRESETS[config.tts_voice_preset]
+        except KeyError as exc:
+            raise ValueError("请为 Base TTS 模型选择 Diana、Eileen 或自定义声音。") from exc
+        label = f"预设声音 {config.tts_voice_preset}"
+    if not audio.is_file():
+        raise ValueError(f"{label}的参考音频不存在：{audio}")
+    if not text_file.is_file():
+        raise ValueError(f"{label}的对应文本文件不存在：{text_file}")
+    text = _read_reference_text(text_file)
+    if not text:
+        raise ValueError(f"{label}的对应文本为空：{text_file}")
+    return str(audio.resolve()), text
 
 
 def extract_asr_subtitle(
@@ -318,6 +364,10 @@ def synthesize_qwen(
         installed = read_installed_model(config.tts_model_path)
         if executable is None or installed is None:
             raise RuntimeError("Qwen3-TTS GGUF 运行环境或模型不存在")
+        reference_audio = config.tts_reference_audio
+        reference_text = config.tts_reference_text
+        if installed.variant == "base":
+            reference_audio, reference_text = resolve_tts_reference(config)
         runner.run(
             (
                 [
@@ -329,9 +379,11 @@ def synthesize_qwen(
                     "--codec-model",
                     installed.codec_path,
                     "--voice",
-                    config.tts_reference_audio,
+                    reference_audio,
                     "--ref-text",
-                    config.tts_reference_text,
+                    reference_text,
+                    "-l",
+                    _crispasr_language_code(config.tts_language),
                     "--tts",
                     text,
                     "--tts-output",
@@ -339,19 +391,21 @@ def synthesize_qwen(
                 ]
                 if installed.variant == "base"
                 else [
-                executable,
-                "--backend",
-                "qwen3-tts-customvoice",
-                "-m",
-                first_model_file(config.tts_model_path, "*.gguf"),
-                "--codec-model",
-                installed.codec_path,
-                "--voice",
-                config.tts_speaker,
-                "--tts",
-                text,
-                "--tts-output",
-                output,
+                    executable,
+                    "--backend",
+                    "qwen3-tts-customvoice",
+                    "-m",
+                    first_model_file(config.tts_model_path, "*.gguf"),
+                    "--codec-model",
+                    installed.codec_path,
+                    "--voice",
+                    config.tts_speaker,
+                    "-l",
+                    _crispasr_language_code(config.tts_language),
+                    "--tts",
+                    text,
+                    "--tts-output",
+                    output,
                 ]
             ),
             quiet=True,
@@ -359,7 +413,7 @@ def synthesize_qwen(
         return
     response = _json_request(
         base_url.rstrip("/") + "/v1/tts",
-        payload={"text": text},
+        payload={"text": text, "language": config.tts_language},
         timeout=1800,
     )
     _copy_qwen_audio(response, output)

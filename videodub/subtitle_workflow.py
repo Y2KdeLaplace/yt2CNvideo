@@ -10,28 +10,37 @@ from .config import AppConfig
 from .media import VideoJob
 from .openai_compatible import ChatResult, OpenAICompatibleClient
 from .runner import ProcessRunner
-from .subtitles import Cue, extract_json_array, find_source_subtitle, read_srt, write_srt
+from .subtitles import (
+    Cue,
+    align_transcript_to_cues,
+    extract_json_array,
+    find_source_subtitle,
+    read_srt,
+    semantic_cues,
+    subtitle_transcript,
+    write_srt,
+)
 
 
 DOMAIN_SYSTEM = """你是视频内容与专业术语分析专家。
-输入包含视频信息、YouTube 字幕样本和 Qwen3-ASR 字幕样本。
+输入包含视频信息、YouTube 文稿样本和 Qwen3-ASR 文稿样本。
 判断主题和专业领域，整理专有名词、缩写、符号与公式的规范写法。
 只返回 JSON 对象，不要使用 Markdown，不要臆造原内容中没有依据的信息。"""
 
-COMPARE_REPAIR_SYSTEM = """你是严格的视频字幕校对专家。
-以 YouTube 字幕的 id 和时间轴为准，逐条比对同时间段的 Qwen3-ASR 识别文本，并结合主题与术语表生成正确的原语言字幕。
-两个来源互相印证：不要把 ASR 当作绝对正确；证据冲突时选择符合语境、语法和专业知识的版本。
-修正错词、专有名词、断裂文本和明显漏字，但不得扩写、翻译或改变原意。
-数学表达可以使用清晰的 LaTeX 行内公式，例如 $\\sum_{i=1}^{10}x_i$。
-必须保留输入的每个 id，不能合并、拆分或遗漏。只返回 JSON 数组，每项格式为 {"id": 1, "corrected_text": "..."}。"""
+TRANSCRIPT_REPAIR_SYSTEM = """你是严格的视频文稿校对专家。
+输入是同一段视频的 YouTube 文稿和 Qwen3-ASR 文稿，两者都已移除字幕 id 和时间戳。
+请把两份文稿合并为一份连贯、完整、原语言的校正文稿。两个来源互相印证，不要把 ASR 当作绝对正确。
+结合上下文、视频主题和术语表修正错词、专有名词、断裂句子和明显漏字，但不得翻译、扩写或改变原意。
+数学表达可以使用清晰的 LaTeX 行内公式。
+只返回 JSON 对象：{"corrected_transcript": "..."}，不要使用 Markdown。"""
 
-TRANSLATION_SYSTEM = """你是专业的简体中文字幕译者。
-根据视频领域和术语表翻译原语言字幕。保持每个 id 独立，不合并、不拆分、不遗漏。
-译文要准确、自然、简洁，术语、人名、缩写和公式全片一致；公式可以保留为 LaTeX。
-只返回 JSON 数组，每项格式为 {"id": 1, "zh": "..."}，不要使用 Markdown。"""
+TRANSLATION_SYSTEM = """你是专业的视频字幕译者。
+把已校正的连续文稿翻译为 {target_language}。输入已按完整句子分组，id 只是时间轴锚点，不是要求逐字对应。
+在看完整个批次的上下文后再翻译，优先保证语义准确、表达流畅、术语一致和适合字幕阅读。
+保留每个句子组的 id，不遗漏。只返回 JSON 数组，每项格式为 {"id": 1, "translated_text": "..."}，不要使用 Markdown。"""
 
-SPEECH_REWRITE_SYSTEM = """你是中文讲解稿改写专家。
-把中文字幕逐条改写成适合语音朗读、同时不改变信息内容的中文。
+SPEECH_REWRITE_SYSTEM = """你是 {language} 讲解稿改写专家。
+把字幕逐条改写成适合 {language} 语音朗读、同时不改变信息内容的文本。
 把公式、数学符号、英文缩写和无法直接朗读的写法改成自然口语。例如公式应表达其运算关系，而不是逐字符念出。
 不要增加解释、总结或过渡句；保持每个 id 独立，不合并、不拆分、不遗漏。
 只返回 JSON 数组，每项格式为 {"id": 1, "speech_text": "..."}。"""
@@ -103,17 +112,6 @@ def _read_metadata(job: VideoJob) -> dict[str, str]:
     return result
 
 
-def _overlapping_asr_text(youtube: Cue, asr_cues: list[Cue]) -> str:
-    margin_ms = 800
-    values = [
-        cue.text
-        for cue in asr_cues
-        if cue.end_ms >= youtube.start_ms - margin_ms
-        and cue.start_ms <= youtube.end_ms + margin_ms
-    ]
-    return " ".join(values)
-
-
 class _TextWorkflow:
     def __init__(
         self,
@@ -136,10 +134,16 @@ class _TextWorkflow:
         self.prompt_tokens += result.prompt_tokens
         self.completion_tokens += result.completion_tokens
 
-    def _call_object(self, system: str, prompt: str) -> dict[str, Any]:
+    def _call_object(
+        self,
+        system: str,
+        prompt: str,
+        *,
+        max_tokens: int = 3000,
+    ) -> dict[str, Any]:
         last_error: Exception | None = None
         for _attempt in range(2):
-            result = self.client.chat(system, prompt, max_tokens=3000)
+            result = self.client.chat(system, prompt, max_tokens=max_tokens)
             self._record_usage(result)
             try:
                 return _extract_json_object(result.text)
@@ -205,8 +209,12 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         prompt = json.dumps(
             {
                 "video": _read_metadata(job),
-                "youtube_sample": _cue_payload(_sample_cues(youtube_cues)),
-                "qwen_asr_sample": _cue_payload(_sample_cues(asr_cues)),
+                "youtube_transcript_sample": subtitle_transcript(
+                    _sample_cues(youtube_cues)
+                ),
+                "qwen_asr_transcript_sample": subtitle_transcript(
+                    _sample_cues(asr_cues)
+                ),
                 "required_schema": {
                     "domain": "string",
                     "summary": "string",
@@ -229,44 +237,43 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         asr_cues: list[Cue],
         domain: dict[str, Any],
     ) -> tuple[list[Cue], list[RepairRecord]]:
-        corrected: list[Cue] = []
-        records: list[RepairRecord] = []
-        batch_size = self.config.subtitle_detection_batch_size
-        for start in range(0, len(youtube_cues), batch_size):
-            self.runner.check_cancelled()
-            batch = youtube_cues[start : start + batch_size]
-            rows = [
+        self.runner.check_cancelled()
+        youtube_transcript = subtitle_transcript(youtube_cues)
+        asr_transcript = subtitle_transcript(asr_cues)
+        result = self._call_object(
+            TRANSCRIPT_REPAIR_SYSTEM,
+            json.dumps(
                 {
-                    "id": cue.index,
-                    "start": round(cue.start_ms / 1000, 3),
-                    "end": round(cue.end_ms / 1000, 3),
-                    "youtube_text": cue.text,
-                    "qwen_asr_text": _overlapping_asr_text(cue, asr_cues),
-                }
-                for cue in batch
-            ]
-            prompt = json.dumps(
-                {"domain": domain, "subtitles": rows},
+                    "domain": domain,
+                    "youtube_transcript": youtube_transcript,
+                    "qwen_asr_transcript": asr_transcript,
+                },
                 ensure_ascii=False,
+            ),
+            max_tokens=12_000,
+        )
+        corrected_transcript = str(result.get("corrected_transcript") or "").strip()
+        if not corrected_transcript:
+            raise ValueError("模型返回的校正文稿为空")
+        corrected = align_transcript_to_cues(youtube_cues, corrected_transcript)
+        if not corrected:
+            raise ValueError("校正文稿无法映射到 YouTube 字幕时间轴")
+        asr_aligned = align_transcript_to_cues(youtube_cues, asr_transcript)
+        corrected_by_id = {cue.index: cue.text for cue in corrected}
+        asr_by_id = {cue.index: cue.text for cue in asr_aligned}
+        records = [
+            RepairRecord(
+                cue.index,
+                cue.text,
+                asr_by_id.get(cue.index, ""),
+                corrected_by_id.get(cue.index, ""),
+                corrected_by_id.get(cue.index, "") != cue.text,
             )
-            result = self._call_array(COMPARE_REPAIR_SYSTEM, prompt)
-            texts = self._validated_texts(result, batch, "corrected_text")
-            for cue, row in zip(batch, rows, strict=True):
-                text = texts[cue.index]
-                corrected.append(Cue(cue.index, cue.start_ms, cue.end_ms, text))
-                records.append(
-                    RepairRecord(
-                        cue.index,
-                        cue.text,
-                        row["qwen_asr_text"],
-                        text,
-                        text != cue.text,
-                    )
-                )
-            self.runner.logger(
-                f"双字幕比对进度：{min(start + len(batch), len(youtube_cues))}/"
-                f"{len(youtube_cues)}"
-            )
+            for cue in youtube_cues
+        ]
+        self.runner.logger(
+            f"文稿清洗完成，已映射回 {len(corrected)} 个字幕时间段。"
+        )
         return corrected, records
 
     def translate(
@@ -275,22 +282,33 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         domain: dict[str, Any],
     ) -> list[Cue]:
         translated: list[Cue] = []
+        units = semantic_cues(cues)
         batch_size = self.config.subtitle_translation_batch_size
-        for start in range(0, len(cues), batch_size):
+        system = TRANSLATION_SYSTEM.replace(
+            "{target_language}", self.config.translation_language
+        )
+        for start in range(0, len(units), batch_size):
             self.runner.check_cancelled()
-            batch = cues[start : start + batch_size]
+            batch = units[start : start + batch_size]
             prompt = json.dumps(
-                {"domain": domain, "subtitles": _cue_payload(batch)},
+                {
+                    "domain": domain,
+                    "target_language": self.config.translation_language,
+                    "transcript_sentences": [
+                        {"id": cue.index, "text": cue.text} for cue in batch
+                    ],
+                },
                 ensure_ascii=False,
             )
-            result = self._call_array(TRANSLATION_SYSTEM, prompt)
-            texts = self._validated_texts(result, batch, "zh")
+            result = self._call_array(system, prompt)
+            texts = self._validated_texts(result, batch, "translated_text")
             translated.extend(
                 Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
                 for cue in batch
             )
             self.runner.logger(
-                f"中文翻译进度：{min(start + len(batch), len(cues))}/{len(cues)}"
+                f"{self.config.translation_language} 翻译进度："
+                f"{min(start + len(batch), len(units))}/{len(units)}"
             )
         return translated
 
@@ -323,7 +341,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         domain = self.analyze_domain(job, youtube_cues, asr_cues)
         repairs: list[RepairRecord] = []
         if repair:
-            self.runner.logger("正在逐条比对 YouTube 与 Qwen3-ASR 字幕…")
+            self.runner.logger("正在合并 YouTube 与 Qwen3-ASR 文稿…")
             corrected, repairs = self.repair(youtube_cues, asr_cues, domain)
             write_srt(job.corrected_subtitle_path, corrected)
         elif job.corrected_subtitle_path.is_file():
@@ -334,7 +352,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
             chinese = self.translate(corrected, domain)
             write_srt(job.chinese_subtitle_path, chinese)
         report = {
-            "version": 2,
+            "version": 3,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "video": str(job.video_path),
             "youtube_subtitle": str(source),
@@ -348,6 +366,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 "completion_tokens": self.completion_tokens - completion_before,
             },
             "model": self.config.subtitle_model,
+            "translation_language": self.config.translation_language,
         }
         report_path = job.generated_base_path.with_name(
             job.generated_base_path.name + ".subtitle-report.json"
@@ -359,7 +378,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         if repair:
             self.runner.logger(f"修复字幕：{job.corrected_subtitle_path}")
         if translate:
-            self.runner.logger(f"中文字幕：{job.chinese_subtitle_path}")
+            self.runner.logger(f"翻译字幕：{job.chinese_subtitle_path}")
         return report
 
 
@@ -367,17 +386,19 @@ class SpeechSubtitleWorkflow(_TextWorkflow):
     def process_job(self, job: VideoJob) -> Path:
         source = job.chinese_subtitle_path
         if not source.is_file():
-            raise RuntimeError(f"缺少中文字幕：{source.name}")
+            raise RuntimeError(f"缺少翻译字幕：{source.name}")
         cues = read_srt(source)
         if not cues:
-            raise RuntimeError(f"中文字幕为空：{source}")
+            raise RuntimeError(f"翻译字幕为空：{source}")
         spoken: list[Cue] = []
         batch_size = self.config.subtitle_translation_batch_size
         for start in range(0, len(cues), batch_size):
             self.runner.check_cancelled()
             batch = cues[start : start + batch_size]
             result = self._call_array(
-                SPEECH_REWRITE_SYSTEM,
+                SPEECH_REWRITE_SYSTEM.replace(
+                    "{language}", self.config.translation_language
+                ),
                 json.dumps({"subtitles": _cue_payload(batch)}, ensure_ascii=False),
             )
             texts = self._validated_texts(result, batch, "speech_text")

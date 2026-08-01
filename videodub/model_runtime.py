@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import AppConfig
 from .model_manager import read_installed_model, uv_runtime_prefix
-from .qwen_speech import check_qwen_service
+from .qwen_speech import check_qwen_service, resolve_tts_reference
 from .runner import ProcessRunner
 
 
@@ -92,6 +92,10 @@ class ManagedModelService:
         if self.kind == "asr" and installed.aligner_path:
             command.extend(["--aligner", installed.aligner_path])
         if self.kind == "tts":
+            reference_audio = self.config.tts_reference_audio
+            reference_text = self.config.tts_reference_text
+            if installed.variant == "base":
+                reference_audio, reference_text = resolve_tts_reference(self.config)
             command.extend(
                 [
                     "--variant",
@@ -99,9 +103,9 @@ class ManagedModelService:
                     "--speaker",
                     self.config.tts_speaker,
                     "--reference-audio",
-                    self.config.tts_reference_audio,
+                    reference_audio,
                     "--reference-text",
-                    self.config.tts_reference_text,
+                    reference_text,
                 ]
             )
         self.runner.logger(f"正在启动 {self.kind.upper()} 模型…")

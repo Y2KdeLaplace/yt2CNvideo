@@ -24,6 +24,18 @@ DEFAULT_WORK_DIR = PROJECT_ROOT / "work"
 DEFAULT_CACHE_DIR = application_cache_dir()
 SETTINGS_FILE = user_config_dir() / "settings.json"
 DEFAULT_SUBTITLE_LANGUAGES = "en-orig,en"
+SUPPORTED_LANGUAGES = {
+    "中文": "Chinese",
+    "英语": "English",
+    "日语": "Japanese",
+    "韩语": "Korean",
+    "德语": "German",
+    "西班牙语": "Spanish",
+    "法语": "French",
+    "意大利语": "Italian",
+    "葡萄牙语": "Portuguese",
+    "俄语": "Russian",
+}
 
 
 def _portable_directory(value: str, default: Path) -> str:
@@ -154,6 +166,9 @@ class AppConfig:
     save_model_info: bool = True
     subtitle_detection_batch_size: int = 40
     subtitle_translation_batch_size: int = 30
+    asr_language: str = "English"
+    translation_language: str = "Chinese"
+    tts_language: str = "Chinese"
 
     asr_backend: str = ""
     asr_model_id: str = ""
@@ -163,8 +178,11 @@ class AppConfig:
     tts_model_path: str = ""
     tts_codec_path: str = ""
     tts_speaker: str = "Vivian"
+    tts_voice_preset: str = ""
+    tts_use_custom_voice: bool = False
     tts_reference_audio: str = ""
     tts_reference_text: str = ""
+    tts_reference_text_file: str = ""
 
     audio_mode: str = "replace"
     original_volume: float = 0.12
@@ -203,6 +221,13 @@ class AppConfig:
         )
         self.original_volume = max(0.0, min(float(self.original_volume), 1.0))
         self.subtitle_api_base_url = self.subtitle_api_base_url.rstrip("/")
+        supported = set(SUPPORTED_LANGUAGES.values())
+        if self.asr_language not in supported:
+            self.asr_language = "English"
+        if self.translation_language not in supported:
+            self.translation_language = "Chinese"
+        if self.tts_language not in supported:
+            self.tts_language = "Chinese"
         return self
 
     def validate_core(self) -> list[str]:
@@ -259,8 +284,12 @@ def save_config(config: AppConfig, path: Path = SETTINGS_FILE) -> None:
     config.ensure_directories()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
+    values = asdict(config)
+    # API keys are runtime secrets. Keep the legacy field readable for old
+    # settings files, but never write a key back to disk.
+    values["subtitle_api_key_encrypted"] = ""
     temporary.write_text(
-        json.dumps(asdict(config), ensure_ascii=False, indent=2),
+        json.dumps(values, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     temporary.replace(path)

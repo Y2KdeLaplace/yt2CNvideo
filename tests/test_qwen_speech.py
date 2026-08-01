@@ -10,6 +10,7 @@ from videodub.qwen_speech import (
     _crispasr_language_code,
     _segments_to_cues,
     _validate_crispasr_asr_model,
+    resolve_tts_reference,
     synthesize_qwen,
 )
 
@@ -26,6 +27,8 @@ class QwenSpeechTests(unittest.TestCase):
     def test_crispasr_uses_explicit_language_codes(self) -> None:
         self.assertEqual(_crispasr_language_code("English"), "en")
         self.assertEqual(_crispasr_language_code("Chinese"), "zh")
+        self.assertEqual(_crispasr_language_code("Japanese"), "ja")
+        self.assertEqual(_crispasr_language_code("Russian"), "ru")
         self.assertEqual(_crispasr_language_code("yue"), "yue")
 
     def test_crispasr_asr_does_not_download_runtime_helpers(self) -> None:
@@ -114,10 +117,12 @@ class QwenSpeechTests(unittest.TestCase):
             model = root / "model.gguf"
             codec = root / "codec.gguf"
             reference = root / "reference.wav"
+            reference_text = root / "reference.anything"
             output = root / "output.wav"
             model.touch()
             codec.touch()
             reference.touch()
+            reference_text.write_text("参考文本", encoding="utf-8")
             installed = InstalledModel(
                 "tts",
                 "gguf",
@@ -130,8 +135,9 @@ class QwenSpeechTests(unittest.TestCase):
             config = AppConfig(
                 tts_backend="gguf",
                 tts_model_path=str(root),
+                tts_use_custom_voice=True,
                 tts_reference_audio=str(reference),
-                tts_reference_text="参考文本",
+                tts_reference_text_file=str(reference_text),
             )
             with (
                 patch(
@@ -149,12 +155,48 @@ class QwenSpeechTests(unittest.TestCase):
         self.assertNotIn("qwen3-tts-customvoice", runner.command)
         self.assertEqual(
             runner.command[runner.command.index("--voice") + 1],
-            str(reference),
+            str(reference.resolve()),
         )
         self.assertEqual(
             runner.command[runner.command.index("--ref-text") + 1],
             "参考文本",
         )
+        self.assertEqual(runner.command[runner.command.index("-l") + 1], "zh")
+
+    def test_custom_reference_text_file_has_no_extension_restriction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "voice.wav"
+            text_file = root / "voice.data"
+            audio.touch()
+            text_file.write_text("实际读取的文本", encoding="utf-8")
+            config = AppConfig(
+                tts_use_custom_voice=True,
+                tts_reference_audio=str(audio),
+                tts_reference_text_file=str(text_file),
+            )
+            resolved_audio, resolved_text = resolve_tts_reference(config)
+            self.assertEqual(Path(resolved_audio), audio.resolve())
+            self.assertEqual(resolved_text, "实际读取的文本")
+
+    def test_service_tts_request_contains_selected_language(self) -> None:
+        captured: dict = {}
+
+        def request(_url, *, payload=None, timeout=0):
+            captured.update(payload or {})
+            return {"audio_base64": ""}
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "videodub.qwen_speech._json_request",
+            side_effect=request,
+        ), patch("videodub.qwen_speech._copy_qwen_audio"):
+            synthesize_qwen(
+                AppConfig(tts_backend="mlx", tts_language="Japanese"),
+                "こんにちは",
+                Path(temp) / "out.wav",
+                RecordingRunner(),
+            )
+        self.assertEqual(captured["language"], "Japanese")
 
 
 if __name__ == "__main__":

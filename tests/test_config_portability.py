@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -36,6 +37,10 @@ class ConfigPortabilityTests(unittest.TestCase):
         self.assertEqual(Path(config.output_dir), Path(config.work_dir) / "output")
         self.assertTrue(config.overwrite)
         self.assertEqual(config.tts_speaker, "Vivian")
+        self.assertEqual(config.asr_language, "English")
+        self.assertEqual(config.translation_language, "Chinese")
+        self.assertEqual(config.tts_language, "Chinese")
+        self.assertEqual(config.tts_voice_preset, "")
         self.assertNotEqual(SETTINGS_FILE.parent, PROJECT_ROOT)
 
     def test_work_directory_migration_merges_and_overwrites_files(self) -> None:
@@ -103,6 +108,16 @@ class ConfigPortabilityTests(unittest.TestCase):
             api_key_from_runtime(config=AppConfig(subtitle_api_key_encrypted=encrypted)),
             "secret-value",
         )
+
+    def test_api_key_is_never_written_to_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Path(temp) / "settings.json"
+            save_config(
+                AppConfig(subtitle_api_key_encrypted=encrypt_api_key("secret-value")),
+                settings,
+            )
+            raw = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(raw["subtitle_api_key_encrypted"], "")
 
 
 if __name__ == "__main__":

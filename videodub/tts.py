@@ -10,6 +10,20 @@ from .runner import ProcessRunner
 from .subtitles import Cue, read_srt
 
 
+LANGUAGE_METADATA_CODES = {
+    "Chinese": "chi",
+    "English": "eng",
+    "Japanese": "jpn",
+    "Korean": "kor",
+    "German": "deu",
+    "Spanish": "spa",
+    "French": "fra",
+    "Italian": "ita",
+    "Portuguese": "por",
+    "Russian": "rus",
+}
+
+
 def _atempo_chain(factor: float) -> str:
     factor = max(0.5, factor)
     filters: list[str] = []
@@ -130,7 +144,7 @@ def _prepare_timed_track(
 def _output_path(config: AppConfig, job: VideoJob) -> Path:
     target_dir = job.generated_dir or Path(config.output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{job.video_path.stem}.中文配音.mp4"
+    return target_dir / f"{job.video_path.stem}.{config.tts_language}配音.mp4"
 
 
 def _mux_video(
@@ -179,9 +193,9 @@ def _mux_video(
                 "-c:s",
                 "mov_text",
                 "-metadata:s:s:0",
-                "language=chi",
+                f"language={LANGUAGE_METADATA_CODES.get(config.tts_language, 'und')}",
                 "-metadata:s:s:0",
-                "title=简体中文",
+                f"title={config.translation_language}",
             ]
         )
     command.extend(["-movflags", "+faststart", output])
@@ -199,13 +213,13 @@ def dub_video(
 ) -> Path:
     subtitle_path = job.chinese_subtitle_path
     if not subtitle_path.exists():
-        raise RuntimeError(f"缺少中文字幕：{subtitle_path.name}")
+        raise RuntimeError(f"缺少翻译字幕：{subtitle_path.name}")
     narration_path = speech_subtitle_path or subtitle_path
     cues = read_srt(narration_path)
     if not cues:
-        raise RuntimeError(f"中文字幕为空：{subtitle_path}")
+        raise RuntimeError(f"翻译字幕为空：{subtitle_path}")
     total_duration = media_duration(config, runner, job.video_path)
-    runner.logger(f"正在生成 {len(cues)} 段中文语音…")
+    runner.logger(f"正在生成 {len(cues)} 段 {config.tts_language} 语音…")
     with tempfile.TemporaryDirectory(prefix="videodub-tts-") as temp:
         work_dir = Path(temp)
         raw_dir = work_dir / "raw"

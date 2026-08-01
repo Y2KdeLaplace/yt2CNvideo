@@ -179,6 +179,7 @@ def create_tts_app(args: argparse.Namespace) -> Any:
 
     class TTSRequest(BaseModel):
         text: str
+        language: str = "Chinese"
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -195,12 +196,13 @@ def create_tts_app(args: argparse.Namespace) -> Any:
                     text=request.text,
                     ref_audio=args.reference_audio,
                     ref_text=args.reference_text,
+                    language=request.language,
                 )
             else:
                 results = model.generate_custom_voice(
                     text=request.text,
                     speaker=args.speaker,
-                    language="Chinese",
+                    language=request.language,
                 )
             result = next(iter(results)) if hasattr(results, "__iter__") else results
             audio = getattr(result, "audio", result)
@@ -209,14 +211,14 @@ def create_tts_app(args: argparse.Namespace) -> Any:
             if args.variant == "base":
                 wavs, sample_rate = model.generate_voice_clone(
                     text=request.text,
-                    language="Chinese",
+                    language=request.language,
                     ref_audio=args.reference_audio,
                     ref_text=args.reference_text,
                 )
             else:
                 wavs, sample_rate = model.generate_custom_voice(
                     text=request.text,
-                    language="Chinese",
+                    language=request.language,
                     speaker=args.speaker,
                 )
             audio = wavs[0]
