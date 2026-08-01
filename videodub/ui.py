@@ -267,6 +267,11 @@ class VideoDubApp(tk.Tk):
 
     def _on_tab_changed(self, _event: object = None) -> None:
         self._refresh_jobs()
+        if (
+            hasattr(self, "job_tree")
+            and self.notebook.select() == str(self.process_tab)
+        ):
+            self.job_tree.selection_remove(*self.job_tree.selection())
         self.after_idle(self._resize_notebook_to_current_tab)
         # Do not leave the first control (the Refresh button on macOS) as the
         # key-window default when entering the processing page.
@@ -352,6 +357,7 @@ class VideoDubApp(tk.Tk):
             self.job_tree.column(key, width=105 if key != "video" else 470, anchor="center" if key != "video" else "w")
         scroll = ttk.Scrollbar(selection, orient="vertical", command=self.job_tree.yview)
         self.job_tree.configure(yscrollcommand=scroll.set)
+        self.job_tree.bind("<Button-1>", self._clear_job_selection_on_blank)
         self.job_tree.bind("<Button-3>", self._show_tree_menu)
         self.job_tree.bind("<Button-2>", self._show_tree_menu)
         self.job_tree.bind("<Control-Button-1>", self._toggle_job_selection)
@@ -577,11 +583,15 @@ class VideoDubApp(tk.Tk):
             item = self.job_tree.insert("", "end", iid=str(index), values=values)
             if str(job.video_path) in selected_paths:
                 self.job_tree.selection_add(item)
-        if self.jobs and not self.job_tree.selection():
-            self.job_tree.selection_set("0")
 
     def _selected_jobs(self) -> list[VideoJob]:
         return [self.jobs[int(item)] for item in self.job_tree.selection() if item.isdigit()]
+
+    def _clear_job_selection_on_blank(self, event: tk.Event) -> str | None:
+        if self.job_tree.identify_row(event.y):
+            return None
+        self.job_tree.selection_remove(*self.job_tree.selection())
+        return "break"
 
     def _toggle_job_selection(self, event: tk.Event) -> str:
         item = self.job_tree.identify_row(event.y)
