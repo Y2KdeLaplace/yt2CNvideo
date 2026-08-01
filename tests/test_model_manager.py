@@ -343,6 +343,43 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(Path(installed.path), selected)
         self.assertEqual(Path(installed.vad_path), vad_file)
 
+    def test_mlx_asr_install_downloads_the_mlx_forced_aligner(self) -> None:
+        choice = ModelChoice(
+            "mlx",
+            "Qwen3-ASR 0.6B 8bit（MLX）",
+            "mlx-community/Qwen3-ASR-0.6B-8bit",
+            "mlx",
+        )
+        downloads: list[str] = []
+
+        def download(_choice, repo_id, _runner, _selected_files=()):
+            downloads.append(repo_id)
+            return Path("aligner") if "ForcedAligner" in repo_id else Path("asr")
+
+        with (
+            patch("videodub.model_manager._install_runtime"),
+            patch(
+                "videodub.model_manager._download_choice",
+                side_effect=download,
+            ),
+        ):
+            installed = install_model(
+                AppConfig(),
+                "asr",
+                choice,
+                "",
+                RecordingRunner(),
+            )
+
+        self.assertEqual(
+            downloads,
+            [
+                "mlx-community/Qwen3-ASR-0.6B-8bit",
+                "mlx-community/Qwen3-ForcedAligner-0.6B-8bit",
+            ],
+        )
+        self.assertEqual(installed.aligner_path, "aligner")
+
     def test_modelscope_cache_discovers_official_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ,
@@ -427,6 +464,10 @@ class ModelManagerTests(unittest.TestCase):
                 Path(temp),
                 "mlx-community/Qwen3-ASR-0.6B-8bit",
             )
+            aligner = create_huggingface_snapshot(
+                Path(temp),
+                "mlx-community/Qwen3-ForcedAligner-0.6B-8bit",
+            )
             base = create_huggingface_snapshot(
                 Path(temp),
                 "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
@@ -436,6 +477,7 @@ class ModelManagerTests(unittest.TestCase):
             tts_models = list_installed_models("tts")
 
         self.assertIn(str(asr), [item.path for item in asr_models])
+        self.assertEqual(asr_models[0].aligner_path, str(aligner))
         self.assertIn(str(base), [item.path for item in tts_models])
         self.assertEqual(tts_models[0].variant, "base")
 

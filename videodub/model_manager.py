@@ -25,6 +25,10 @@ from .runner import CancelledError, CommandError, ProcessRunner
 
 
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
+HF_FORCED_ALIGNER_REPOSITORY = "Qwen/Qwen3-ForcedAligner-0.6B"
+MLX_FORCED_ALIGNER_REPOSITORY = (
+    "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+)
 HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
 HF_MIRROR_ENDPOINTS = (
     "https://hf-cdn.sufy.com",
@@ -390,11 +394,15 @@ def _resolve_choice(choice: ModelChoice) -> Path | None:
 def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
     codec_path = ""
     aligner_path = ""
-    if kind == "asr" and backend == "hf":
-        aligner = (
-            resolve_modelscope_model("Qwen/Qwen3-ForcedAligner-0.6B")
-            or resolve_huggingface_model("Qwen/Qwen3-ForcedAligner-0.6B")
+    if kind == "asr" and backend in {"hf", "mlx"}:
+        repository = (
+            MLX_FORCED_ALIGNER_REPOSITORY
+            if backend == "mlx"
+            else HF_FORCED_ALIGNER_REPOSITORY
         )
+        aligner = resolve_huggingface_model(repository)
+        if backend == "hf":
+            aligner = resolve_modelscope_model(repository) or aligner
         aligner_path = str(aligner or "")
     if kind == "tts" and backend == "gguf":
         codec = resolve_huggingface_model(
@@ -953,13 +961,18 @@ def install_model(
     codec_path = ""
     aligner_path = ""
     vad_path = ""
-    if kind == "asr" and backend == "hf":
+    if kind == "asr" and backend in {"hf", "mlx"}:
+        aligner_repo = (
+            MLX_FORCED_ALIGNER_REPOSITORY
+            if backend == "mlx"
+            else HF_FORCED_ALIGNER_REPOSITORY
+        )
         aligner_choice = ModelChoice(
             "aligner",
             "",
-            "Qwen/Qwen3-ForcedAligner-0.6B",
-            "hf",
-            choice.source,
+            aligner_repo,
+            backend,
+            "huggingface" if backend == "mlx" else choice.source,
         )
         aligner_path = str(
             _download_choice(aligner_choice, aligner_choice.repo_id, runner)

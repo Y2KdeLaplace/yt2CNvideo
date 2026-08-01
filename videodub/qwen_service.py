@@ -8,6 +8,7 @@ import argparse
 import base64
 import io
 import tempfile
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -66,17 +67,153 @@ def _mlx_segments(result: Any) -> list[dict[str, Any]]:
     return segments
 
 
-def _transcribe_mlx(model: Any, audio_path: Path, language: str) -> Any:
-    return model.generate(
-        str(audio_path),
-        language=language or None,
+def _mlx_audio_chunks(audio_path: Path) -> list[tuple[Any, float]]:
+    import numpy as np
+    from mlx_audio.stt.models.qwen3_asr.qwen3_asr import (
+        split_audio_into_chunks,
     )
+    from mlx_audio.stt.utils import load_audio
+
+    return split_audio_into_chunks(
+        np.array(load_audio(str(audio_path))),
+        sr=16000,
+        chunk_duration=240.0,
+        min_chunk_duration=1.0,
+    )
+
+
+def _alignment_character(character: str) -> bool:
+    return character == "'" or unicodedata.category(character)[:1] in {"L", "N"}
+
+
+def _aligned_display_tokens(transcript: str, items: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    source_positions: list[int] = []
+    for position, character in enumerate(transcript):
+        if not _alignment_character(character):
+            continue
+        for folded in character.casefold():
+            normalized.append(folded)
+            source_positions.append(position)
+    searchable = "".join(normalized)
+    starts: list[int] = []
+    cursor = 0
+    for item in items:
+        needle = "".join(
+            character.casefold()
+            for character in str(getattr(item, "text", ""))
+            if _alignment_character(character)
+        )
+        found = searchable.find(needle, cursor) if needle else -1
+        if found < 0:
+            return [
+                str(getattr(value, "text", "")).strip() + " "
+                for value in items
+            ]
+        starts.append(source_positions[found])
+        cursor = found + len(needle)
+    return [
+        transcript[
+            0 if index == 0 else start : starts[index + 1]
+            if index + 1 < len(starts)
+            else len(transcript)
+        ]
+        for index, start in enumerate(starts)
+    ]
+
+
+def _ends_with(text: str, punctuation: str) -> bool:
+    stripped = text.rstrip(" \t\r\n\"'”’)]}）】")
+    return stripped.endswith(tuple(punctuation))
+
+
+def _alignment_to_segments(
+    alignment: Any,
+    transcript: str,
+    offset_seconds: float,
+) -> list[dict[str, Any]]:
+    items = list(getattr(alignment, "items", []) or [])
+    if not items:
+        return []
+    display_tokens = _aligned_display_tokens(transcript, items)
+    segments: list[dict[str, Any]] = []
+    first = 0
+    for index, item in enumerate(items):
+        text = "".join(display_tokens[first : index + 1]).strip()
+        next_item = items[index + 1] if index + 1 < len(items) else None
+        pause = (
+            float(getattr(next_item, "start_time", 0.0))
+            - float(getattr(item, "end_time", 0.0))
+            if next_item is not None
+            else 0.0
+        )
+        text_limit = (
+            28 if any("\u3400" <= character <= "\u9fff" for character in text) else 72
+        )
+        boundary = (
+            _ends_with(text, ".!?。！？…")
+            or pause >= 0.65
+            or len(text) >= text_limit
+            or (
+                len(text) >= text_limit // 2
+                and _ends_with(text, ",:;，：；、")
+            )
+            or next_item is None
+        )
+        if not boundary:
+            continue
+        start_item = items[first]
+        segments.append(
+            {
+                "text": text,
+                "start": round(
+                    offset_seconds
+                    + float(getattr(start_item, "start_time", 0.0)),
+                    3,
+                ),
+                "end": round(
+                    offset_seconds + float(getattr(item, "end_time", 0.0)),
+                    3,
+                ),
+            }
+        )
+        first = index + 1
+    return segments
+
+
+def _transcribe_mlx(
+    model: Any,
+    aligner: Any,
+    audio_path: Path,
+    language: str,
+) -> dict[str, Any]:
+    texts: list[str] = []
+    segments: list[dict[str, Any]] = []
+    for audio_chunk, offset_seconds in _mlx_audio_chunks(audio_path):
+        result = model.generate(audio_chunk, language=language or None)
+        text = str(
+            (
+                result.get("text")
+                if isinstance(result, dict)
+                else getattr(result, "text", "")
+            )
+            or ""
+        ).strip()
+        if not text:
+            continue
+        alignment = aligner.generate(audio_chunk, text, language)
+        aligned = _alignment_to_segments(alignment, text, offset_seconds)
+        if not aligned:
+            raise RuntimeError("MLX Forced Aligner 没有返回逐词时间戳")
+        texts.append(text)
+        segments.extend(aligned)
+    return {"text": " ".join(texts), "segments": segments}
 
 
 def create_asr_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
-    state: dict[str, Any] = {"model": None}
+    state: dict[str, Any] = {"model": None, "aligner": None}
 
     @asynccontextmanager
     async def lifespan(_app: Any):
@@ -84,6 +221,9 @@ def create_asr_app(args: argparse.Namespace) -> Any:
             from mlx_audio.stt.utils import load_model
 
             state["model"] = load_model(args.model)
+            if not args.aligner:
+                raise RuntimeError("Mac ASR 缺少 MLX Forced Aligner 模型")
+            state["aligner"] = load_model(args.aligner)
         else:
             from qwen_asr import Qwen3ASRModel
 
@@ -98,6 +238,7 @@ def create_asr_app(args: argparse.Namespace) -> Any:
             )
         yield
         state["model"] = None
+        state["aligner"] = None
 
     app = FastAPI(lifespan=lifespan)
 
@@ -120,7 +261,12 @@ def create_asr_app(args: argparse.Namespace) -> Any:
                 temp_path = Path(handle.name)
             if args.backend == "mlx":
                 model = state["model"]
-                result = _transcribe_mlx(model, temp_path, language)
+                result = _transcribe_mlx(
+                    model,
+                    state["aligner"],
+                    temp_path,
+                    language,
+                )
                 text = str(
                     (result.get("text") if isinstance(result, dict) else getattr(result, "text", ""))
                     or ""

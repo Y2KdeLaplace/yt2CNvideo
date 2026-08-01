@@ -72,12 +72,16 @@ uv run scip
 程序直接使用 MLX 模型及 `mlx-audio` 的调用方式：
 
 - ASR：`mlx-community/Qwen3-ASR-0.6B-8bit`
+- ASR 对齐：`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`
 - TTS Base：`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit`
 - TTS CustomVoice：`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`
 
 uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 [royisme/qwen-speech-mlx](https://github.com/royisme/qwen-speech-mlx)
-的加载与推理流程，并配合两个模型仓库的接口。
+的加载与推理流程，并配合上述模型仓库的接口。
+下载 Mac ASR 模型时会同时准备 MLX Forced Aligner。识别文本先取得逐词
+时间戳，再按句末标点、真实停顿和字幕可读长度生成自然分段，不使用固定
+秒数作为最终字幕边界。
 
 ### Windows / Linux
 

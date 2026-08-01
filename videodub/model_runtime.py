@@ -69,6 +69,10 @@ class ManagedModelService:
         installed = read_installed_model(path)
         if installed is None:
             raise RuntimeError(f"模型未完整下载或已被移动：{path}")
+        if self.kind == "asr" and backend == "mlx" and not installed.aligner_path:
+            raise RuntimeError(
+                "Mac ASR 缺少 MLX Forced Aligner，请在模型菜单中重新下载该模型。"
+            )
         if backend == "gguf":
             return self
         existing = check_qwen_service(self.base_url, self.kind, timeout=1)

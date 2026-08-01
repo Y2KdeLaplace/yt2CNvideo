@@ -30,7 +30,13 @@ class ManagedModelServiceTests(unittest.TestCase):
         process = Mock()
         process.poll.return_value = None
         runner = ProcessRunner()
-        installed = InstalledModel("asr", "mlx", "owner/model", "/model")
+        installed = InstalledModel(
+            "asr",
+            "mlx",
+            "owner/model",
+            "/model",
+            aligner_path="/aligner",
+        )
         checks = iter(
             (
                 QwenServiceInfo(False, "asr"),
