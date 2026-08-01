@@ -26,26 +26,11 @@ def _timestamp_segments(result: Any) -> list[dict[str, Any]]:
     stamps = getattr(result, "time_stamps", None)
     if isinstance(stamps, list) and stamps:
         stamps = stamps[0]
-    items = list(getattr(stamps, "items", []) or [])
-    segments: list[dict[str, Any]] = []
-    current: list[Any] = []
-    for item in items:
-        current.append(item)
-        text = "".join(str(getattr(part, "text", "")) for part in current)
-        start = float(getattr(current[0], "start_time", 0.0))
-        end = float(getattr(current[-1], "end_time", start))
-        if end - start >= 7.0 or text.rstrip().endswith((".", "!", "?", "。", "！", "？")):
-            segments.append({"text": text.strip(), "start": start, "end": end})
-            current = []
-    if current:
-        segments.append(
-            {
-                "text": "".join(str(getattr(part, "text", "")) for part in current).strip(),
-                "start": float(getattr(current[0], "start_time", 0.0)),
-                "end": float(getattr(current[-1], "end_time", 0.0)),
-            }
-        )
-    return [item for item in segments if item["text"]]
+    return _alignment_to_segments(
+        stamps,
+        str(getattr(result, "text", "") or ""),
+        0.0,
+    )
 
 
 def _mlx_segments(result: Any) -> list[dict[str, Any]]:

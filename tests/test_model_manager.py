@@ -319,6 +319,16 @@ class ModelManagerTests(unittest.TestCase):
             vad_root.mkdir()
             vad_file = vad_root / "ggml-silero-v6.2.0.bin"
             vad_file.write_text("vad", encoding="utf-8")
+            aligner_root = root / "aligner"
+            aligner_root.mkdir()
+            aligner_file = (
+                aligner_root / "qwen3-forced-aligner-0.6b-q8_0.gguf"
+            )
+            aligner_file.write_text("aligner", encoding="utf-8")
+
+            def companion(repo_id, _runner, _include=()):
+                return aligner_root if "forced-aligner" in repo_id else vad_root
+
             with (
                 patch("videodub.model_manager._install_runtime"),
                 patch(
@@ -327,7 +337,7 @@ class ModelManagerTests(unittest.TestCase):
                 ),
                 patch(
                     "videodub.model_manager._download_huggingface",
-                    return_value=vad_root,
+                    side_effect=companion,
                 ),
             ):
                 installed = install_model(
@@ -342,6 +352,7 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(installed.backend, "gguf")
         self.assertEqual(Path(installed.path), selected)
         self.assertEqual(Path(installed.vad_path), vad_file)
+        self.assertEqual(Path(installed.aligner_path), aligner_file)
 
     def test_mlx_asr_install_downloads_the_mlx_forced_aligner(self) -> None:
         choice = ModelChoice(
@@ -446,7 +457,13 @@ class ModelManagerTests(unittest.TestCase):
         self.assertTrue(any("custom" in key for key in variants))
 
     def test_gguf_asr_choice_uses_crispasr_conversion(self) -> None:
-        choice = next(item for item in model_choices("asr") if item.key == "gguf")
+        with patch(
+            "videodub.model_manager.platform.system",
+            return_value="Windows",
+        ):
+            choice = next(
+                item for item in model_choices("asr") if item.key == "gguf"
+            )
         self.assertEqual(choice.repo_id, "cstr/qwen3-asr-0.6b-GGUF")
 
     def test_macos_discovers_existing_mlx_models(self) -> None:

@@ -16,6 +16,11 @@ class ManagedModelServiceTests(unittest.TestCase):
         process.poll.return_value = None
         with (
             patch("videodub.model_runtime.os.name", "nt"),
+            patch(
+                "videodub.model_runtime.subprocess.CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
             patch("videodub.model_runtime.subprocess.run") as run,
         ):
             _terminate_process_tree(process)

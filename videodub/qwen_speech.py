@@ -216,13 +216,21 @@ def _crispasr_language_code(language: str) -> str:
     }.get(normalized, normalized or "en")
 
 
-def _crispasr_asr_runtime_options(language: str, vad_model: Path) -> list[str]:
+def _crispasr_asr_runtime_options(
+    language: str,
+    vad_model: Path,
+    aligner_model: Path,
+) -> list[str]:
     return [
         "-l",
         _crispasr_language_code(language),
         "--vad",
         "-vm",
         str(vad_model),
+        "-am",
+        str(aligner_model),
+        "--split-on-punct",
+        "--strict-pipeline",
     ]
 
 
@@ -294,9 +302,16 @@ def extract_asr_subtitle(
             model = first_model_file(config.asr_model_path, "*.gguf")
             installed = _validate_crispasr_asr_model(model)
             vad_model = Path(installed.vad_path) if installed else Path()
+            aligner_model = (
+                Path(installed.aligner_path) if installed else Path()
+            )
             if not installed or not vad_model.is_file():
                 raise RuntimeError(
                     "ASR GGUF 缺少 Silero VAD 依赖，请在模型菜单中重新下载该模型。"
+                )
+            if not aligner_model.is_file():
+                raise RuntimeError(
+                    "ASR GGUF 缺少 Qwen3 Forced Aligner，请在模型菜单中重新下载该模型。"
                 )
             prefix = Path(temp) / "recognized"
             runner.run(
@@ -308,7 +323,11 @@ def extract_asr_subtitle(
                     model,
                     "-f",
                     wav_path,
-                    *_crispasr_asr_runtime_options(language, vad_model),
+                    *_crispasr_asr_runtime_options(
+                        language,
+                        vad_model,
+                        aligner_model,
+                    ),
                     "-osrt",
                     "-of",
                     prefix,

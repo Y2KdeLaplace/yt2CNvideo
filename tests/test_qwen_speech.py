@@ -32,10 +32,24 @@ class QwenSpeechTests(unittest.TestCase):
         self.assertEqual(_crispasr_language_code("yue"), "yue")
 
     def test_crispasr_asr_does_not_download_runtime_helpers(self) -> None:
-        options = _crispasr_asr_runtime_options("English", Path("vad.bin"))
+        options = _crispasr_asr_runtime_options(
+            "English",
+            Path("vad.bin"),
+            Path("aligner.gguf"),
+        )
         self.assertEqual(
             options,
-            ["-l", "en", "--vad", "-vm", "vad.bin"],
+            [
+                "-l",
+                "en",
+                "--vad",
+                "-vm",
+                "vad.bin",
+                "-am",
+                "aligner.gguf",
+                "--split-on-punct",
+                "--strict-pipeline",
+            ],
         )
 
     def test_asr_segments_become_srt_cues(self) -> None:

@@ -26,6 +26,8 @@ from .runner import CancelledError, CommandError, ProcessRunner
 
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
 HF_FORCED_ALIGNER_REPOSITORY = "Qwen/Qwen3-ForcedAligner-0.6B"
+GGUF_FORCED_ALIGNER_REPOSITORY = "cstr/qwen3-forced-aligner-0.6b-GGUF"
+GGUF_FORCED_ALIGNER_FILENAME = "qwen3-forced-aligner-0.6b-q8_0.gguf"
 MLX_FORCED_ALIGNER_REPOSITORY = (
     "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 )
@@ -404,6 +406,13 @@ def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
         if backend == "hf":
             aligner = resolve_modelscope_model(repository) or aligner
         aligner_path = str(aligner or "")
+    if kind == "asr" and backend == "gguf":
+        repository = resolve_huggingface_model(
+            GGUF_FORCED_ALIGNER_REPOSITORY
+        )
+        if repository:
+            aligner = repository / GGUF_FORCED_ALIGNER_FILENAME
+            aligner_path = str(aligner) if aligner.is_file() else ""
     if kind == "tts" and backend == "gguf":
         codec = resolve_huggingface_model(
             "cstr/qwen3-tts-tokenizer-12hz-GGUF"
@@ -988,6 +997,15 @@ def install_model(
             raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
         codec_path = str(codec_files[0])
     if kind == "asr" and backend == "gguf":
+        aligner = _download_huggingface(
+            GGUF_FORCED_ALIGNER_REPOSITORY,
+            runner,
+            (GGUF_FORCED_ALIGNER_FILENAME,),
+        )
+        aligner_file = aligner / GGUF_FORCED_ALIGNER_FILENAME
+        if not aligner_file.is_file():
+            raise RuntimeError("ASR GGUF 的 Qwen3 Forced Aligner 下载后未找到")
+        aligner_path = str(aligner_file)
         vad = _download_huggingface(
             "ggml-org/whisper-vad",
             runner,
