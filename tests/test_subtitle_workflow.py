@@ -554,6 +554,29 @@ class SubtitleWorkflowTests(unittest.TestCase):
             ]
             self.assertEqual(len(segmentation_calls), 2)
 
+    def test_translation_failure_artifacts_are_saved_beside_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output"
+            output.mkdir()
+            workflow = SubtitleRepairWorkflow(
+                AppConfig(subtitle_model="failing-model"),
+                ProcessRunner(),
+            )
+            workflow._call_array = Mock(side_effect=RuntimeError("模型失败"))
+
+            with self.assertRaisesRegex(RuntimeError, "模型失败"):
+                workflow.translate(
+                    [Cue(1, 0, 2000, "A spike train.")],
+                    {},
+                    artifact_base=root / "Lecture",
+                    transcript_path=output / "Lecture.zh-CN.txt",
+                )
+
+            self.assertTrue((root / "Lecture.translation-debug.txt").is_file())
+            self.assertTrue((root / "Lecture.segmentation-debug.json").is_file())
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_malformed_segmentation_json_falls_back_to_complete_sentence(self) -> None:
         with _MockChatServer() as mock:
             logs: list[str] = []
@@ -732,6 +755,16 @@ class SubtitleWorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 ),
                 "一个脉冲序列。这是下一句话。",
+            )
+            self.assertEqual(
+                {path.name for path in (root / "output").iterdir()},
+                {
+                    "Lecture [abc123].corrected.srt",
+                    "Lecture [abc123].zh-CN.srt",
+                },
+            )
+            self.assertTrue(
+                (root / "Lecture [abc123].subtitle-report.json").is_file()
             )
             self.assertEqual(report["domain"]["domain"], "computational neuroscience")
             repair_calls = [

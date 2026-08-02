@@ -75,6 +75,71 @@ class TtsTests(unittest.TestCase):
         )
         self.assertEqual(output.name, "full_audio.wav")
 
+    def test_tts_retries_once_after_generation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            calls = 0
+            messages: list[str] = []
+
+            def synthesize(_config, _text, output, _runner, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("临时失败")
+                output.write_bytes(b"audio")
+
+            with (
+                patch(
+                    "videodub.tts.check_qwen_service",
+                    return_value=SimpleNamespace(
+                        available=True,
+                        model="Qwen3-TTS",
+                        error="",
+                    ),
+                ),
+                patch("videodub.tts.synthesize_qwen", side_effect=synthesize),
+            ):
+                output = _synthesize_qwen(
+                    AppConfig(tts_backend="mlx"),
+                    ProcessRunner(messages.append),
+                    "需要重试。",
+                    root,
+                    "http://127.0.0.1:9955",
+                )
+                output_bytes = output.read_bytes()
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(output_bytes, b"audio")
+        self.assertTrue(any("正在自动重试" in message for message in messages))
+
+    def test_tts_reports_error_after_retry_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with (
+                patch(
+                    "videodub.tts.check_qwen_service",
+                    return_value=SimpleNamespace(
+                        available=True,
+                        model="Qwen3-TTS",
+                        error="",
+                    ),
+                ),
+                patch(
+                    "videodub.tts.synthesize_qwen",
+                    side_effect=RuntimeError("模型失败"),
+                ) as synthesize,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "连续 2 次生成失败"):
+                    _synthesize_qwen(
+                        AppConfig(tts_backend="mlx"),
+                        ProcessRunner(),
+                        "始终失败。",
+                        root,
+                        "http://127.0.0.1:9955",
+                    )
+
+        self.assertEqual(synthesize.call_count, 2)
+
     def test_long_tts_text_is_split_only_at_sentence_boundaries(self) -> None:
         first = "甲" * 350 + "。"
         second = "乙" * 350 + "。"
@@ -122,6 +187,54 @@ class TtsTests(unittest.TestCase):
             self.assertEqual(batches, [["甲" * 350 + "。", "乙" * 350 + "。"]])
             self.assertGreater(_wav_duration_ms(output), 200)
             self.assertTrue((root / "tts-chunks.json").is_file())
+
+    def test_long_tts_retries_failed_batch_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            text = ("甲" * 350 + "。") + ("乙" * 350 + "。")
+            batches: list[list[str]] = []
+
+            def synthesize_batch(_config, texts, outputs, _runner, **_kwargs):
+                batches.append(texts)
+                for index, output in enumerate(outputs):
+                    if len(batches) == 1 and index == 1:
+                        raise RuntimeError("第二段临时失败")
+                    with wave.open(str(output), "wb") as destination:
+                        destination.setnchannels(1)
+                        destination.setsampwidth(2)
+                        destination.setframerate(24000)
+                        destination.writeframes(b"\0\0" * 2400)
+
+            with (
+                patch(
+                    "videodub.tts.check_qwen_service",
+                    return_value=SimpleNamespace(
+                        available=True,
+                        model="Qwen3-TTS",
+                        error="",
+                    ),
+                ),
+                patch(
+                    "videodub.tts.synthesize_qwen_batch",
+                    side_effect=synthesize_batch,
+                ),
+            ):
+                output = _synthesize_qwen(
+                    AppConfig(tts_backend="mlx"),
+                    ProcessRunner(),
+                    text,
+                    root,
+                    "http://127.0.0.1:9955",
+                )
+
+            self.assertEqual(
+                batches,
+                [
+                    ["甲" * 350 + "。", "乙" * 350 + "。"],
+                    ["甲" * 350 + "。", "乙" * 350 + "。"],
+                ],
+            )
+            self.assertGreater(_wav_duration_ms(output), 200)
 
     def test_alignment_reuses_exact_tts_chunk_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -20,7 +20,7 @@ from .qwen_speech import (
     synthesize_qwen,
     synthesize_qwen_batch,
 )
-from .runner import ProcessRunner
+from .runner import CancelledError, ProcessRunner
 from .subtitles import Cue, read_srt
 
 
@@ -46,6 +46,7 @@ MAX_TOTAL_DELAY_MS = 800
 TTS_BATCH_SIZE = 2
 TTS_CHUNK_MAX_CHARS = 600
 TTS_CHUNK_SILENCE_MS = 120
+TTS_SYNTHESIS_ATTEMPTS = 2
 SENTENCE_END_RE = re.compile(r"[.!?。！？][\"'”’》〉】』〕〗〙〛）)\]]*$")
 TTS_SENTENCE_BREAK_RE = re.compile(
     r"[.!?。！？…]+[\"'”’》〉】』〕〗〙〛）)\]]*\s*"
@@ -164,7 +165,22 @@ def _synthesize_qwen(
     output = work_dir / "full_audio.wav"
     chunks = _tts_text_chunks(text)
     if len(chunks) == 1:
-        synthesize_qwen(config, text, output, runner, base_url=base_url)
+        for attempt in range(1, TTS_SYNTHESIS_ATTEMPTS + 1):
+            runner.check_cancelled()
+            output.unlink(missing_ok=True)
+            try:
+                synthesize_qwen(config, text, output, runner, base_url=base_url)
+                if not output.is_file() or output.stat().st_size == 0:
+                    raise RuntimeError("Qwen3-TTS 没有返回有效音频")
+                break
+            except CancelledError:
+                raise
+            except (OSError, RuntimeError) as exc:
+                if attempt == TTS_SYNTHESIS_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Qwen3-TTS 连续 {TTS_SYNTHESIS_ATTEMPTS} 次生成失败：{exc}"
+                    ) from exc
+                runner.logger(f"Qwen3-TTS 生成失败，正在自动重试：{exc}")
     else:
         runner.logger(
             f"完整文稿超过单次 TTS 生成容量，按完整句子拆为 {len(chunks)} 段，"
@@ -172,15 +188,37 @@ def _synthesize_qwen(
         )
         chunk_paths = [work_dir / f"tts-{index:03d}.wav" for index in range(len(chunks))]
         for first in range(0, len(chunks), TTS_BATCH_SIZE):
-            runner.check_cancelled()
             last = min(first + TTS_BATCH_SIZE, len(chunks))
-            synthesize_qwen_batch(
-                config,
-                chunks[first:last],
-                chunk_paths[first:last],
-                runner,
-                base_url=base_url,
-            )
+            for attempt in range(1, TTS_SYNTHESIS_ATTEMPTS + 1):
+                runner.check_cancelled()
+                batch_paths = chunk_paths[first:last]
+                for path in batch_paths:
+                    path.unlink(missing_ok=True)
+                try:
+                    synthesize_qwen_batch(
+                        config,
+                        chunks[first:last],
+                        batch_paths,
+                        runner,
+                        base_url=base_url,
+                    )
+                    if any(
+                        not path.is_file() or path.stat().st_size == 0
+                        for path in batch_paths
+                    ):
+                        raise RuntimeError("Qwen3-TTS 没有返回完整的批次音频")
+                    break
+                except CancelledError:
+                    raise
+                except (OSError, RuntimeError) as exc:
+                    if attempt == TTS_SYNTHESIS_ATTEMPTS:
+                        raise RuntimeError(
+                            f"Qwen3-TTS 文稿分段 {first + 1}–{last} 连续 "
+                            f"{TTS_SYNTHESIS_ATTEMPTS} 次生成失败：{exc}"
+                        ) from exc
+                    runner.logger(
+                        f"Qwen3-TTS 文稿分段生成失败，正在自动重试：{exc}"
+                    )
             runner.logger(f"完整文稿 TTS 进度：{last}/{len(chunks)}")
         if any(not path.is_file() or path.stat().st_size == 0 for path in chunk_paths):
             raise RuntimeError("Qwen3-TTS 没有生成全部文稿分段")

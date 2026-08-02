@@ -29,7 +29,7 @@ class MediaDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual(
                 jobs[0].translated_transcript_path("German").resolve(),
-                (output / "Lecture.translated.de.txt").resolve(),
+                (root / "Lecture.translated.de.txt").resolve(),
             )
 
     def test_source_subtitle_is_not_duplicated_when_video_exists(self) -> None:

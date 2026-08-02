@@ -691,7 +691,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
             translated = self.translate(
                 corrected,
                 domain,
-                artifact_base=job.generated_base_path,
+                artifact_base=job.base_path,
                 transcript_path=job.translated_transcript_path(
                     self.config.translation_language
                 ),
@@ -719,8 +719,8 @@ class SubtitleRepairWorkflow(_TextWorkflow):
             "model": self.config.subtitle_model,
             "translation_language": self.config.translation_language,
         }
-        report_path = job.generated_base_path.with_name(
-            job.generated_base_path.name + ".subtitle-report.json"
+        report_path = job.base_path.with_name(
+            job.base_path.name + ".subtitle-report.json"
         )
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
