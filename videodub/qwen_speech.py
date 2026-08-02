@@ -370,6 +370,40 @@ def _copy_qwen_audio(response: dict[str, Any], target: Path) -> None:
     raise RuntimeError("Qwen3-TTS 没有返回音频")
 
 
+def synthesize_qwen_batch(
+    config: AppConfig,
+    texts: list[str],
+    outputs: list[Path],
+    runner: ProcessRunner,
+    *,
+    base_url: str = TTS_SERVICE_URL,
+) -> None:
+    if len(texts) != len(outputs) or not texts:
+        raise ValueError("Qwen3-TTS 批量输入与输出数量不一致")
+    if config.tts_backend == "gguf":
+        for text, output in zip(texts, outputs, strict=True):
+            synthesize_qwen(
+                config,
+                text,
+                output,
+                runner,
+                base_url=base_url,
+            )
+        return
+    response = _json_request(
+        base_url.rstrip("/") + "/v1/tts",
+        payload={"texts": texts, "language": config.tts_language},
+        timeout=1800,
+    )
+    encoded = response.get("audio_base64_list")
+    if not isinstance(encoded, list) or len(encoded) != len(outputs):
+        raise RuntimeError("Qwen3-TTS 批量返回的音频数量不一致")
+    for value, output in zip(encoded, outputs, strict=True):
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("Qwen3-TTS 批量返回包含无效音频")
+        output.write_bytes(base64.b64decode(value))
+
+
 def synthesize_qwen(
     config: AppConfig,
     text: str,

@@ -3,12 +3,44 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from videodub.qwen_service import _timestamp_segments, _transcribe_mlx
+from videodub.qwen_service import (
+    _generate_tts_batch,
+    _timestamp_segments,
+    _transcribe_mlx,
+)
 
 
 class QwenServiceTests(unittest.TestCase):
+    def test_mlx_base_tts_uses_shared_reference_batch_generation(self) -> None:
+        model = SimpleNamespace()
+        model.batch_generate = Mock(
+            return_value=iter(
+                [
+                    SimpleNamespace(sequence_idx=1, audio="second", sample_rate=24000),
+                    SimpleNamespace(sequence_idx=0, audio="first", sample_rate=24000),
+                ]
+            )
+        )
+        args = SimpleNamespace(
+            backend="mlx",
+            variant="base",
+            reference_audio="voice.wav",
+            reference_text="reference",
+            speaker="Vivian",
+        )
+
+        outputs = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
+
+        self.assertEqual(outputs, [("first", 24000), ("second", 24000)])
+        model.batch_generate.assert_called_once_with(
+            ["一", "二"],
+            lang_code="Chinese",
+            ref_audio="voice.wav",
+            ref_text="reference",
+        )
+
     def test_official_qwen_preserves_spaces_and_uses_natural_segments(self) -> None:
         words = (
             ("Good", 1.6, 1.9),

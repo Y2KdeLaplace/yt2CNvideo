@@ -292,6 +292,83 @@ def _audio_bytes(audio: Any, sample_rate: int) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def _generate_tts_one(
+    model: Any,
+    args: argparse.Namespace,
+    text: str,
+    language: str,
+) -> tuple[Any, int]:
+    if args.backend == "mlx":
+        if args.variant == "base":
+            results = model.generate(
+                text=text,
+                ref_audio=args.reference_audio,
+                ref_text=args.reference_text,
+                lang_code=language,
+            )
+        else:
+            results = model.generate_custom_voice(
+                text=text,
+                speaker=args.speaker,
+                language=language,
+            )
+        result = next(iter(results)) if hasattr(results, "__iter__") else results
+        return (
+            getattr(result, "audio", result),
+            int(getattr(result, "sample_rate", 24000)),
+        )
+    if args.variant == "base":
+        wavs, sample_rate = model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=args.reference_audio,
+            ref_text=args.reference_text,
+        )
+    else:
+        wavs, sample_rate = model.generate_custom_voice(
+            text=text,
+            language=language,
+            speaker=args.speaker,
+        )
+    return wavs[0], int(sample_rate)
+
+
+def _generate_tts_batch(
+    model: Any,
+    args: argparse.Namespace,
+    texts: list[str],
+    language: str,
+) -> list[tuple[Any, int]]:
+    if args.backend == "mlx" and len(texts) > 1 and hasattr(model, "batch_generate"):
+        kwargs: dict[str, Any] = {"lang_code": language}
+        if args.variant == "base":
+            kwargs.update(
+                ref_audio=args.reference_audio,
+                ref_text=args.reference_text,
+            )
+        else:
+            kwargs["voices"] = [args.speaker] * len(texts)
+        try:
+            results = list(model.batch_generate(texts, **kwargs))
+        except (AttributeError, TypeError):
+            results = []
+        indexed = {
+            int(getattr(result, "sequence_idx", -1)): (
+                getattr(result, "audio", result),
+                int(getattr(result, "sample_rate", 24000)),
+            )
+            for result in results
+        }
+        if len(indexed) == len(texts) and all(
+            index in indexed for index in range(len(texts))
+        ):
+            return [indexed[index] for index in range(len(texts))]
+    return [
+        _generate_tts_one(model, args, text, language)
+        for text in texts
+    ]
+
+
 def create_tts_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
@@ -317,7 +394,8 @@ def create_tts_app(args: argparse.Namespace) -> Any:
     app = FastAPI(lifespan=lifespan)
 
     class TTSRequest(BaseModel):
-        text: str
+        text: str = ""
+        texts: list[str] | None = None
         language: str = "Chinese"
 
     @app.get("/health")
@@ -328,40 +406,23 @@ def create_tts_app(args: argparse.Namespace) -> Any:
 
     @app.post("/v1/tts")
     def synthesize(request: TTSRequest) -> dict[str, Any]:
-        model = state["model"]
-        if args.backend == "mlx":
-            if args.variant == "base":
-                results = model.generate(
-                    text=request.text,
-                    ref_audio=args.reference_audio,
-                    ref_text=args.reference_text,
-                    language=request.language,
-                )
-            else:
-                results = model.generate_custom_voice(
-                    text=request.text,
-                    speaker=args.speaker,
-                    language=request.language,
-                )
-            result = next(iter(results)) if hasattr(results, "__iter__") else results
-            audio = getattr(result, "audio", result)
-            sample_rate = int(getattr(result, "sample_rate", 24000))
-        else:
-            if args.variant == "base":
-                wavs, sample_rate = model.generate_voice_clone(
-                    text=request.text,
-                    language=request.language,
-                    ref_audio=args.reference_audio,
-                    ref_text=args.reference_text,
-                )
-            else:
-                wavs, sample_rate = model.generate_custom_voice(
-                    text=request.text,
-                    language=request.language,
-                    speaker=args.speaker,
-                )
-            audio = wavs[0]
-        return {"audio_base64": _audio_bytes(audio, sample_rate), "model": args.model}
+        texts = request.texts if request.texts is not None else [request.text]
+        if not texts or any(not text.strip() for text in texts):
+            raise HTTPException(status_code=400, detail="TTS text is empty")
+        outputs = _generate_tts_batch(
+            state["model"],
+            args,
+            texts,
+            request.language,
+        )
+        encoded = [_audio_bytes(audio, sample_rate) for audio, sample_rate in outputs]
+        response: dict[str, Any] = {
+            "audio_base64_list": encoded,
+            "model": args.model,
+        }
+        if request.texts is None:
+            response["audio_base64"] = encoded[0]
+        return response
 
     return app
 

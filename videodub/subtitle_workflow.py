@@ -493,6 +493,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 batches.append(current_batch)
 
             rows = []
+            segmentation_unavailable = False
             for batch_number, batch_groups in enumerate(batches, 1):
                 segmentation_groups = [
                     {
@@ -513,14 +514,27 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 }
                 batch_rows: list[dict[str, Any]] = []
                 batch_texts: dict[int, str] = {}
-                for attempt in range(2):
-                    batch_rows = self._call_array(
-                        segmentation_system,
-                        json.dumps(segmentation_request, ensure_ascii=False),
-                        max_tokens=8_000,
+                if segmentation_unavailable:
+                    batch_texts = {
+                        int(group["ids"][0]): group_texts[int(group["group_id"])]
+                        for group in batch_groups
+                    }
+                    texts.update(batch_texts)
+                    self.runner.logger(
+                        f"字幕分段批次 {batch_number} 已沿用完整句组时间窗。"
                     )
-                    rows.extend(batch_rows)
+                    self.runner.logger(
+                        f"字幕时间轴分段进度：{batch_number}/{len(batches)}"
+                    )
+                    continue
+                for attempt in range(2):
                     try:
+                        batch_rows = self._call_array(
+                            segmentation_system,
+                            json.dumps(segmentation_request, ensure_ascii=False),
+                            max_tokens=8_000,
+                        )
+                        rows.extend(batch_rows)
                         if len(batch_rows) != len(batch_groups):
                             raise ValueError(
                                 "模型输出的句组数量与输入不一致"
@@ -559,12 +573,13 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                                 if part:
                                     batch_texts[int(cue_id)] = part
                         break
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                         if attempt:
                             self.runner.logger(
                                 f"字幕分段批次 {batch_number} 连续校验失败，"
-                                "已按完整句组自动合并时间窗。"
+                                "已按完整句组自动合并时间窗；后续批次将直接沿用。"
                             )
+                            segmentation_unavailable = True
                             batch_texts = {
                                 int(group["ids"][0]): group_texts[
                                     int(group["group_id"])
@@ -720,6 +735,10 @@ class SubtitleRepairWorkflow(_TextWorkflow):
 
 class SpeechSubtitleWorkflow(_TextWorkflow):
     def process_job(self, job: VideoJob) -> Path:
+        output = job.speech_subtitle_path_for(self.config.translation_language)
+        if output.is_file() and read_srt(output):
+            self.runner.logger(f"复用已有配音字幕：{output}")
+            return output
         source = job.translated_subtitle_path(self.config.translation_language)
         if not source.is_file():
             raise RuntimeError(f"缺少翻译字幕：{source.name}")
@@ -745,7 +764,6 @@ class SpeechSubtitleWorkflow(_TextWorkflow):
             self.runner.logger(
                 f"配音文本改写进度：{min(start + len(batch), len(cues))}/{len(cues)}"
             )
-        output = job.speech_subtitle_path_for(self.config.translation_language)
         write_srt(output, spoken)
         self.runner.logger(f"临时配音字幕：{output}")
         return output

@@ -106,12 +106,16 @@ class VideoDubApp(tk.Tk):
         configure_cache_directory(self.config_data.cache_dir)
         self.config_data.ensure_directories()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.runner = ProcessRunner(lambda line: self.events.put(("log", line)))
+        self.download_runner = ProcessRunner(
+            lambda line: self.events.put(("log", line))
+        )
         self.active_runners: list[ProcessRunner] = []
         self.model_download_runner: ProcessRunner | None = None
         self.runners_lock = threading.Lock()
-        self.worker: threading.Thread | None = None
-        self.current_task = ""
+        self.download_worker: threading.Thread | None = None
+        self.process_worker: threading.Thread | None = None
+        self.download_running = False
+        self.process_running = False
         self.jobs: list[VideoJob] = []
         self.model_lock_state = {"asr": False, "tts": False}
         self.session_api_key = api_key_from_runtime(config=self.config_data)
@@ -266,7 +270,7 @@ class VideoDubApp(tk.Tk):
         scroll.pack(side="right", fill="y")
 
     def _on_tab_changed(self, _event: object = None) -> None:
-        selection_locked = getattr(self, "current_task", "") == "process"
+        selection_locked = getattr(self, "process_running", False)
         if not selection_locked:
             self._refresh_jobs()
         if (
@@ -487,7 +491,7 @@ class VideoDubApp(tk.Tk):
         self.after(1, self._update_url_placeholder)
 
     def _show_tree_menu(self, event: tk.Event) -> str:
-        if getattr(self, "current_task", "") == "process":
+        if getattr(self, "process_running", False):
             return "break"
         menu = tk.Menu(self, tearoff=False)
         menu.add_command(
@@ -601,7 +605,7 @@ class VideoDubApp(tk.Tk):
         ]
 
     def _clear_job_selection_on_blank(self, event: tk.Event) -> str | None:
-        if getattr(self, "current_task", "") == "process":
+        if getattr(self, "process_running", False):
             return "break"
         if self.job_tree.identify_row(event.y):
             return None
@@ -609,7 +613,7 @@ class VideoDubApp(tk.Tk):
         return "break"
 
     def _toggle_job_selection(self, event: tk.Event) -> str:
-        if getattr(self, "current_task", "") == "process":
+        if getattr(self, "process_running", False):
             return "break"
         item = self.job_tree.identify_row(event.y)
         if not item:
@@ -622,44 +626,47 @@ class VideoDubApp(tk.Tk):
         return "break"
 
     def _select_all_jobs(self, _event: tk.Event | None = None) -> str:
-        if getattr(self, "current_task", "") == "process":
+        if getattr(self, "process_running", False):
             return "break"
         if self.job_tree.selection():
             self.job_tree.selection_set(self.job_tree.get_children())
         return "break"
 
-    def _set_running(self, running: bool, task: str = "") -> None:
-        self.current_task = task if running else ""
+    def _set_running(self, running: bool, task: str) -> None:
+        if task == "download":
+            self.download_running = running
+        elif task == "process":
+            self.process_running = running
+        else:
+            raise ValueError("未知任务状态")
         self.url_text.configure(
-            state="disabled" if running and task == "download" else "normal"
+            state="disabled" if self.download_running else "normal"
         )
-        process_selection_locked = running and task == "process"
         self.refresh_jobs_button.configure(
-            state="disabled" if process_selection_locked else "normal"
+            state="disabled" if self.process_running else "normal"
         )
         self.job_tree.state(
-            ("disabled",) if process_selection_locked else ("!disabled",)
+            ("disabled",) if self.process_running else ("!disabled",)
         )
-        if running and task == "download":
+        if self.download_running:
             self.download_button.configure(
                 text="停止",
-                command=self._stop,
+                command=self._stop_download,
                 state="normal",
             )
-            self.process_button.configure(state="disabled")
-        elif running and task == "process":
-            self.process_button.configure(
-                text="停止",
-                command=self._stop,
-                state="normal",
-            )
-            self.download_button.configure(state="disabled")
         else:
             self.download_button.configure(
                 text="下载",
                 command=self._start_download,
                 state="normal",
             )
+        if self.process_running:
+            self.process_button.configure(
+                text="停止",
+                command=self._stop_processing,
+                state="normal",
+            )
+        else:
             self.process_button.configure(
                 text="运行",
                 command=self._start_processing,
@@ -667,45 +674,49 @@ class VideoDubApp(tk.Tk):
             )
 
     def _start_download(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.download_worker and self.download_worker.is_alive():
             return
         urls = [line.strip() for line in self.url_text.get("1.0", "end").splitlines() if line.strip()]
         if not urls:
             messagebox.showwarning("缺少链接", "请先输入 YouTube 链接。", parent=self)
             return
         try:
-            config = self._sync_basic_config()
+            config = replace(self._sync_basic_config())
         except Exception as exc:
             messagebox.showerror("设置错误", str(exc), parent=self)
             return
         self._separator("YouTube 视频下载")
-        self.runner.reset()
+        self.download_runner.reset()
         self._set_running(True, "download")
-        self.worker = threading.Thread(target=self._download_worker, args=(config, urls), daemon=True)
-        self.worker.start()
+        self.download_worker = threading.Thread(
+            target=self._download_worker,
+            args=(config, urls),
+            daemon=True,
+        )
+        self.download_worker.start()
 
     def _download_worker(self, config: AppConfig, urls: list[str]) -> None:
         try:
             for url in urls:
-                self.runner.check_cancelled()
+                self.download_runner.check_cancelled()
                 before = snapshot_download_directories(config)
                 try:
-                    download(config, self.runner, url)
+                    download(config, self.download_runner, url)
                 except Exception:
                     cleanup_new_download_directories(
                         config,
                         before,
-                        self.runner,
+                        self.download_runner,
                     )
                     raise
-            self.events.put(("done", "下载完成"))
+            self.events.put(("task_done", ("download", "下载完成")))
         except CancelledError:
-            self.events.put(("done", "下载已停止"))
+            self.events.put(("task_done", ("download", "下载已停止")))
         except Exception as exc:
-            self.events.put(("error", exc))
+            self.events.put(("task_error", ("download", exc)))
 
     def _start_processing(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.process_worker and self.process_worker.is_alive():
             return
         jobs = self._selected_jobs()
         stages = (
@@ -721,7 +732,7 @@ class VideoDubApp(tk.Tk):
             messagebox.showwarning("没有任务", "请至少选择一个处理步骤。", parent=self)
             return
         try:
-            config = self._sync_basic_config()
+            config = replace(self._sync_basic_config())
             if (stages[1] or stages[2] or stages[3]) and (
                 not config.subtitle_api_base_url or not config.subtitle_model
             ):
@@ -748,14 +759,13 @@ class VideoDubApp(tk.Tk):
             messagebox.showerror("设置错误", str(exc), parent=self)
             return
         self._separator("字幕与配音")
-        self.runner.reset()
         self._set_running(True, "process")
-        self.worker = threading.Thread(
+        self.process_worker = threading.Thread(
             target=self._processing_worker,
             args=(config, jobs, stages, parallel),
             daemon=True,
         )
-        self.worker.start()
+        self.process_worker.start()
 
     def _processing_worker(
         self,
@@ -809,15 +819,15 @@ class VideoDubApp(tk.Tk):
                     if failed_count
                     else "处理完成"
                 )
-                self.events.put(("done", message))
+                self.events.put(("task_done", ("process", message)))
                 return
-            self.events.put(("done", "处理完成"))
+            self.events.put(("task_done", ("process", "处理完成")))
         except CancelledError:
             self._cancel_active_runners()
-            self.events.put(("done", "处理已停止"))
+            self.events.put(("task_done", ("process", "处理已停止")))
         except Exception as exc:
             self._cancel_active_runners()
-            self.events.put(("error", exc))
+            self.events.put(("task_error", ("process", exc)))
 
     def _process_one_job(
         self,
@@ -891,10 +901,13 @@ class VideoDubApp(tk.Tk):
                 if runner in self.active_runners:
                     self.active_runners.remove(runner)
 
-    def _stop(self) -> None:
-        self.runner.cancel()
+    def _stop_download(self) -> None:
+        self.download_runner.cancel()
+        self._append_log("正在停止下载任务…")
+
+    def _stop_processing(self) -> None:
         self._cancel_active_runners()
-        self._append_log("正在停止当前任务…")
+        self._append_log("正在停止处理任务…")
 
     def _cancel_active_runners(self) -> None:
         with self.runners_lock:
@@ -1817,13 +1830,19 @@ class VideoDubApp(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
-                elif kind == "done":
-                    self._append_log(str(payload))
-                    self._set_running(False)
+                elif kind == "task_done":
+                    task, message = payload
+                    self._append_log(str(message))
+                    self._set_running(False, str(task))
                     self._refresh_jobs()
+                elif kind == "task_error":
+                    task, error = payload
+                    self._append_log(f"错误：{error}")
+                    self._set_running(False, str(task))
+                    self._refresh_jobs()
+                    messagebox.showerror("任务失败", str(error), parent=self)
                 elif kind == "error":
                     self._append_log(f"错误：{payload}")
-                    self._set_running(False)
                     messagebox.showerror("任务失败", str(payload), parent=self)
                 elif kind == "update":
                     latest, url = payload
@@ -1849,10 +1868,12 @@ class VideoDubApp(tk.Tk):
                 return
             self.model_download_runner.cancel()
             self.model_download_runner = None
-        if self.worker and self.worker.is_alive():
+        download_alive = self.download_worker and self.download_worker.is_alive()
+        process_alive = self.process_worker and self.process_worker.is_alive()
+        if download_alive or process_alive:
             if not messagebox.askyesno("退出", "任务仍在运行，停止并退出？", parent=self):
                 return
-            self.runner.cancel()
+            self.download_runner.cancel()
             self._cancel_active_runners()
         try:
             self._persist_config()

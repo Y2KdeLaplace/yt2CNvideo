@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from videodub.qwen_speech import (
     _validate_crispasr_asr_model,
     resolve_tts_reference,
     synthesize_qwen,
+    synthesize_qwen_batch,
 )
 from videodub.subtitles import Cue
 
@@ -269,6 +271,34 @@ class QwenSpeechTests(unittest.TestCase):
                 RecordingRunner(),
             )
         self.assertEqual(captured["language"], "Japanese")
+
+    def test_service_tts_batch_writes_each_returned_audio(self) -> None:
+        captured: dict = {}
+
+        def request(_url, *, payload=None, timeout=0):
+            captured.update(payload or {})
+            return {
+                "audio_base64_list": [
+                    base64.b64encode(b"first").decode("ascii"),
+                    base64.b64encode(b"second").decode("ascii"),
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "videodub.qwen_speech._json_request",
+            side_effect=request,
+        ):
+            outputs = [Path(temp) / "one.wav", Path(temp) / "two.wav"]
+            synthesize_qwen_batch(
+                AppConfig(tts_backend="mlx", tts_language="Chinese"),
+                ["一", "二"],
+                outputs,
+                RecordingRunner(),
+            )
+            audio_bytes = [path.read_bytes() for path in outputs]
+
+        self.assertEqual(captured["texts"], ["一", "二"])
+        self.assertEqual(audio_bytes, [b"first", b"second"])
 
 
 if __name__ == "__main__":

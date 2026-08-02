@@ -6,7 +6,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from videodub.ui import VideoDubApp
 from videodub.config import AppConfig
@@ -45,14 +45,17 @@ class VideoSelectionTests(unittest.TestCase):
         while not events.empty():
             messages.append(events.get_nowait())
         self.assertEqual(completed, ["continued"])
-        self.assertFalse(any(kind == "error" for kind, _value in messages))
+        self.assertFalse(any(kind == "task_error" for kind, _value in messages))
         self.assertTrue(
             any(
                 kind == "log" and "out-of-memory" in str(value)
                 for kind, value in messages
             )
         )
-        self.assertIn(("done", "处理完成，1 个任务失败"), messages)
+        self.assertIn(
+            ("task_done", ("process", "处理完成，1 个任务失败")),
+            messages,
+        )
         app._cancel_active_runners.assert_not_called()
 
     def test_extract_stage_skips_a_subtitle_only_job(self) -> None:
@@ -218,13 +221,17 @@ class VideoSelectionTests(unittest.TestCase):
 
     def test_download_state_locks_only_the_url_input(self) -> None:
         app = SimpleNamespace(
-            current_task="",
+            download_running=False,
+            process_running=False,
             url_text=Mock(),
             refresh_jobs_button=Mock(),
             job_tree=Mock(),
             download_button=Mock(),
             process_button=Mock(),
-            _stop=Mock(),
+            _stop_download=Mock(),
+            _stop_processing=Mock(),
+            _start_download=Mock(),
+            _start_processing=Mock(),
         )
 
         VideoDubApp._set_running(app, True, "download")
@@ -232,22 +239,25 @@ class VideoSelectionTests(unittest.TestCase):
         app.url_text.configure.assert_called_once_with(state="disabled")
         app.refresh_jobs_button.configure.assert_called_once_with(state="normal")
         app.job_tree.state.assert_called_once_with(("!disabled",))
+        self.assertEqual(app.process_button.configure.call_args.kwargs["state"], "normal")
 
     def test_process_state_locks_video_selection_and_restores_it_when_done(self) -> None:
         app = SimpleNamespace(
-            current_task="",
+            download_running=False,
+            process_running=False,
             url_text=Mock(),
             refresh_jobs_button=Mock(),
             job_tree=Mock(),
             download_button=Mock(),
             process_button=Mock(),
-            _stop=Mock(),
+            _stop_download=Mock(),
+            _stop_processing=Mock(),
             _start_download=Mock(),
             _start_processing=Mock(),
         )
 
         VideoDubApp._set_running(app, True, "process")
-        VideoDubApp._set_running(app, False)
+        VideoDubApp._set_running(app, False, "process")
 
         self.assertEqual(
             app.refresh_jobs_button.configure.call_args_list,
@@ -257,6 +267,62 @@ class VideoSelectionTests(unittest.TestCase):
             app.job_tree.state.call_args_list,
             [unittest.mock.call(("disabled",)), unittest.mock.call(("!disabled",))],
         )
+
+    def test_download_and_processing_states_are_independent(self) -> None:
+        app = SimpleNamespace(
+            download_running=False,
+            process_running=False,
+            url_text=Mock(),
+            refresh_jobs_button=Mock(),
+            job_tree=Mock(),
+            download_button=Mock(),
+            process_button=Mock(),
+            _stop_download=Mock(),
+            _stop_processing=Mock(),
+            _start_download=Mock(),
+            _start_processing=Mock(),
+        )
+
+        VideoDubApp._set_running(app, True, "process")
+        VideoDubApp._set_running(app, True, "download")
+
+        self.assertTrue(app.download_running)
+        self.assertTrue(app.process_running)
+        self.assertIs(
+            app.download_button.configure.call_args.kwargs["command"],
+            app._stop_download,
+        )
+        self.assertIs(
+            app.process_button.configure.call_args.kwargs["command"],
+            app._stop_processing,
+        )
+
+        VideoDubApp._set_running(app, False, "download")
+
+        self.assertFalse(app.download_running)
+        self.assertTrue(app.process_running)
+        self.assertEqual(app.job_tree.state.call_args.args[0], ("disabled",))
+
+    def test_running_processing_does_not_block_starting_a_download(self) -> None:
+        process_worker = SimpleNamespace(is_alive=lambda: True)
+        thread = Mock()
+        app = SimpleNamespace(
+            process_worker=process_worker,
+            download_worker=None,
+            url_text=Mock(),
+            _sync_basic_config=Mock(return_value=AppConfig()),
+            _separator=Mock(),
+            download_runner=Mock(),
+            _set_running=Mock(),
+            _download_worker=Mock(),
+        )
+        app.url_text.get.return_value = "https://youtu.be/example\n"
+
+        with patch("videodub.ui.threading.Thread", return_value=thread):
+            VideoDubApp._start_download(app)
+
+        thread.start.assert_called_once_with()
+        app._set_running.assert_called_once_with(True, "download")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import wave
 from pathlib import Path
 
 from .config import AppConfig
@@ -41,44 +42,171 @@ def _synthesize_qwen(
     cues: list[Cue],
     raw_dir: Path,
     base_url: str,
-) -> list[Path]:
+) -> Path:
     if config.tts_backend != "gguf":
         info = check_qwen_service(base_url, "tts")
         if not info.available:
             raise RuntimeError(f"Qwen3-TTS 模型服务未就绪：{info.error}")
         runner.logger(f"Qwen3-TTS 模型：{info.model or '未报告'}")
-    outputs: list[Path] = []
-    for i, cue in enumerate(cues):
-        runner.check_cancelled()
-        output = raw_dir / f"raw-{i:06d}.wav"
-        synthesize_qwen(config, cue.text, output, runner, base_url=base_url)
-        if not output.is_file() or output.stat().st_size == 0:
-            raise RuntimeError(f"Qwen3-TTS 未生成有效音频（字幕 {i + 1}）")
-        outputs.append(output)
-        if (i + 1) % 10 == 0 or i + 1 == len(cues):
-            runner.logger(f"Qwen3-TTS 配音进度：{i + 1}/{len(cues)}")
-    return outputs
+    runner.check_cancelled()
+    text = _joined_speech_text(cues)
+    output = raw_dir / "raw-full.wav"
+    synthesize_qwen(config, text, output, runner, base_url=base_url)
+    if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError("Qwen3-TTS 未生成有效的完整配音音频")
+    runner.logger(f"Qwen3-TTS 已一次生成完整配音（{len(cues)} 条字幕）")
+    return output
+
+
+def _joined_speech_text(cues: list[Cue]) -> str:
+    parts: list[str] = []
+    for cue in cues:
+        text = cue.text.strip()
+        if not text:
+            continue
+        if (
+            parts
+            and parts[-1][-1].isascii()
+            and parts[-1][-1].isalnum()
+            and text[0].isascii()
+            and text[0].isalnum()
+        ):
+            parts.append(" ")
+        parts.append(text)
+    return "".join(parts)
+
+
+def _text_weight(text: str) -> float:
+    weight = 0.0
+    for character in text:
+        if character.isspace():
+            continue
+        if character in "。！？.!?":
+            weight += 2.0
+        elif character in "，、；：,;:":
+            weight += 0.75
+        else:
+            weight += 1.0
+    return max(1.0, weight)
+
+
+def _source_ranges(
+    cues: list[Cue],
+    total_ms: int,
+    silence_midpoints: list[int],
+) -> list[tuple[int, int]]:
+    if not cues:
+        return []
+    weights = [_text_weight(cue.text) for cue in cues]
+    total_weight = sum(weights)
+    expected: list[int] = []
+    cumulative = 0.0
+    for weight in weights[:-1]:
+        cumulative += weight
+        expected.append(round(total_ms * cumulative / total_weight))
+
+    cuts = [0]
+    for index, target in enumerate(expected):
+        previous_target = expected[index - 1] if index else 0
+        next_target = expected[index + 1] if index + 1 < len(expected) else total_ms
+        window_start = (previous_target + target) // 2
+        window_end = (target + next_target) // 2
+        lower = max(cuts[-1] + 1, window_start)
+        upper = min(total_ms - (len(expected) - index), window_end)
+        nearby = [
+            point
+            for point in silence_midpoints
+            if lower <= point <= upper
+        ]
+        cut = min(nearby, key=lambda point: abs(point - target)) if nearby else target
+        cut = max(cuts[-1] + 1, min(cut, total_ms - (len(expected) - index)))
+        cuts.append(cut)
+    cuts.append(total_ms)
+    return list(zip(cuts, cuts[1:]))
+
+
+def _silence_midpoints(
+    config: AppConfig,
+    runner: ProcessRunner,
+    path: Path,
+    total_ms: int,
+) -> list[int]:
+    lines = runner.run(
+        [
+            config.ffmpeg_path,
+            "-hide_banner",
+            "-i",
+            path,
+            "-af",
+            "silencedetect=noise=-35dB:d=0.06",
+            "-f",
+            "null",
+            "-",
+        ],
+        quiet=True,
+    )
+    starts: list[float] = []
+    midpoints: list[int] = []
+    for line in lines:
+        if "silence_start:" in line:
+            try:
+                starts.append(float(line.split("silence_start:", 1)[1].split()[0]))
+            except ValueError:
+                continue
+        elif "silence_end:" in line and starts:
+            try:
+                end = float(line.split("silence_end:", 1)[1].split()[0])
+            except ValueError:
+                continue
+            start = starts.pop(0)
+            midpoint = round((start + end) * 500)
+            if 0 < midpoint < total_ms:
+                midpoints.append(midpoint)
+    return midpoints
+
+
+def _wav_duration_ms(path: Path) -> int:
+    try:
+        with wave.open(str(path), "rb") as source:
+            return max(1, round(source.getnframes() / source.getframerate() * 1000))
+    except (EOFError, wave.Error, ZeroDivisionError) as exc:
+        raise ValueError(f"无法读取 WAV 时长：{path}") from exc
 
 
 def _prepare_timed_track(
     config: AppConfig,
     runner: ProcessRunner,
     cues: list[Cue],
-    raw_files: list[Path],
+    raw_file: Path,
     work_dir: Path,
     total_duration: float,
 ) -> Path:
+    try:
+        raw_duration_ms = _wav_duration_ms(raw_file)
+    except ValueError:
+        raw_duration_ms = max(
+            1,
+            round(media_duration(config, runner, raw_file) * 1000),
+        )
+    source_ranges = _source_ranges(
+        cues,
+        raw_duration_ms,
+        _silence_midpoints(config, runner, raw_file, raw_duration_ms),
+    )
     segment_files: list[Path] = []
     cursor_ms = 0
-    for i, (cue, raw_file) in enumerate(zip(cues, raw_files, strict=True)):
+    for i, (cue, source_range) in enumerate(
+        zip(cues, source_ranges, strict=True)
+    ):
         runner.check_cancelled()
         start_ms = max(cursor_ms, cue.start_ms)
         gap_ms = max(0, cue.start_ms - cursor_ms)
         target_ms = max(350, cue.end_ms - cue.start_ms)
-        raw_duration_ms = max(1, round(media_duration(config, runner, raw_file) * 1000))
+        source_start_ms, source_end_ms = source_range
+        source_duration_ms = max(1, source_end_ms - source_start_ms)
         filters: list[str] = []
-        if raw_duration_ms > target_ms:
-            filters.append(_atempo_chain(raw_duration_ms / target_ms))
+        if source_duration_ms > target_ms:
+            filters.append(_atempo_chain(source_duration_ms / target_ms))
         if gap_ms:
             filters.append(f"adelay={gap_ms}:all=1")
         segment_duration = (gap_ms + target_ms) / 1000
@@ -97,6 +225,10 @@ def _prepare_timed_track(
                 "-y",
                 "-i",
                 raw_file,
+                "-ss",
+                f"{source_start_ms / 1000:.3f}",
+                "-t",
+                f"{source_duration_ms / 1000:.3f}",
                 "-af",
                 ",".join(filters),
                 "-c:a",
@@ -235,7 +367,7 @@ def dub_video(
         work_dir = Path(temp)
         raw_dir = work_dir / "raw"
         raw_dir.mkdir()
-        raw_files = _synthesize_qwen(
+        raw_file = _synthesize_qwen(
             config,
             runner,
             cues,
@@ -246,7 +378,7 @@ def dub_video(
             config,
             runner,
             cues,
-            raw_files,
+            raw_file,
             work_dir,
             total_duration,
         )

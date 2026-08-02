@@ -111,8 +111,9 @@ class _MockChatServer:
                     elif payload["model"] in {
                         "omitting-segmentation-model",
                         "invalid-timing-model",
+                        "malformed-segmentation-model",
                     }:
-                        translations = ["一个脉冲序列。"]
+                        translations = ["一个脉冲序列。" for _group in groups]
                     else:
                         translations = []
                         for group in groups:
@@ -158,43 +159,46 @@ class _MockChatServer:
                             translated_rows.pop()
                     content = json.dumps(translated_rows)
                 elif "字幕语义分段专家" in system:
-                    requested = json.loads(payload["messages"][1]["content"])
-                    segmented_rows = []
-                    for group in requested["segmentation_groups"]:
-                        translated = group["translated_text"]
-                        part_count = len(group["source_parts"])
-                        if payload["model"] == "split-sentence-model":
-                            parts = ["如果我们现在出发，", "我们就能", "赶上飞机。"]
-                        elif payload["model"] == "large-batch-model":
-                            marker = translated.find("译", 1)
-                            parts = [translated[:marker], translated[marker:]]
-                        elif payload["model"] == "sentence-boundary-model":
-                            parts = [
-                                "你知道的？而且只要电源被中断，",
-                                "它就会重启，顺便把",
-                                "历史记录全抹干净了。",
-                            ]
-                        elif payload["model"] == "omitting-segmentation-model":
-                            parts = ["", translated]
-                        elif payload["model"] == "invalid-timing-model":
-                            segmented_rows.append(
-                                {
-                                    "id": 31,
-                                    "sentence_group": 31,
-                                    "translated_text": translated,
-                                }
-                            )
-                            continue
-                        elif part_count == 1:
-                            parts = [translated]
-                        elif requested["target_language"] == "German":
-                            parts = ["Eine Impulsfolge.", "Das ist der nächste Satz."]
-                        else:
-                            parts = ["一个脉冲序列。", "这是下一句话。"]
-                        if payload["model"] == "formatting-model":
-                            parts = [part.replace("。", "") for part in parts]
-                        segmented_rows.append({"parts": parts})
-                    content = json.dumps(segmented_rows)
+                    if payload["model"] == "malformed-segmentation-model":
+                        content = '[{"parts": ["一个脉冲序列。"]}'
+                    else:
+                        requested = json.loads(payload["messages"][1]["content"])
+                        segmented_rows = []
+                        for group in requested["segmentation_groups"]:
+                            translated = group["translated_text"]
+                            part_count = len(group["source_parts"])
+                            if payload["model"] == "split-sentence-model":
+                                parts = ["如果我们现在出发，", "我们就能", "赶上飞机。"]
+                            elif payload["model"] == "large-batch-model":
+                                marker = translated.find("译", 1)
+                                parts = [translated[:marker], translated[marker:]]
+                            elif payload["model"] == "sentence-boundary-model":
+                                parts = [
+                                    "你知道的？而且只要电源被中断，",
+                                    "它就会重启，顺便把",
+                                    "历史记录全抹干净了。",
+                                ]
+                            elif payload["model"] == "omitting-segmentation-model":
+                                parts = ["", translated]
+                            elif payload["model"] == "invalid-timing-model":
+                                segmented_rows.append(
+                                    {
+                                        "id": 31,
+                                        "sentence_group": 31,
+                                        "translated_text": translated,
+                                    }
+                                )
+                                continue
+                            elif part_count == 1:
+                                parts = [translated]
+                            elif requested["target_language"] == "German":
+                                parts = ["Eine Impulsfolge.", "Das ist der nächste Satz."]
+                            else:
+                                parts = ["一个脉冲序列。", "这是下一句话。"]
+                            if payload["model"] == "formatting-model":
+                                parts = [part.replace("。", "") for part in parts]
+                            segmented_rows.append({"parts": parts})
+                        content = json.dumps(segmented_rows)
                 elif "讲解稿改写专家" in system:
                     content = json.dumps(
                         [
@@ -551,6 +555,42 @@ class SubtitleWorkflowTests(unittest.TestCase):
             ]
             self.assertEqual(len(segmentation_calls), 2)
 
+    def test_malformed_segmentation_json_falls_back_to_complete_sentence(self) -> None:
+        with _MockChatServer() as mock:
+            logs: list[str] = []
+            workflow = SubtitleRepairWorkflow(
+                AppConfig(
+                    subtitle_api_base_url=mock.base_url,
+                    subtitle_model="malformed-segmentation-model",
+                ),
+                ProcessRunner(logs.append),
+            )
+
+            translated = workflow.translate(
+                [
+                    Cue(1, 0, 1000, "A spike"),
+                    Cue(2, 1000, 2000, "train."),
+                    Cue(3, 3000, 4000, "A spike"),
+                    Cue(4, 4000, 5000, "train."),
+                ],
+                {},
+            )
+
+            self.assertEqual(
+                translated,
+                [
+                    Cue(1, 0, 2000, "一个脉冲序列。"),
+                    Cue(2, 3000, 5000, "一个脉冲序列。"),
+                ],
+            )
+            self.assertTrue(any("自动合并时间窗" in line for line in logs))
+            segmentation_calls = [
+                call
+                for call in mock.calls
+                if "字幕语义分段专家" in call["messages"][0]["content"]
+            ]
+            self.assertEqual(len(segmentation_calls), 4)
+
     def test_split_source_sentence_uses_the_same_source_cue_boundaries(self) -> None:
         with _MockChatServer() as mock:
             workflow = SubtitleRepairWorkflow(
@@ -805,6 +845,36 @@ class SubtitleWorkflowTests(unittest.TestCase):
                 read_srt(path)[0].text,
                 "x i 从 i 为 1 到 10 求和。",
             )
+
+    def test_existing_speech_subtitle_is_reused_without_rewriting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output"
+            output.mkdir()
+            job = VideoJob(root / "Lecture.mp4", generated_dir=output)
+            existing = job.speech_subtitle_path_for("Chinese")
+            existing.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\n已经改写好的配音文本。\n",
+                encoding="utf-8",
+            )
+            messages: list[str] = []
+            workflow = SpeechSubtitleWorkflow(
+                AppConfig(
+                    translation_language="Chinese",
+                    subtitle_model="unused-model",
+                ),
+                ProcessRunner(messages.append),
+            )
+            workflow._call_array = Mock(
+                side_effect=AssertionError("不应调用字幕模型")
+            )
+
+            path = workflow.process_job(job)
+
+            self.assertEqual(path, existing)
+            self.assertEqual(read_srt(path)[0].text, "已经改写好的配音文本。")
+            self.assertIn(f"复用已有配音字幕：{existing}", messages)
+            workflow._call_array.assert_not_called()
 
 
 if __name__ == "__main__":
