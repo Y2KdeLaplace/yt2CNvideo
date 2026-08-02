@@ -47,13 +47,12 @@ TRANSLATION_SYSTEM = """你是专业的视频文稿译者和校对者。
 
 SUBTITLE_SEGMENTATION_SYSTEM = """你是字幕语义分段专家。
 输入只包含一个小批次的原语言校正字幕，以及这些完整句组已经完成的 {target_language} 译文。视频画面不可用，也不应作为判断依据。
-你的任务只是把译文原文分配给每个输入字幕 id；不得重新翻译、改写、增删或调换译文内容。程序会直接继承每个 id 的原始开始和结束时间，你不要生成或修改时间。
-输入已经提供 translated_sentence_groups，每组列出完整原文、完整译文及其 id 范围。每组译文只能分配给该组的 ids，绝不能跨组移动。即使本组最后一个 id 只有一个单词，本组译文的结尾也必须留在该 id；不得放弃任何时间窗。
-若一个输入 id 本身包含完整句子、完整短语或简单拼接成的完整表达，该表达的全部译文必须放在同一个 id。若一句话跨越多个输入 id，则结合整句语义和目标语言语序，把译文自然分配到这些 id 中。
-每个输入 id 必须且只能返回一次，不得遗漏、合并或新增 id，每项必须返回其 sentence_group 和非空的 translated_text。根据目标语言的自然语法边界、标点和书写系统分割文本，不要把中文规则机械套用到其他语言。
+输入的 segmentation_groups 已按顺序排列；每组包含完整译文和按时间顺序排列的 source_parts。你的任务只是把该组译文分配到等长的 parts 数组；不得重新翻译、改写、增删或调换译文内容。不要生成任何字幕 id、句组 id 或时间戳。
+输出数组必须与 segmentation_groups 等长；每项的 parts 必须与对应 source_parts 等长。若相邻原文窗口在目标语言中应当合并，把完整译文放在其中一个位置，其他被合并位置返回空字符串。每组至少有一个非空 part。
+结合整句语义、目标语言语序和每个 source_part 的 duration_ms 自然分配译文。根据目标语言的自然语法边界、标点和书写系统分割文本，不要把中文规则机械套用到其他语言。
 目标语言要求：{language_guidance}
-同一 sentence_group 的所有 translated_text 按顺序拼接、忽略空白后，必须与该组 translated_text 完全一致。
-只返回 JSON 数组，每项格式为 {"id": 1, "sentence_group": 1, "translated_text": "..."}。不要使用 Markdown。"""
+每组所有非空 parts 按顺序拼接、忽略空白后，必须与该组 translated_text 完全一致。
+只返回 JSON 数组，每项格式为 {"parts": ["第一段译文", "", "第三段译文"]}。不要使用 Markdown。"""
 
 SPEECH_REWRITE_SYSTEM = """你是 {language} 讲解稿改写专家。
 把字幕逐条改写成适合 {language} 语音朗读、同时不改变信息内容的文本。
@@ -402,7 +401,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         if not corrected_transcript:
             raise ValueError("校正文稿为空")
         guidance = _language_guidance(self.config.translation_language)
-        sentence_groups, cue_groups = _sentence_group_payload(cues)
+        sentence_groups, _ = _sentence_group_payload(cues)
         system = TRANSLATION_SYSTEM.replace(
             "{target_language}", self.config.translation_language
         ).replace("{language_guidance}", guidance)
@@ -467,10 +466,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 "正在分批生成字幕时间轴…"
             )
 
-            source_subtitles = _cue_payload(cues)
-            source_by_id = {int(item["id"]): item for item in source_subtitles}
-            for item in source_subtitles:
-                item["sentence_group"] = cue_groups[int(item["id"])]
+            cue_by_id = {cue.index: cue for cue in cues}
             texts: dict[int, str] = {}
             multi_cue_groups: list[dict[str, Any]] = []
             for group in sentence_groups:
@@ -498,27 +494,22 @@ class SubtitleRepairWorkflow(_TextWorkflow):
 
             rows = []
             for batch_number, batch_groups in enumerate(batches, 1):
-                batch_ids = [
-                    int(cue_id)
-                    for group in batch_groups
-                    for cue_id in group["ids"]
-                ]
-                batch_id_set = set(batch_ids)
-                expected_cues = [
-                    cue for cue in cues if cue.index in batch_id_set
-                ]
-                translated_groups = [
+                segmentation_groups = [
                     {
-                        **group,
+                        "source_parts": [
+                            {
+                                "text": cue_by_id[int(cue_id)].text,
+                                "duration_ms": cue_by_id[int(cue_id)].duration_ms,
+                            }
+                            for cue_id in group["ids"]
+                        ],
                         "translated_text": group_texts[int(group["group_id"])],
                     }
                     for group in batch_groups
                 ]
                 segmentation_request: dict[str, Any] = {
                     "target_language": self.config.translation_language,
-                    "source_subtitles": [source_by_id[cue_id] for cue_id in batch_ids],
-                    "translated_sentence_groups": translated_groups,
-                    "expected_ids": batch_ids,
+                    "segmentation_groups": segmentation_groups,
                 }
                 batch_rows: list[dict[str, Any]] = []
                 batch_texts: dict[int, str] = {}
@@ -528,56 +519,100 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                         json.dumps(segmentation_request, ensure_ascii=False),
                         max_tokens=8_000,
                     )
+                    rows.extend(batch_rows)
                     try:
-                        batch_texts = self._validated_texts(
-                            batch_rows,
-                            expected_cues,
-                            "translated_text",
-                        )
-                        for row in batch_rows:
-                            cue_id = int(row["id"])
-                            group_id = int(row["sentence_group"])
-                            if cue_groups.get(cue_id) != group_id:
-                                raise ValueError(
-                                    f"模型输出的字幕 {cue_id} 跨越了句子组"
-                                )
-                        for group in batch_groups:
-                            group_id = int(group["group_id"])
-                            joined = "".join(
-                                batch_texts[int(cue_id)] for cue_id in group["ids"]
+                        if len(batch_rows) != len(batch_groups):
+                            raise ValueError(
+                                "模型输出的句组数量与输入不一致"
                             )
+                        batch_texts = {}
+                        for row, group in zip(
+                            batch_rows,
+                            batch_groups,
+                            strict=True,
+                        ):
+                            group_id = int(group["group_id"])
+                            raw_parts = row.get("parts")
+                            if not isinstance(raw_parts, list) or len(
+                                raw_parts
+                            ) != len(group["ids"]):
+                                raise ValueError(
+                                    f"字幕句组 {group_id} 的 parts 数量无效"
+                                )
+                            parts = [str(part or "").strip() for part in raw_parts]
+                            if not any(parts):
+                                raise ValueError(
+                                    f"字幕句组 {group_id} 没有返回任何文本"
+                                )
+                            joined = "".join(parts)
                             if _without_whitespace(joined) != _without_whitespace(
                                 group_texts[group_id]
                             ):
                                 raise ValueError(
                                     f"字幕句组 {group_id} 改动或遗漏了翻译文稿"
                                 )
+                            for cue_id, part in zip(
+                                group["ids"],
+                                parts,
+                                strict=True,
+                            ):
+                                if part:
+                                    batch_texts[int(cue_id)] = part
                         break
                     except (KeyError, TypeError, ValueError) as exc:
                         if attempt:
-                            raise
+                            self.runner.logger(
+                                f"字幕分段批次 {batch_number} 连续校验失败，"
+                                "已按完整句组自动合并时间窗。"
+                            )
+                            batch_texts = {
+                                int(group["ids"][0]): group_texts[
+                                    int(group["group_id"])
+                                ]
+                                for group in batch_groups
+                            }
+                            break
                         self.runner.logger(
                             f"字幕分段批次 {batch_number} 校验失败，正在重试…"
                         )
                         segmentation_request["previous_validation_error"] = str(exc)
                         segmentation_request["retry_instruction"] = (
-                            "重新返回完整 JSON 数组，严格包含且只包含 expected_ids；"
-                            "每个句组拼接后必须与 translated_text 完全一致。"
+                            "重新返回与 segmentation_groups 等长的 JSON 数组；"
+                            "每项只含 parts，parts 与 source_parts 等长。允许用空字符串"
+                            "表示合并位置，但非空部分拼接后必须与 translated_text 完全一致。"
                         )
                 texts.update(batch_texts)
-                rows.extend(batch_rows)
                 self.runner.logger(
                     f"字幕时间轴分段进度：{batch_number}/{len(batches)}"
                 )
 
-            missing_ids = [cue.index for cue in cues if cue.index not in texts]
-            if missing_ids:
-                raise ValueError(f"字幕分段遗漏 id：{missing_ids[:20]}")
-            draft = [
-                Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
-                for cue in cues
-            ]
-            return draft
+            translated: list[Cue] = []
+            for group in sentence_groups:
+                group_ids = [int(cue_id) for cue_id in group["ids"]]
+                returned_ids = [cue_id for cue_id in group_ids if cue_id in texts]
+                if not returned_ids:
+                    raise ValueError(
+                        f"字幕句组 {group['group_id']} 没有可写入的字幕"
+                    )
+                positions = {cue_id: index for index, cue_id in enumerate(group_ids)}
+                for index, cue_id in enumerate(returned_ids):
+                    first_position = 0 if index == 0 else positions[cue_id]
+                    last_position = (
+                        len(group_ids) - 1
+                        if index + 1 == len(returned_ids)
+                        else positions[returned_ids[index + 1]] - 1
+                    )
+                    first_cue = cue_by_id[group_ids[first_position]]
+                    last_cue = cue_by_id[group_ids[last_position]]
+                    translated.append(
+                        Cue(
+                            len(translated) + 1,
+                            first_cue.start_ms,
+                            last_cue.end_ms,
+                            texts[cue_id],
+                        )
+                    )
+            return translated
         except CancelledError:
             raise
         except (OSError, RuntimeError, ValueError) as exc:
