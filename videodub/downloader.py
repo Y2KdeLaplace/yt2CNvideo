@@ -166,7 +166,11 @@ def download(config: AppConfig, runner: ProcessRunner, url: str) -> list[VideoJo
             if ID_MARKER in line
         )
     )
-    all_jobs = discover_video_jobs(config.download_dir, config.output_dir)
+    all_jobs = [
+        job
+        for job in discover_video_jobs(config.download_dir, config.output_dir)
+        if job.source_subtitle_path is None
+    ]
     if not ids:
         runner.logger("未从下载输出获得视频 ID，将处理下载目录中的视频。")
         jobs = all_jobs
@@ -190,7 +194,11 @@ def download(config: AppConfig, runner: ProcessRunner, url: str) -> list[VideoJo
             )
         except CommandError:
             runner.logger("警告：自动字幕下载失败或触发限流，已跳过。")
-        refreshed = discover_video_jobs(config.download_dir, config.output_dir)
+        refreshed = [
+            job
+            for job in discover_video_jobs(config.download_dir, config.output_dir)
+            if job.source_subtitle_path is None
+        ]
         by_path = {item.video_path.resolve(): item for item in refreshed}
         jobs = [by_path.get(item.video_path.resolve(), item) for item in jobs]
     for job in jobs:

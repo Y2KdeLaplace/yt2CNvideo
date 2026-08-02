@@ -17,6 +17,19 @@ GENERATED_SUFFIXES = (
     ".speech.zh-CN.srt",
 )
 
+TRANSLATION_SUFFIXES = {
+    "Chinese": "zh-CN",
+    "English": "en",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "German": "de",
+    "Spanish": "es",
+    "French": "fr",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Russian": "ru",
+}
+
 
 @dataclass(frozen=True)
 class VideoJob:
@@ -25,6 +38,11 @@ class VideoJob:
     video_id: str = ""
     title: str = ""
     generated_dir: Path | None = None
+    source_subtitle_path: Path | None = None
+
+    @property
+    def has_video(self) -> bool:
+        return self.video_path.is_file()
 
     @property
     def base_path(self) -> Path:
@@ -32,9 +50,14 @@ class VideoJob:
 
     @property
     def chinese_subtitle_path(self) -> Path:
-        return self.generated_base_path.with_name(
-            self.generated_base_path.name + ".zh-CN.srt"
-        )
+        return self.translated_subtitle_path("Chinese")
+
+    def translated_subtitle_path(self, language: str) -> Path:
+        suffix = TRANSLATION_SUFFIXES.get(language, language.lower())
+        name = self.generated_base_path.name
+        if language == "Chinese":
+            return self.generated_base_path.with_name(name + ".zh-CN.srt")
+        return self.generated_base_path.with_name(name + f".translated.{suffix}.srt")
 
     @property
     def corrected_subtitle_path(self) -> Path:
@@ -44,8 +67,12 @@ class VideoJob:
 
     @property
     def speech_subtitle_path(self) -> Path:
+        return self.speech_subtitle_path_for("Chinese")
+
+    def speech_subtitle_path_for(self, language: str) -> Path:
+        suffix = TRANSLATION_SUFFIXES.get(language, language.lower())
         return self.generated_base_path.with_name(
-            self.generated_base_path.name + ".speech.zh-CN.srt"
+            self.generated_base_path.name + f".speech.{suffix}.srt"
         )
 
     @property
@@ -111,7 +138,54 @@ def discover_video_jobs(
                 relative_parent = Path()
             generated_dir = output_path / relative_parent
         jobs.append(VideoJob(video, info_path, video_id, title, generated_dir))
-    return jobs
+    video_stems = {
+        (job.video_path.parent.resolve(), job.video_path.stem) for job in jobs
+    }
+    for subtitle in sorted(root_path.rglob("*.srt")):
+        if output_path is not None:
+            try:
+                subtitle.resolve().relative_to(output_path)
+                continue
+            except ValueError:
+                pass
+        name = subtitle.name
+        if (
+            name.endswith(GENERATED_SUFFIXES)
+            or ".translated." in name
+            or ".speech." in name
+        ):
+            continue
+        if any(
+            subtitle.parent.resolve() == parent and name.startswith(stem + ".")
+            for parent, stem in video_stems
+        ):
+            continue
+        stem = subtitle.stem
+        match = re.match(
+            r"^(?P<base>.+)\.(?:[a-z]{2,3}(?:[-_][A-Za-z0-9]+)*|en-orig)$",
+            stem,
+            re.IGNORECASE,
+        )
+        base = match.group("base") if match else stem
+        virtual_video = subtitle.with_name(base + ".mp4")
+        generated_dir = None
+        if output_path is not None:
+            try:
+                relative_parent = subtitle.parent.resolve().relative_to(
+                    root_path.resolve()
+                )
+            except ValueError:
+                relative_parent = Path()
+            generated_dir = output_path / relative_parent
+        jobs.append(
+            VideoJob(
+                virtual_video,
+                title=base,
+                generated_dir=generated_dir,
+                source_subtitle_path=subtitle,
+            )
+        )
+    return sorted(jobs, key=lambda job: (str(job.video_path.parent), job.title))
 
 
 def media_duration(config: AppConfig, runner: ProcessRunner, path: Path) -> float:

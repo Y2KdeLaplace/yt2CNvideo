@@ -13,6 +13,7 @@ from videodub.qwen_speech import (
     resolve_tts_reference,
     synthesize_qwen,
 )
+from videodub.subtitles import Cue
 
 
 class RecordingRunner:
@@ -63,7 +64,64 @@ class QwenSpeechTests(unittest.TestCase):
         )
         self.assertEqual([cue.index for cue in cues], [1, 2])
         self.assertEqual(cues[0].start_ms, 250)
+        self.assertEqual(cues[0].end_ms, 1500)
+        self.assertEqual(cues[1].start_ms, 1500)
         self.assertEqual(cues[1].end_ms, 2000)
+        self.assertEqual([cue.text for cue in cues], ["Hello", "world"])
+
+    def test_asr_preserves_short_word_aligned_cue(self) -> None:
+        cues = _segments_to_cues(
+            [
+                {
+                    "text": "you know? And it's just one of those things whenever it gets interrupted",
+                    "start": 59.52,
+                    "end": 62.24,
+                },
+                {
+                    "text": "from the power source, it has to reboot and it just totally wipes out the",
+                    "start": 62.24,
+                    "end": 65.76,
+                },
+                {"text": "history.", "start": 65.76, "end": 66.32},
+            ],
+            "",
+            66.32,
+        )
+
+        self.assertEqual(
+            [(cue.start_ms, cue.end_ms, cue.text) for cue in cues],
+            [
+                (
+                    59_520,
+                    62_240,
+                    "you know? And it's just one of those things whenever it gets interrupted",
+                ),
+                (
+                    62_240,
+                    65_760,
+                    "from the power source, it has to reboot and it just totally wipes out the",
+                ),
+                (65_760, 66_320, "history."),
+            ],
+        )
+
+    def test_asr_does_not_invent_boundaries_for_long_cues(self) -> None:
+        cues = _segments_to_cues(
+            [
+                {
+                    "text": "one two three four five six seven eight",
+                    "start": 0,
+                    "end": 8,
+                }
+            ],
+            "",
+            8,
+        )
+
+        self.assertEqual(
+            cues,
+            [Cue(1, 0, 8000, "one two three four five six seven eight")],
+        )
 
     def test_asr_text_without_segments_uses_video_duration(self) -> None:
         cues = _segments_to_cues(None, "Fallback", 4.2)

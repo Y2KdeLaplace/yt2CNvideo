@@ -2,7 +2,7 @@
 
 ## Product invariants
 
-- The active flow is: yt-dlp download → YouTube English subtitles → one OpenAI-compatible model for repair/translation → Chinese SRT → Chinese TTS → ffmpeg mux.
+- The active flow is: yt-dlp download → YouTube English subtitles + Qwen3-ASR/Forced Aligner → one OpenAI-compatible model for repair/translation → translated SRT → Qwen3-TTS → ffmpeg mux.
 - Do not add Whisper or another ASR fallback. Missing YouTube subtitles should produce a clear error.
 - Subtitle AI uses one model field. `subtitle_use_vision` only controls whether suspect screenshots are attached to that same model.
 - Keep the default UI simple. Batch size, context radius, confidence threshold, and screenshot count are internal defaults, not normal user controls.
@@ -35,4 +35,14 @@ Run the tests after behavior changes. GUI work also needs a hidden-window smoke 
 - Use `pathlib.Path`, argument-list subprocess calls, UTF-8, and platform-neutral paths.
 - API keys stay in memory or environment variables and must never be written to `settings.json`.
 - External commands go through `ProcessRunner` so cancellation and logging keep working.
-- Preserve subtitle IDs and timestamps. Model output must be validated before writing files.
+- Model output must be validated before writing files.
+
+## Subtitle timeline invariants
+
+- Acoustic word alignment is the highest-priority timing evidence. Never move, extend, or proportionally invent ASR timestamps merely to force a duration target.
+- `1.75–4.8 s` is a soft readability range for splitting long sentences at real punctuation or pauses, never a hard minimum or maximum.
+- Corrected subtitles use the ASR timeline when ASR exists. Text repair may merge adjacent ASR cues, but it must absorb their complete time span: the merged cue starts at the first cue start, ends at the last cue end, concatenates the corrected text, and receives a new consecutive ID.
+- Never leave an empty cue, silently discard a cue time span, or keep non-consecutive IDs after merging. Saved and in-memory cue IDs must describe the same sequence.
+- Full-document translation operates on timestamp-free sentence groups with stable `group_id` values. If the model omits groups, retry only the missing groups with full-document context.
+- Do not request one unbounded model response containing every timed subtitle cue. After sentence-group translation, generate timed target-language cues in bounded batches of complete groups; never split a sentence group across batches.
+- A one-cue sentence receives its translated group text directly. Multi-cue sentences may be semantically divided, but every input cue in that group must receive non-empty text and the concatenated result must exactly match the translated group.

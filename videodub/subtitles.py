@@ -116,7 +116,7 @@ def _tokens(text: str) -> list[str]:
 def _join_tokens(tokens: list[str]) -> str:
     text = ""
     no_space_before = set(",.;:!?%、。，！？；：)]}〉》】』〕〗〙〛")
-    no_space_after = set("([{〈《【「〔〖〘〚")
+    no_space_after = set("([{〈《【「〔〖〘〚。、，！？；：")
     for token in tokens:
         if not text:
             text = token
@@ -145,7 +145,12 @@ def subtitle_transcript(cues: list[Cue]) -> str:
     return _join_tokens(transcript_tokens)
 
 
-def align_transcript_to_cues(source_cues: list[Cue], transcript: str) -> list[Cue]:
+def align_transcript_to_cues(
+    source_cues: list[Cue],
+    transcript: str,
+    *,
+    merge_empty_cues: bool = False,
+) -> list[Cue]:
     """Map a corrected same-language transcript onto an existing SRT timeline."""
     source_tokens: list[str] = []
     boundaries: list[int] = []
@@ -194,10 +199,30 @@ def align_transcript_to_cues(source_cues: list[Cue], transcript: str) -> list[Cu
     mapped[-1] = len(target_tokens)
 
     aligned: list[Cue] = []
+    pending_start_ms: int | None = None
     for cue, start, end in zip(source_cues, mapped[:-1], mapped[1:], strict=True):
         text = _join_tokens(target_tokens[start:end])
         if text:
-            aligned.append(Cue(cue.index, cue.start_ms, cue.end_ms, text))
+            aligned.append(
+                Cue(
+                    len(aligned) + 1 if merge_empty_cues else cue.index,
+                    pending_start_ms if pending_start_ms is not None else cue.start_ms,
+                    cue.end_ms,
+                    text,
+                )
+            )
+            pending_start_ms = None
+        elif merge_empty_cues:
+            if aligned:
+                previous = aligned[-1]
+                aligned[-1] = Cue(
+                    previous.index,
+                    previous.start_ms,
+                    cue.end_ms,
+                    previous.text,
+                )
+            elif pending_start_ms is None:
+                pending_start_ms = cue.start_ms
     return aligned
 
 
@@ -259,6 +284,8 @@ def find_source_subtitle(video_path: Path) -> Path | None:
         if item.is_file()
         and item.suffix.lower() == ".srt"
         and item.stem.startswith(stem)
+        and ".translated." not in item.name
+        and ".speech." not in item.name
         and not item.name.endswith(
             (
                 ".asr.srt",

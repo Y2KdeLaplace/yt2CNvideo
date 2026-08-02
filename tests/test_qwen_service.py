@@ -128,6 +128,94 @@ class QwenServiceTests(unittest.TestCase):
             ],
         )
 
+    def test_official_qwen_does_not_force_split_without_natural_boundary(self) -> None:
+        words = [
+            SimpleNamespace(
+                text=f"word{index}",
+                start_time=index * 0.6,
+                end_time=(index + 1) * 0.6,
+            )
+            for index in range(12)
+        ]
+        result = SimpleNamespace(
+            text=" ".join(item.text for item in words) + ".",
+            time_stamps=[SimpleNamespace(items=words)],
+        )
+
+        segments = _timestamp_segments(result)
+
+        self.assertEqual(
+            segments,
+            [
+                {
+                    "text": " ".join(item.text for item in words) + ".",
+                    "start": 0.0,
+                    "end": 7.2,
+                }
+            ],
+        )
+
+    def test_official_qwen_splits_long_sentence_at_natural_small_pause(self) -> None:
+        words = (
+            ("This", 0.0, 0.4),
+            ("continuous", 0.4, 0.9),
+            ("explanation", 0.9, 1.5),
+            ("reaches", 1.5, 2.0),
+            ("a", 2.35, 2.45),
+            ("natural", 2.45, 2.9),
+            ("pause", 2.9, 3.3),
+            ("here", 3.3, 3.7),
+        )
+        result = SimpleNamespace(
+            text="This continuous explanation reaches a natural pause here.",
+            time_stamps=[
+                SimpleNamespace(
+                    items=[
+                        SimpleNamespace(text=text, start_time=start, end_time=end)
+                        for text, start, end in words
+                    ]
+                )
+            ],
+        )
+
+        segments = _timestamp_segments(result)
+
+        self.assertEqual(
+            segments,
+            [
+                {
+                    "text": "This continuous explanation reaches",
+                    "start": 0.0,
+                    "end": 2.0,
+                },
+                {
+                    "text": "a natural pause here.",
+                    "start": 2.35,
+                    "end": 3.7,
+                },
+            ],
+        )
+
+    def test_official_qwen_uses_smaller_pause_after_soft_maximum(self) -> None:
+        words = [
+            SimpleNamespace(
+                text=f"w{index}",
+                start_time=index * 0.5 + (0.15 if index >= 10 else 0.0),
+                end_time=(index + 1) * 0.5 + (0.15 if index >= 10 else 0.0),
+            )
+            for index in range(12)
+        ]
+        result = SimpleNamespace(
+            text=" ".join(item.text for item in words) + ".",
+            time_stamps=[SimpleNamespace(items=words)],
+        )
+
+        segments = _timestamp_segments(result)
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["end"], 5.0)
+        self.assertEqual(segments[1]["start"], 5.15)
+
 
 if __name__ == "__main__":
     unittest.main()

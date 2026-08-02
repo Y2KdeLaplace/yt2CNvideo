@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -147,6 +148,12 @@ def _output_path(config: AppConfig, job: VideoJob) -> Path:
     return target_dir / f"{job.video_path.stem}.{config.tts_language}配音.mp4"
 
 
+def _audio_output_path(config: AppConfig, job: VideoJob) -> Path:
+    target_dir = job.generated_dir or Path(config.output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / f"{job.video_path.stem}.{config.tts_language}配音.m4a"
+
+
 def _mux_video(
     config: AppConfig,
     runner: ProcessRunner,
@@ -211,14 +218,18 @@ def dub_video(
     speech_subtitle_path: Path | None = None,
     qwen_base_url: str = "http://127.0.0.1:9955",
 ) -> Path:
-    subtitle_path = job.chinese_subtitle_path
+    subtitle_path = job.translated_subtitle_path(config.translation_language)
     if not subtitle_path.exists():
         raise RuntimeError(f"缺少翻译字幕：{subtitle_path.name}")
     narration_path = speech_subtitle_path or subtitle_path
     cues = read_srt(narration_path)
     if not cues:
         raise RuntimeError(f"翻译字幕为空：{subtitle_path}")
-    total_duration = media_duration(config, runner, job.video_path)
+    total_duration = (
+        media_duration(config, runner, job.video_path)
+        if job.has_video
+        else max(cue.end_ms for cue in cues) / 1000
+    )
     runner.logger(f"正在生成 {len(cues)} 段 {config.tts_language} 语音…")
     with tempfile.TemporaryDirectory(prefix="videodub-tts-") as temp:
         work_dir = Path(temp)
@@ -239,4 +250,8 @@ def dub_video(
             work_dir,
             total_duration,
         )
-        return _mux_video(config, runner, job, voice_track, subtitle_path)
+        if job.has_video:
+            return _mux_video(config, runner, job, voice_track, subtitle_path)
+        output = _audio_output_path(config, job)
+        shutil.copyfile(voice_track, output)
+        return output

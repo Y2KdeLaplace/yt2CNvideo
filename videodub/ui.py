@@ -266,9 +266,12 @@ class VideoDubApp(tk.Tk):
         scroll.pack(side="right", fill="y")
 
     def _on_tab_changed(self, _event: object = None) -> None:
-        self._refresh_jobs()
+        selection_locked = getattr(self, "current_task", "") == "process"
+        if not selection_locked:
+            self._refresh_jobs()
         if (
-            hasattr(self, "job_tree")
+            not selection_locked
+            and hasattr(self, "job_tree")
             and self.notebook.select() == str(self.process_tab)
         ):
             self.job_tree.selection_remove(*self.job_tree.selection())
@@ -328,15 +331,14 @@ class VideoDubApp(tk.Tk):
     def _build_process_tab(self) -> None:
         selection = ttk.LabelFrame(self.process_tab, text="选择视频", padding=8)
         selection.pack(fill="x")
-        ttk.Button(
+        self.refresh_jobs_button = ttk.Button(
             selection,
             text="刷新",
             command=self._refresh_jobs,
             style="Main.TButton",
             takefocus=False,
-        ).pack(
-            anchor="e", pady=(0, 5)
         )
+        self.refresh_jobs_button.pack(anchor="e", pady=(0, 5))
         columns = ("video", "downloaded", "asr", "corrected", "chinese")
         self.job_tree = ttk.Treeview(
             selection,
@@ -346,7 +348,7 @@ class VideoDubApp(tk.Tk):
             height=10,
         )
         labels = {
-            "video": "视频名",
+            "video": "视频/字幕名",
             "downloaded": "下载字幕",
             "asr": "识别字幕",
             "corrected": "修复字幕",
@@ -485,6 +487,8 @@ class VideoDubApp(tk.Tk):
         self.after(1, self._update_url_placeholder)
 
     def _show_tree_menu(self, event: tk.Event) -> str:
+        if getattr(self, "current_task", "") == "process":
+            return "break"
         menu = tk.Menu(self, tearoff=False)
         menu.add_command(
             label="全选",
@@ -573,27 +577,40 @@ class VideoDubApp(tk.Tk):
         self.jobs = self._jobs()
         self.job_tree.delete(*self.job_tree.get_children())
         for index, job in enumerate(self.jobs):
+            source = job.source_subtitle_path or find_source_subtitle(job.video_path)
+            translated_path = job.translated_subtitle_path(
+                self.config_data.translation_language
+            )
             values = (
                 job.title,
-                "●" if find_source_subtitle(job.video_path) else "—",
+                "●" if source else "—",
                 "●" if job.asr_subtitle_path.is_file() else "—",
                 "●" if job.corrected_subtitle_path.is_file() else "—",
-                "●" if job.chinese_subtitle_path.is_file() else "—",
+                "●" if translated_path.is_file() else "—",
             )
             item = self.job_tree.insert("", "end", iid=str(index), values=values)
             if str(job.video_path) in selected_paths:
                 self.job_tree.selection_add(item)
 
     def _selected_jobs(self) -> list[VideoJob]:
-        return [self.jobs[int(item)] for item in self.job_tree.selection() if item.isdigit()]
+        selected = set(self.job_tree.selection())
+        return [
+            self.jobs[int(item)]
+            for item in self.job_tree.get_children()
+            if item in selected and item.isdigit() and int(item) < len(self.jobs)
+        ]
 
     def _clear_job_selection_on_blank(self, event: tk.Event) -> str | None:
+        if getattr(self, "current_task", "") == "process":
+            return "break"
         if self.job_tree.identify_row(event.y):
             return None
         self.job_tree.selection_remove(*self.job_tree.selection())
         return "break"
 
     def _toggle_job_selection(self, event: tk.Event) -> str:
+        if getattr(self, "current_task", "") == "process":
+            return "break"
         item = self.job_tree.identify_row(event.y)
         if not item:
             return "break"
@@ -605,12 +622,24 @@ class VideoDubApp(tk.Tk):
         return "break"
 
     def _select_all_jobs(self, _event: tk.Event | None = None) -> str:
+        if getattr(self, "current_task", "") == "process":
+            return "break"
         if self.job_tree.selection():
             self.job_tree.selection_set(self.job_tree.get_children())
         return "break"
 
     def _set_running(self, running: bool, task: str = "") -> None:
         self.current_task = task if running else ""
+        self.url_text.configure(
+            state="disabled" if running and task == "download" else "normal"
+        )
+        process_selection_locked = running and task == "process"
+        self.refresh_jobs_button.configure(
+            state="disabled" if process_selection_locked else "normal"
+        )
+        self.job_tree.state(
+            ("disabled",) if process_selection_locked else ("!disabled",)
+        )
         if running and task == "download":
             self.download_button.configure(
                 text="停止",
@@ -686,7 +715,7 @@ class VideoDubApp(tk.Tk):
             self.stage_dub.get(),
         )
         if not jobs:
-            messagebox.showwarning("没有选择视频", "请至少选择一个视频。", parent=self)
+            messagebox.showwarning("没有选择任务", "请至少选择一个视频或字幕。", parent=self)
             return
         if not any(stages):
             messagebox.showwarning("没有任务", "请至少选择一个处理步骤。", parent=self)
@@ -697,7 +726,7 @@ class VideoDubApp(tk.Tk):
                 not config.subtitle_api_base_url or not config.subtitle_model
             ):
                 raise ValueError("请先在“模型 → 语言模型”中完成配置。")
-            if stages[0] and (
+            if stages[0] and any(job.has_video for job in jobs) and (
                 not self.model_lock_state["asr"] or not config.asr_model_path
             ):
                 raise ValueError("请先在“模型 → 语音识别模型”中选择并锁定模型。")
@@ -742,29 +771,46 @@ class VideoDubApp(tk.Tk):
                 for index, job in enumerate(jobs[1:], 1):
                     self._process_one_job(config, job, stages, index)
             else:
-                self.events.put(("log", f"并行处理：{worker_count} 个视频"))
+                self.events.put(("log", f"并行处理：{worker_count} 个任务"))
+                failed_count = 0
                 with ThreadPoolExecutor(
                     max_workers=worker_count,
                     thread_name_prefix="videodub",
                 ) as executor:
-                    futures = [
+                    futures = {
                         executor.submit(
                             self._process_one_job,
                             config,
                             job,
                             stages,
                             index,
-                        )
+                        ): job
                         for index, job in enumerate(jobs)
-                    ]
-                    try:
-                        for future in as_completed(futures):
+                    }
+                    for future in as_completed(futures):
+                        try:
                             future.result()
-                    except Exception:
-                        self._cancel_active_runners()
-                        for future in futures:
-                            future.cancel()
-                        raise
+                        except CancelledError:
+                            self._cancel_active_runners()
+                            for pending in futures:
+                                pending.cancel()
+                            raise
+                        except Exception as exc:
+                            failed_count += 1
+                            job = futures[future]
+                            self.events.put(
+                                (
+                                    "log",
+                                    f"[{job.title}] 处理失败，已释放资源并跳过：{exc}",
+                                )
+                            )
+                message = (
+                    f"处理完成，{failed_count} 个任务失败"
+                    if failed_count
+                    else "处理完成"
+                )
+                self.events.put(("done", message))
+                return
             self.events.put(("done", "处理完成"))
         except CancelledError:
             self._cancel_active_runners()
@@ -790,7 +836,7 @@ class VideoDubApp(tk.Tk):
             runner.reset()
             with ExitStack() as stack:
                 asr_url = ""
-                if extract:
+                if extract and job.has_video:
                     asr_service = stack.enter_context(
                         ManagedModelService(
                             config,
@@ -807,6 +853,8 @@ class VideoDubApp(tk.Tk):
                         language=config.asr_language,
                         base_url=asr_url,
                     )
+                elif extract:
+                    runner.logger("未找到视频，已跳过语音提取。")
                 if repair or translate:
                     SubtitleRepairWorkflow(
                         config,
@@ -837,7 +885,7 @@ class VideoDubApp(tk.Tk):
                         speech_subtitle_path=speech,
                         qwen_base_url=tts_url,
                     )
-                    runner.logger(f"配音视频：{output}")
+                    runner.logger(f"配音输出：{output}")
         finally:
             with self.runners_lock:
                 if runner in self.active_runners:

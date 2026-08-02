@@ -66,6 +66,27 @@ Second line
         self.assertEqual(aligned[0].text, "A spike train.")
         self.assertEqual(aligned[1].text, "Next sentence.")
 
+    def test_repair_alignment_merges_cues_omitted_by_the_model(self) -> None:
+        source = [
+            Cue(1, 100, 500, "Damn it!"),
+            Cue(2, 500, 900, "Damn it!"),
+            Cue(3, 900, 1400, "Next line."),
+        ]
+
+        aligned = align_transcript_to_cues(
+            source,
+            "Damn it! Next line.",
+            merge_empty_cues=True,
+        )
+
+        self.assertEqual(
+            aligned,
+            [
+                Cue(1, 100, 900, "Damn it!"),
+                Cue(2, 900, 1400, "Next line."),
+            ],
+        )
+
     def test_semantic_cues_join_fragments_before_translation(self) -> None:
         grouped = semantic_cues(
             [

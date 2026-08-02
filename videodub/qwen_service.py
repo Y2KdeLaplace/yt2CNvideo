@@ -135,14 +135,22 @@ def _alignment_to_segments(
         text_limit = (
             28 if any("\u3400" <= character <= "\u9fff" for character in text) else 72
         )
+        start_time = float(getattr(items[first], "start_time", 0.0))
+        current_end = float(getattr(item, "end_time", 0.0))
+        duration = current_end - start_time
+        natural_long_sentence_break = (
+            duration >= 1.75
+            and (
+                _ends_with(text, ",:;，：；、")
+                or pause >= 0.25
+                or (len(text) >= text_limit and pause >= 0.12)
+                or (duration >= 4.8 and pause >= 0.12)
+            )
+        )
         boundary = (
             _ends_with(text, ".!?。！？…")
             or pause >= 0.65
-            or len(text) >= text_limit
-            or (
-                len(text) >= text_limit // 2
-                and _ends_with(text, ",:;，：；、")
-            )
+            or natural_long_sentence_break
             or next_item is None
         )
         if not boundary:
