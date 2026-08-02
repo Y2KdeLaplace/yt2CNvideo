@@ -396,7 +396,7 @@ def _resolve_choice(choice: ModelChoice) -> Path | None:
 def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
     codec_path = ""
     aligner_path = ""
-    if kind == "asr" and backend in {"hf", "mlx"}:
+    if kind in {"asr", "tts"} and backend in {"hf", "mlx"}:
         repository = (
             MLX_FORCED_ALIGNER_REPOSITORY
             if backend == "mlx"
@@ -420,6 +420,11 @@ def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
         if codec:
             files = sorted(codec.rglob("*.gguf"))
             codec_path = str(files[0]) if files else ""
+        aligner = (
+            resolve_modelscope_model(HF_FORCED_ALIGNER_REPOSITORY)
+            or resolve_huggingface_model(HF_FORCED_ALIGNER_REPOSITORY)
+        )
+        aligner_path = str(aligner or "")
     return codec_path, aligner_path
 
 
@@ -563,7 +568,7 @@ def runtime_packages(kind: str, backend: str) -> tuple[str, tuple[str, ...]]:
                 "uvicorn>=0.40",
             ),
         )
-    if kind == "asr":
+    if kind in {"asr", "aligner"}:
         return (
             "3.12",
             (
@@ -602,7 +607,7 @@ def _install_runtime(kind: str, backend: str, runner: ProcessRunner) -> None:
         "import fastapi, mlx_audio, uvicorn"
         if backend == "mlx"
         else "import fastapi, qwen_asr, uvicorn"
-        if kind == "asr"
+        if kind in {"asr", "aligner"}
         else "import fastapi, qwen_tts, uvicorn"
     )
     runner.run([*uv_runtime_prefix(kind, backend), "python", "-c", imports])
@@ -949,6 +954,12 @@ def install_model(
         raise ValueError("请选择要下载的 GGUF 模型版本")
     backend = "gguf" if selected_files else choice.backend
     _install_runtime(kind, backend, runner)
+    if kind == "tts":
+        _install_runtime(
+            "aligner",
+            "mlx" if backend == "mlx" else "hf",
+            runner,
+        )
     target = _download_choice(
         choice,
         repo_id,
@@ -970,7 +981,7 @@ def install_model(
     codec_path = ""
     aligner_path = ""
     vad_path = ""
-    if kind == "asr" and backend in {"hf", "mlx"}:
+    if kind in {"asr", "tts"} and backend in {"hf", "mlx"}:
         aligner_repo = (
             MLX_FORCED_ALIGNER_REPOSITORY
             if backend == "mlx"
@@ -996,6 +1007,16 @@ def install_model(
         if not codec_files:
             raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
         codec_path = str(codec_files[0])
+        aligner_choice = ModelChoice(
+            "aligner",
+            "",
+            HF_FORCED_ALIGNER_REPOSITORY,
+            "hf",
+            "modelscope",
+        )
+        aligner_path = str(
+            _download_choice(aligner_choice, aligner_choice.repo_id, runner)
+        )
     if kind == "asr" and backend == "gguf":
         aligner = _download_huggingface(
             GGUF_FORCED_ALIGNER_REPOSITORY,

@@ -25,6 +25,7 @@ from videodub.config import (
     load_config,
     migrate_cache_directory,
     migrate_work_directory,
+    reset_temporary_directory,
     save_config,
     save_language_model_info,
 )
@@ -53,7 +54,7 @@ from videodub.qwen_speech import (
     resolve_tts_reference,
 )
 from videodub.runner import CancelledError, ProcessRunner
-from videodub.subtitle_workflow import SpeechSubtitleWorkflow, SubtitleRepairWorkflow
+from videodub.subtitle_workflow import SubtitleRepairWorkflow
 from videodub.subtitles import find_source_subtitle
 from videodub.tts import dub_video
 
@@ -105,6 +106,7 @@ class VideoDubApp(tk.Tk):
         load_language_model_info(self.config_data)
         configure_cache_directory(self.config_data.cache_dir)
         self.config_data.ensure_directories()
+        reset_temporary_directory(self.config_data)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.download_runner = ProcessRunner(
             lambda line: self.events.put(("log", line))
@@ -747,6 +749,11 @@ class VideoDubApp(tk.Tk):
                 raise ValueError("请先在“模型 → 语音生成模型”中选择并锁定模型。")
             if stages[3]:
                 tts_model = read_installed_model(config.tts_model_path)
+                if not tts_model or not tts_model.aligner_path:
+                    raise ValueError(
+                        "当前语音生成模型缺少 Qwen3 Forced Aligner，"
+                        "请在模型菜单中重新下载该模型。"
+                    )
                 if tts_model and tts_model.variant == "base":
                     resolve_tts_reference(config)
             parallel = 1
@@ -882,18 +889,20 @@ class VideoDubApp(tk.Tk):
                         )
                     )
                     tts_url = tts_service.base_url
-                    speech = SpeechSubtitleWorkflow(
-                        config,
-                        runner,
-                        api_key=self.session_api_key
-                        or api_key_from_runtime(config=config),
-                    ).process_job(job)
+                    aligner_service = stack.enter_context(
+                        ManagedModelService(
+                            config,
+                            runner,
+                            "aligner",
+                            port=13000 + slot,
+                        )
+                    )
                     output = dub_video(
                         config,
                         runner,
                         job,
-                        speech_subtitle_path=speech,
                         qwen_base_url=tts_url,
+                        aligner_base_url=aligner_service.base_url,
                     )
                     runner.logger(f"配音输出：{output}")
         finally:

@@ -98,6 +98,16 @@ def configure_cache_directory(cache_dir: str | Path) -> Path:
     return root
 
 
+def reset_temporary_directory(config: "AppConfig") -> Path:
+    temporary = Path(config.cache_dir).expanduser().resolve() / "tmp"
+    if temporary.is_symlink() or temporary.is_file():
+        temporary.unlink()
+    elif temporary.is_dir():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    return temporary
+
+
 def migrate_cache_directory(source: str | Path, target: str | Path) -> None:
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target).expanduser().resolve()
@@ -246,6 +256,8 @@ class AppConfig:
         DEFAULT_WORK_DIR.mkdir(parents=True, exist_ok=True)
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+        (Path(self.cache_dir) / "tmp").mkdir(exist_ok=True)
 
 
 def load_config(path: Path | None = None) -> AppConfig:

@@ -9,6 +9,7 @@ from videodub.model_manager import InstalledModel
 from videodub.qwen_speech import (
     _crispasr_asr_runtime_options,
     _crispasr_language_code,
+    _multipart_audio,
     _segments_to_cues,
     _validate_crispasr_asr_model,
     resolve_tts_reference,
@@ -27,6 +28,18 @@ class RecordingRunner:
 
 
 class QwenSpeechTests(unittest.TestCase):
+    def test_alignment_multipart_contains_known_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            audio = Path(temp) / "voice.wav"
+            audio.write_bytes(b"wave")
+            body, _boundary = _multipart_audio(
+                audio,
+                "Chinese",
+                text="完整文稿。",
+            )
+        self.assertIn("完整文稿。".encode("utf-8"), body)
+        self.assertIn(b'name="text"', body)
+
     def test_crispasr_uses_explicit_language_codes(self) -> None:
         self.assertEqual(_crispasr_language_code("English"), "en")
         self.assertEqual(_crispasr_language_code("Chinese"), "zh")

@@ -67,6 +67,18 @@ def _mlx_audio_chunks(audio_path: Path) -> list[tuple[Any, float]]:
     )
 
 
+def _alignment_items(alignment: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "text": str(getattr(item, "text", "")),
+            "start": float(getattr(item, "start_time", 0.0)),
+            "end": float(getattr(item, "end_time", 0.0)),
+        }
+        for item in list(getattr(alignment, "items", []) or [])
+        if str(getattr(item, "text", "")).strip()
+    ]
+
+
 def _alignment_character(character: str) -> bool:
     return character == "'" or unicodedata.category(character)[:1] in {"L", "N"}
 
@@ -239,7 +251,12 @@ def create_asr_app(args: argparse.Namespace) -> Any:
     def health() -> dict[str, str]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {"status": "ok", "model": args.model, "backend": args.backend, "type": "asr"}
+        return {
+            "status": "ok",
+            "model": args.model,
+            "backend": args.backend,
+            "type": "asr",
+        }
 
     @app.post("/v1/asr")
     async def transcribe(
@@ -261,10 +278,17 @@ def create_asr_app(args: argparse.Namespace) -> Any:
                     language,
                 )
                 text = str(
-                    (result.get("text") if isinstance(result, dict) else getattr(result, "text", ""))
+                    result.get("text")
+                    if isinstance(result, dict)
+                    else getattr(result, "text", "")
                     or ""
                 )
-                return {"text": text, "language": language, "model": args.model, "segments": _mlx_segments(result)}
+                return {
+                    "text": text,
+                    "language": language,
+                    "model": args.model,
+                    "segments": _mlx_segments(result),
+                }
             result = state["model"].transcribe(
                 audio=str(temp_path),
                 language=language or None,
@@ -276,6 +300,78 @@ def create_asr_app(args: argparse.Namespace) -> Any:
                 "model": args.model,
                 "segments": _timestamp_segments(result),
             }
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    return app
+
+
+def create_aligner_app(args: argparse.Namespace) -> Any:
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+
+    state: dict[str, Any] = {"model": None}
+
+    @asynccontextmanager
+    async def lifespan(_app: Any):
+        if args.backend == "mlx":
+            from mlx_audio.stt.utils import load_model
+
+            state["model"] = load_model(args.model)
+        else:
+            from qwen_asr import Qwen3ForcedAligner
+
+            state["model"] = Qwen3ForcedAligner.from_pretrained(
+                args.model,
+                **_torch_options(),
+            )
+        yield
+        state["model"] = None
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        if state["model"] is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        return {
+            "status": "ok",
+            "model": args.model,
+            "backend": args.backend,
+            "type": "aligner",
+        }
+
+    @app.post("/v1/align")
+    async def align(
+        audio: UploadFile = File(...),
+        text: str = Form(...),
+        language: str = Form("Chinese"),
+    ) -> dict[str, Any]:
+        suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                handle.write(await audio.read())
+                temp_path = Path(handle.name)
+            if args.backend == "mlx":
+                import numpy as np
+                from mlx_audio.stt.utils import load_audio
+
+                samples = np.array(load_audio(str(temp_path)))
+                result = state["model"].generate(samples, text, language)
+            else:
+                result = state["model"].align(
+                    audio=str(temp_path),
+                    text=text,
+                    language=language,
+                )[0]
+            items = _alignment_items(result)
+            if not items:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Forced Aligner 没有返回逐字或逐词时间戳",
+                )
+            return {"items": items, "language": language, "model": args.model}
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
@@ -299,23 +395,44 @@ def _generate_tts_one(
     language: str,
 ) -> tuple[Any, int]:
     if args.backend == "mlx":
-        if args.variant == "base":
-            results = model.generate(
-                text=text,
-                ref_audio=args.reference_audio,
-                ref_text=args.reference_text,
-                lang_code=language,
+        tokenizer = getattr(model, "tokenizer", None)
+        try:
+            text_tokens = len(tokenizer.encode(text)) if tokenizer is not None else len(text)
+        except (AttributeError, TypeError, ValueError):
+            text_tokens = len(text)
+        max_tokens = min(4096, max(512, text_tokens * 6))
+        for temperature, top_p in ((0.7, 0.9), (0.5, 0.85)):
+            options = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+            }
+            if args.variant == "base":
+                results = model.generate(
+                    text=text,
+                    ref_audio=args.reference_audio,
+                    ref_text=args.reference_text,
+                    lang_code=language,
+                    **options,
+                )
+            else:
+                results = model.generate_custom_voice(
+                    text=text,
+                    speaker=args.speaker,
+                    language=language,
+                    **options,
+                )
+            result = (
+                next(iter(results)) if hasattr(results, "__iter__") else results
             )
-        else:
-            results = model.generate_custom_voice(
-                text=text,
-                speaker=args.speaker,
-                language=language,
-            )
-        result = next(iter(results)) if hasattr(results, "__iter__") else results
-        return (
-            getattr(result, "audio", result),
-            int(getattr(result, "sample_rate", 24000)),
+            token_count = int(getattr(result, "token_count", 0) or 0)
+            if not token_count or token_count < max_tokens:
+                return (
+                    getattr(result, "audio", result),
+                    int(getattr(result, "sample_rate", 24000)),
+                )
+        raise RuntimeError(
+            "MLX Qwen3-TTS 连续两次达到生成长度上限，拒绝返回退化音频"
         )
     if args.variant == "base":
         wavs, sample_rate = model.generate_voice_clone(
@@ -402,7 +519,12 @@ def create_tts_app(args: argparse.Namespace) -> Any:
     def health() -> dict[str, str]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {"status": "ok", "model": args.model, "backend": args.backend, "type": "tts"}
+        return {
+            "status": "ok",
+            "model": args.model,
+            "backend": args.backend,
+            "type": "tts",
+        }
 
     @app.post("/v1/tts")
     def synthesize(request: TTSRequest) -> dict[str, Any]:
@@ -429,11 +551,15 @@ def create_tts_app(args: argparse.Namespace) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("service", choices=("asr", "tts"))
+    parser.add_argument("service", choices=("asr", "tts", "aligner"))
     parser.add_argument("--backend", choices=("hf", "mlx"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--aligner", default="")
-    parser.add_argument("--variant", choices=("base", "custom_voice"), default="custom_voice")
+    parser.add_argument(
+        "--variant",
+        choices=("base", "custom_voice"),
+        default="custom_voice",
+    )
     parser.add_argument("--speaker", default="Vivian")
     parser.add_argument("--reference-audio", default="")
     parser.add_argument("--reference-text", default="")
@@ -442,8 +568,17 @@ def main() -> None:
     args = parser.parse_args()
     import uvicorn
 
-    app = create_asr_app(args) if args.service == "asr" else create_tts_app(args)
-    uvicorn.run(app, host=args.host, port=args.port or (9956 if args.service == "asr" else 9955))
+    app = (
+        create_asr_app(args)
+        if args.service == "asr"
+        else create_tts_app(args)
+        if args.service == "tts"
+        else create_aligner_app(args)
+    )
+    default_port = (
+        9956 if args.service == "asr" else 9955 if args.service == "tts" else 9957
+    )
+    uvicorn.run(app, host=args.host, port=args.port or default_port)
 
 
 if __name__ == "__main__":

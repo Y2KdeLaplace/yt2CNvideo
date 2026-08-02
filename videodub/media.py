@@ -59,20 +59,13 @@ class VideoJob:
             return self.generated_base_path.with_name(name + ".zh-CN.srt")
         return self.generated_base_path.with_name(name + f".translated.{suffix}.srt")
 
+    def translated_transcript_path(self, language: str) -> Path:
+        return self.translated_subtitle_path(language).with_suffix(".txt")
+
     @property
     def corrected_subtitle_path(self) -> Path:
         return self.generated_base_path.with_name(
             self.generated_base_path.name + ".corrected.srt"
-        )
-
-    @property
-    def speech_subtitle_path(self) -> Path:
-        return self.speech_subtitle_path_for("Chinese")
-
-    def speech_subtitle_path_for(self, language: str) -> Path:
-        suffix = TRANSLATION_SUFFIXES.get(language, language.lower())
-        return self.generated_base_path.with_name(
-            self.generated_base_path.name + f".speech.{suffix}.srt"
         )
 
     @property

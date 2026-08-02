@@ -5,7 +5,7 @@ scip 是一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 1. 用 yt-dlp 下载视频，优先取视频作者提供的字幕，没有时再取 YouTube 自动字幕。
 2. 用 Qwen3-ASR 从音轨生成一份独立识别字幕。
 3. 用一个 OpenAI 兼容语言模型比对两份字幕、修复原文并翻译为简体中文。
-4. 把中文字幕改写成适合朗读的文本，生成中文语音，再由 ffmpeg 对齐时间、替换音轨并嵌入字幕。
+4. 保存完整翻译文稿，用 Qwen3-TTS 一次生成整段语音，再通过 Qwen3 Forced Aligner 和 ffmpeg 按整句对齐、替换音轨并嵌入字幕。
 
 ASR 不会被当作 YouTube 字幕缺失时的自动后备。修复步骤同时需要下载字幕与识别字幕；缺少下载字幕会明确报错。
 
@@ -75,6 +75,7 @@ uv run scip
 - ASR 对齐：`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`
 - TTS Base：`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit`
 - TTS CustomVoice：`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`
+- TTS 对齐：`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`
 
 uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 [royisme/qwen-speech-mlx](https://github.com/royisme/qwen-speech-mlx)
@@ -92,6 +93,7 @@ uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 - 官方 TTS Base：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
 - 官方 TTS CustomVoice：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
 - GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。
+- TTS Forced Aligner：安装 TTS 时同时准备与 0.6B TTS 配套的 `Qwen/Qwen3-ForcedAligner-0.6B`；GGUF TTS 的对齐阶段也使用该官方模型。
 
 GGUF 使用按当前系统下载的 CrispASR 预编译运行时。选择“其他模型”后可输入 Hugging Face 的 `owner/model`，例如 `seanghay/Qwen3-ASR-0.6B-Khmer`。
 
@@ -109,7 +111,7 @@ Qwen3-TTS CustomVoice 使用内置中文音色 Vivian。Base 模型用于声音�
 
 为保留升级前的设置，scip 继续使用上述原配置目录名称，不会在启动时执行一次性迁移。
 
-“关于 → 缓存目录”只管理本应用的运行组件与可变应用数据，例如 CrispASR 运行组件。可选择“设置缓存目录”指定位置，程序会将旧的应用缓存完整迁移到新位置；也可选择“打开缓存目录”直接查看。Hugging Face 与 ModelScope 下载的模型保持各自原有的标准缓存位置，便于与其他工具共用，不会被本应用移动或重定向。
+“关于 → 缓存目录”只管理本应用的运行组件与可变应用数据，例如 CrispASR 运行组件和配音中间音频。可选择“设置缓存目录”指定位置，程序会将旧的应用缓存完整迁移到新位置；也可选择“打开缓存目录”直接查看。缓存目录下的 `tmp` 在每次打开程序时清空并重建。Hugging Face 与 ModelScope 下载的模型保持各自原有的标准缓存位置，便于与其他工具共用，不会被本应用移动或重定向。
 
 ## 工作目录
 
@@ -123,7 +125,7 @@ work/
 └── output/
     ├── 视频.corrected.srt
     ├── 视频.zh-CN.srt
-    ├── 视频.speech.zh-CN.srt
+    ├── 视频.zh-CN.txt
     ├── 视频.subtitle-report.json
     └── 视频.中文配音.mp4
 ```
@@ -148,7 +150,9 @@ work/
 
 ASR 不需要先生成 MP3。程序让 ffmpeg 直接把视频音轨解码为临时的 16 kHz 单声道无损 WAV，识别结束即删除。
 
-字幕修复与翻译只通过纯文本和语言模型交互；模型会判断领域、统一专业名词，并允许在修复字幕中保留 LaTeX 公式。配音前会生成临时朗读字幕，把公式改写为自然口语。语音会压缩或补静音以匹配原字幕时间段。
+字幕修复与翻译只通过纯文本和语言模型交互；模型会判断领域、统一专业名词，并允许在修复字幕中保留 LaTeX 公式。翻译完成时会把完整译文同时保存为结果目录中的 TXT；进入配音后直接读取该 TXT 与对应 SRT，不复制到缓存，也不再次调用语言模型改写。
+
+配音阶段把完整 TXT 交给 Qwen3-TTS。短文稿一次生成；超过模型单次生成容量的长文稿会在自然句末拆成受控小批次，随后重新拼成一条完整长音频，并记录每段的精确音频位置供 Forced Aligner 使用。旧模型无法批量生成时自动顺序处理。原始长音频和 Forced Aligner 结果仅写入缓存 `tmp`。没有 TTS 分段记录的长音频超过对齐模型单段限制时，程序会根据实际 TTS 音频进度映射字幕边界，并逐级扩大静音搜索窗、放宽静音判定；仍找不到安全静音时停止，不硬切语音。对齐后以完整句子为最小单位：拉长优先补静音，缩短时允许按目标时间窗强制变速；即使时长比例超出 0.75–1.25 也只记录提示，不再停止任务。所有接缝加入 15 ms 淡入淡出以避免爆音。
 
 ## 更新与版本
 

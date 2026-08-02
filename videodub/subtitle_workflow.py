@@ -54,13 +54,6 @@ SUBTITLE_SEGMENTATION_SYSTEM = """你是字幕语义分段专家。
 每组所有非空 parts 按顺序拼接、忽略空白后，必须与该组 translated_text 完全一致。
 只返回 JSON 数组，每项格式为 {"parts": ["第一段译文", "", "第三段译文"]}。不要使用 Markdown。"""
 
-SPEECH_REWRITE_SYSTEM = """你是 {language} 讲解稿改写专家。
-把字幕逐条改写成适合 {language} 语音朗读、同时不改变信息内容的文本。
-把公式、数学符号、英文缩写和无法直接朗读的写法改成自然口语。例如公式应表达其运算关系，而不是逐字符念出。
-不要增加解释、总结或过渡句；保持每个 id 独立，不合并、不拆分、不遗漏。
-只返回 JSON 数组，每项格式为 {"id": 1, "speech_text": "..."}。"""
-
-
 @dataclass(frozen=True)
 class RepairRecord:
     cue_id: int
@@ -395,6 +388,7 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         domain: dict[str, Any],
         *,
         artifact_base: Path | None = None,
+        transcript_path: Path | None = None,
     ) -> list[Cue]:
         self.runner.check_cancelled()
         corrected_transcript = subtitle_transcript(cues)
@@ -627,6 +621,9 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                             texts[cue_id],
                         )
                     )
+            if transcript_path is not None:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                transcript_path.write_text(translated_transcript, encoding="utf-8")
             return translated
         except CancelledError:
             raise
@@ -695,6 +692,9 @@ class SubtitleRepairWorkflow(_TextWorkflow):
                 corrected,
                 domain,
                 artifact_base=job.generated_base_path,
+                transcript_path=job.translated_transcript_path(
+                    self.config.translation_language
+                ),
             )
             write_srt(translated_path, translated)
         report = {
@@ -731,39 +731,3 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         if translate:
             self.runner.logger(f"翻译字幕：{translated_path}")
         return report
-
-
-class SpeechSubtitleWorkflow(_TextWorkflow):
-    def process_job(self, job: VideoJob) -> Path:
-        output = job.speech_subtitle_path_for(self.config.translation_language)
-        if output.is_file() and read_srt(output):
-            self.runner.logger(f"复用已有配音字幕：{output}")
-            return output
-        source = job.translated_subtitle_path(self.config.translation_language)
-        if not source.is_file():
-            raise RuntimeError(f"缺少翻译字幕：{source.name}")
-        cues = read_srt(source)
-        if not cues:
-            raise RuntimeError(f"翻译字幕为空：{source}")
-        spoken: list[Cue] = []
-        batch_size = self.config.subtitle_translation_batch_size
-        for start in range(0, len(cues), batch_size):
-            self.runner.check_cancelled()
-            batch = cues[start : start + batch_size]
-            result = self._call_array(
-                SPEECH_REWRITE_SYSTEM.replace(
-                    "{language}", self.config.translation_language
-                ),
-                json.dumps({"subtitles": _cue_payload(batch)}, ensure_ascii=False),
-            )
-            texts = self._validated_texts(result, batch, "speech_text")
-            spoken.extend(
-                Cue(cue.index, cue.start_ms, cue.end_ms, texts[cue.index])
-                for cue in batch
-            )
-            self.runner.logger(
-                f"配音文本改写进度：{min(start + len(batch), len(cues))}/{len(cues)}"
-            )
-        write_srt(output, spoken)
-        self.runner.logger(f"临时配音字幕：{output}")
-        return output

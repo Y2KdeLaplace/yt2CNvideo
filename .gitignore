@@ -20,3 +20,4 @@ settings.json
 *.onnx.json
 work/
 output/
+.DS_Store

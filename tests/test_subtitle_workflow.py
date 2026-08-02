@@ -19,7 +19,6 @@ from videodub.subtitle_workflow import (
     SUBTITLE_SEGMENTATION_SYSTEM,
     TRANSCRIPT_REPAIR_SYSTEM,
     TRANSLATION_SYSTEM,
-    SpeechSubtitleWorkflow,
     SubtitleRepairWorkflow,
 )
 from videodub.subtitles import Cue, find_source_subtitle, read_srt
@@ -728,6 +727,12 @@ class SubtitleWorkflowTests(unittest.TestCase):
                 chinese,
                 [Cue(1, 0, 2000, "一个脉冲序列。这是下一句话。")],
             )
+            self.assertEqual(
+                job.translated_transcript_path("Chinese").read_text(
+                    encoding="utf-8"
+                ),
+                "一个脉冲序列。这是下一句话。",
+            )
             self.assertEqual(report["domain"]["domain"], "computational neuroscience")
             repair_calls = [
                 call
@@ -817,65 +822,6 @@ class SubtitleWorkflowTests(unittest.TestCase):
             )
             repair_prompt = json.loads(repair_call["messages"][1]["content"])
             self.assertNotIn("qwen_asr_transcript", repair_prompt)
-
-    def test_speech_subtitle_rewrites_formula_for_tts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp, _MockChatServer() as mock:
-            root = Path(temp)
-            video = root / "Lecture.mp4"
-            video.touch()
-            output = root / "output"
-            output.mkdir()
-            job = VideoJob(video, generated_dir=output)
-            job.chinese_subtitle_path.write_text(
-                "1\n00:00:00,000 --> 00:00:02,000\n"
-                "$\\sum_{i=1}^{10}x_i$\n",
-                encoding="utf-8",
-            )
-            workflow = SpeechSubtitleWorkflow(
-                AppConfig(
-                    subtitle_api_base_url=mock.base_url,
-                    subtitle_model="mock-text-model",
-                ),
-                ProcessRunner(),
-            )
-
-            path = workflow.process_job(job)
-
-            self.assertEqual(
-                read_srt(path)[0].text,
-                "x i 从 i 为 1 到 10 求和。",
-            )
-
-    def test_existing_speech_subtitle_is_reused_without_rewriting(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            output = root / "output"
-            output.mkdir()
-            job = VideoJob(root / "Lecture.mp4", generated_dir=output)
-            existing = job.speech_subtitle_path_for("Chinese")
-            existing.write_text(
-                "1\n00:00:00,000 --> 00:00:02,000\n已经改写好的配音文本。\n",
-                encoding="utf-8",
-            )
-            messages: list[str] = []
-            workflow = SpeechSubtitleWorkflow(
-                AppConfig(
-                    translation_language="Chinese",
-                    subtitle_model="unused-model",
-                ),
-                ProcessRunner(messages.append),
-            )
-            workflow._call_array = Mock(
-                side_effect=AssertionError("不应调用字幕模型")
-            )
-
-            path = workflow.process_job(job)
-
-            self.assertEqual(path, existing)
-            self.assertEqual(read_srt(path)[0].text, "已经改写好的配音文本。")
-            self.assertIn(f"复用已有配音字幕：{existing}", messages)
-            workflow._call_array.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

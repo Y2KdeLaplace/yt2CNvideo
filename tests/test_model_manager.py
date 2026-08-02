@@ -391,6 +391,50 @@ class ModelManagerTests(unittest.TestCase):
         )
         self.assertEqual(installed.aligner_path, "aligner")
 
+    def test_mlx_tts_install_downloads_matching_forced_aligner(self) -> None:
+        choice = ModelChoice(
+            "mlx_custom_voice",
+            "Qwen3-TTS 0.6B CustomVoice 8bit（MLX）",
+            "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+            "mlx",
+        )
+        downloads: list[str] = []
+        runtimes: list[tuple[str, str]] = []
+
+        def download(_choice, repo_id, _runner, _selected_files=()):
+            downloads.append(repo_id)
+            return Path("aligner") if "ForcedAligner" in repo_id else Path("tts")
+
+        with (
+            patch(
+                "videodub.model_manager._install_runtime",
+                side_effect=lambda kind, backend, _runner: runtimes.append(
+                    (kind, backend)
+                ),
+            ),
+            patch(
+                "videodub.model_manager._download_choice",
+                side_effect=download,
+            ),
+        ):
+            installed = install_model(
+                AppConfig(),
+                "tts",
+                choice,
+                "",
+                RecordingRunner(),
+            )
+
+        self.assertEqual(runtimes, [("tts", "mlx"), ("aligner", "mlx")])
+        self.assertEqual(
+            downloads,
+            [
+                "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+                "mlx-community/Qwen3-ForcedAligner-0.6B-8bit",
+            ],
+        )
+        self.assertEqual(installed.aligner_path, "aligner")
+
     def test_modelscope_cache_discovers_official_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ,

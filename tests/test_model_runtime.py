@@ -11,6 +11,45 @@ from videodub.runner import ProcessRunner
 
 
 class ManagedModelServiceTests(unittest.TestCase):
+    def test_aligner_service_uses_tts_companion_model(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        installed = InstalledModel(
+            "tts",
+            "mlx",
+            "owner/tts",
+            "/tts",
+            aligner_path="/aligner",
+        )
+        checks = iter(
+            (
+                QwenServiceInfo(False, "aligner"),
+                QwenServiceInfo(True, "aligner", "/aligner", "mlx"),
+            )
+        )
+        runner = ProcessRunner()
+        config = AppConfig(tts_backend="mlx", tts_model_path="/tts")
+
+        with (
+            patch(
+                "videodub.model_runtime.read_installed_model",
+                return_value=installed,
+            ),
+            patch(
+                "videodub.model_runtime.check_qwen_service",
+                side_effect=lambda *_args, **_kwargs: next(checks),
+            ),
+            patch("videodub.model_runtime.subprocess.Popen", return_value=process) as popen,
+            patch("videodub.model_runtime.threading.Thread"),
+            patch("videodub.model_runtime._terminate_process_tree"),
+            ManagedModelService(config, runner, "aligner", port=13000),
+        ):
+            pass
+
+        command = popen.call_args.args[0]
+        self.assertIn("aligner", command)
+        self.assertEqual(command[command.index("--model") + 1], "/aligner")
+
     def test_windows_termination_kills_the_complete_process_tree(self) -> None:
         process = Mock(pid=321)
         process.poll.return_value = None

@@ -56,19 +56,35 @@ class ManagedModelService:
         self.config = config
         self.runner = runner
         self.kind = kind
-        self.port = port or (9956 if kind == "asr" else 9955)
+        default_port = (
+            9956 if kind == "asr" else 9957 if kind == "aligner" else 9955
+        )
+        self.port = port or default_port
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.process: subprocess.Popen[str] | None = None
         self._stop_lock = threading.Lock()
 
     def __enter__(self) -> "ManagedModelService":
-        path = self.config.asr_model_path if self.kind == "asr" else self.config.tts_model_path
-        backend = self.config.asr_backend if self.kind == "asr" else self.config.tts_backend
-        if not path:
+        selected_path = (
+            self.config.asr_model_path
+            if self.kind == "asr"
+            else self.config.tts_model_path
+        )
+        if not selected_path:
             raise RuntimeError(f"请先在“模型”菜单下载并选择{self.kind.upper()}模型")
-        installed = read_installed_model(path)
+        installed = read_installed_model(selected_path)
         if installed is None:
-            raise RuntimeError(f"模型未完整下载或已被移动：{path}")
+            raise RuntimeError(f"模型未完整下载或已被移动：{selected_path}")
+        if self.kind == "aligner":
+            path = installed.aligner_path
+            backend = "mlx" if installed.backend == "mlx" else "hf"
+            if not path:
+                raise RuntimeError(
+                    "当前 TTS 模型缺少 Qwen3 Forced Aligner，请在模型菜单中重新下载。"
+                )
+        else:
+            path = selected_path
+            backend = installed.backend
         if self.kind == "asr" and backend == "mlx" and not installed.aligner_path:
             raise RuntimeError(
                 "Mac ASR 缺少 MLX Forced Aligner，请在模型菜单中重新下载该模型。"

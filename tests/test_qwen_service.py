@@ -6,13 +6,71 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from videodub.qwen_service import (
+    _alignment_items,
     _generate_tts_batch,
+    _generate_tts_one,
     _timestamp_segments,
     _transcribe_mlx,
 )
 
 
 class QwenServiceTests(unittest.TestCase):
+    def test_mlx_tts_retries_when_generation_reaches_token_limit(self) -> None:
+        model = SimpleNamespace(
+            tokenizer=SimpleNamespace(encode=lambda _text: list(range(100))),
+            generate=Mock(
+                side_effect=[
+                    iter(
+                        [
+                            SimpleNamespace(
+                                audio="bad",
+                                sample_rate=24000,
+                                token_count=600,
+                            )
+                        ]
+                    ),
+                    iter(
+                        [
+                            SimpleNamespace(
+                                audio="good",
+                                sample_rate=24000,
+                                token_count=200,
+                            )
+                        ]
+                    ),
+                ]
+            ),
+        )
+        args = SimpleNamespace(
+            backend="mlx",
+            variant="base",
+            reference_audio="voice.wav",
+            reference_text="reference",
+            speaker="Vivian",
+        )
+
+        output = _generate_tts_one(model, args, "完整文稿", "Chinese")
+
+        self.assertEqual(output, ("good", 24000))
+        self.assertEqual(model.generate.call_count, 2)
+        self.assertEqual(model.generate.call_args_list[0].kwargs["max_tokens"], 600)
+        self.assertEqual(model.generate.call_args_list[1].kwargs["temperature"], 0.5)
+
+    def test_forced_alignment_items_keep_word_timestamps(self) -> None:
+        alignment = SimpleNamespace(
+            items=[
+                SimpleNamespace(text="你", start_time=0.08, end_time=0.24),
+                SimpleNamespace(text="好", start_time=0.24, end_time=0.48),
+            ]
+        )
+        self.assertEqual(
+            _alignment_items(alignment),
+            [
+                {"text": "你", "start": 0.08, "end": 0.24},
+                {"text": "好", "start": 0.24, "end": 0.48},
+            ],
+        )
+
     def test_mlx_base_tts_uses_shared_reference_batch_generation(self) -> None:
         model = SimpleNamespace()
         model.batch_generate = Mock(

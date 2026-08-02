@@ -18,6 +18,7 @@ from videodub.config import (
     load_config,
     migrate_work_directory,
     migrate_cache_directory,
+    reset_temporary_directory,
     save_config,
     save_language_model_info,
 )
@@ -25,6 +26,19 @@ from videodub.platform_utils import executable_exists, resolve_executable
 
 
 class ConfigPortabilityTests(unittest.TestCase):
+    def test_temporary_cache_is_cleared_and_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = AppConfig(cache_dir=temp)
+            temporary = Path(temp) / "tmp"
+            temporary.mkdir()
+            (temporary / "stale.wav").write_bytes(b"stale")
+
+            result = reset_temporary_directory(config)
+
+            self.assertEqual(result, temporary.resolve())
+            self.assertTrue(temporary.is_dir())
+            self.assertEqual(list(temporary.iterdir()), [])
+
     def test_python_executable_resolution_is_platform_independent(self) -> None:
         resolved = resolve_executable(sys.executable, "python")
         self.assertTrue(Path(resolved).is_file())

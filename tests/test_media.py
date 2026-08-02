@@ -27,6 +27,10 @@ class MediaDiscoveryTests(unittest.TestCase):
                 jobs[0].translated_subtitle_path("German").resolve(),
                 (output / "Lecture.translated.de.srt").resolve(),
             )
+            self.assertEqual(
+                jobs[0].translated_transcript_path("German").resolve(),
+                (output / "Lecture.translated.de.txt").resolve(),
+            )
 
     def test_source_subtitle_is_not_duplicated_when_video_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
