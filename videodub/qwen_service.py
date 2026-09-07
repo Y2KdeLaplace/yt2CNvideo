@@ -67,18 +67,6 @@ def _mlx_audio_chunks(audio_path: Path) -> list[tuple[Any, float]]:
     )
 
 
-def _alignment_items(alignment: Any) -> list[dict[str, Any]]:
-    return [
-        {
-            "text": str(getattr(item, "text", "")),
-            "start": float(getattr(item, "start_time", 0.0)),
-            "end": float(getattr(item, "end_time", 0.0)),
-        }
-        for item in list(getattr(alignment, "items", []) or [])
-        if str(getattr(item, "text", "")).strip()
-    ]
-
-
 def _alignment_character(character: str) -> bool:
     return character == "'" or unicodedata.category(character)[:1] in {"L", "N"}
 
@@ -307,78 +295,6 @@ def create_asr_app(args: argparse.Namespace) -> Any:
     return app
 
 
-def create_aligner_app(args: argparse.Namespace) -> Any:
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-
-    state: dict[str, Any] = {"model": None}
-
-    @asynccontextmanager
-    async def lifespan(_app: Any):
-        if args.backend == "mlx":
-            from mlx_audio.stt.utils import load_model
-
-            state["model"] = load_model(args.model)
-        else:
-            from qwen_asr import Qwen3ForcedAligner
-
-            state["model"] = Qwen3ForcedAligner.from_pretrained(
-                args.model,
-                **_torch_options(),
-            )
-        yield
-        state["model"] = None
-
-    app = FastAPI(lifespan=lifespan)
-
-    @app.get("/health")
-    def health() -> dict[str, str]:
-        if state["model"] is None:
-            raise HTTPException(status_code=503, detail="Model not loaded")
-        return {
-            "status": "ok",
-            "model": args.model,
-            "backend": args.backend,
-            "type": "aligner",
-        }
-
-    @app.post("/v1/align")
-    async def align(
-        audio: UploadFile = File(...),
-        text: str = Form(...),
-        language: str = Form("Chinese"),
-    ) -> dict[str, Any]:
-        suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
-        temp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-                handle.write(await audio.read())
-                temp_path = Path(handle.name)
-            if args.backend == "mlx":
-                import numpy as np
-                from mlx_audio.stt.utils import load_audio
-
-                samples = np.array(load_audio(str(temp_path)))
-                result = state["model"].generate(samples, text, language)
-            else:
-                result = state["model"].align(
-                    audio=str(temp_path),
-                    text=text,
-                    language=language,
-                )[0]
-            items = _alignment_items(result)
-            if not items:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Forced Aligner 没有返回逐字或逐词时间戳",
-                )
-            return {"items": items, "language": language, "model": args.model}
-        finally:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
-
-    return app
-
-
 def _audio_bytes(audio: Any, sample_rate: int) -> str:
     import numpy as np
     import soundfile as sf
@@ -551,7 +467,7 @@ def create_tts_app(args: argparse.Namespace) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("service", choices=("asr", "tts", "aligner"))
+    parser.add_argument("service", choices=("asr", "tts"))
     parser.add_argument("--backend", choices=("hf", "mlx"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--aligner", default="")
@@ -568,16 +484,8 @@ def main() -> None:
     args = parser.parse_args()
     import uvicorn
 
-    app = (
-        create_asr_app(args)
-        if args.service == "asr"
-        else create_tts_app(args)
-        if args.service == "tts"
-        else create_aligner_app(args)
-    )
-    default_port = (
-        9956 if args.service == "asr" else 9955 if args.service == "tts" else 9957
-    )
+    app = create_asr_app(args) if args.service == "asr" else create_tts_app(args)
+    default_port = 9956 if args.service == "asr" else 9955
     uvicorn.run(app, host=args.host, port=args.port or default_port)
 
 

@@ -106,8 +106,6 @@ def check_qwen_service(
 def _multipart_audio(
     path: Path,
     language: str,
-    *,
-    text: str = "",
 ) -> tuple[bytes, str]:
     boundary = "----VideoDub" + uuid.uuid4().hex
     newline = b"\r\n"
@@ -118,15 +116,6 @@ def _multipart_audio(
         b"",
         language.encode("utf-8"),
     ]
-    if text:
-        parts.extend(
-            [
-                f"--{boundary}".encode(),
-                b'Content-Disposition: form-data; name="text"',
-                b"",
-                text.encode("utf-8"),
-            ]
-        )
     parts.extend(
         [
             f"--{boundary}".encode(),
@@ -169,37 +158,6 @@ def _post_audio(
     if not isinstance(value, dict):
         raise RuntimeError("Qwen3-ASR 返回格式异常")
     return value
-
-
-def align_qwen(
-    audio_path: Path,
-    text: str,
-    language: str,
-    *,
-    base_url: str,
-    timeout: int = 3600,
-) -> list[dict[str, Any]]:
-    body, boundary = _multipart_audio(audio_path, language, text=text)
-    request = urllib.request.Request(
-        base_url.rstrip("/") + "/v1/align",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            value = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Qwen3 Forced Aligner 返回 HTTP {exc.code}：{detail[:1200]}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接 Qwen3 Forced Aligner：{exc.reason}") from exc
-    items = value.get("items") if isinstance(value, dict) else None
-    if not isinstance(items, list) or not items:
-        raise RuntimeError("Qwen3 Forced Aligner 没有返回有效时间戳")
-    return [item for item in items if isinstance(item, dict)]
 
 
 def _segments_to_cues(

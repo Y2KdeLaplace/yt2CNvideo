@@ -749,11 +749,6 @@ class VideoDubApp(tk.Tk):
                 raise ValueError("请先在“模型 → 语音生成模型”中选择并锁定模型。")
             if stages[3]:
                 tts_model = read_installed_model(config.tts_model_path)
-                if not tts_model or not tts_model.aligner_path:
-                    raise ValueError(
-                        "当前语音生成模型缺少 Qwen3 Forced Aligner，"
-                        "请在模型菜单中重新下载该模型。"
-                    )
                 if tts_model and tts_model.variant == "base":
                     resolve_tts_reference(config)
             parallel = 1
@@ -889,20 +884,11 @@ class VideoDubApp(tk.Tk):
                         )
                     )
                     tts_url = tts_service.base_url
-                    aligner_service = stack.enter_context(
-                        ManagedModelService(
-                            config,
-                            runner,
-                            "aligner",
-                            port=13000 + slot,
-                        )
-                    )
                     output = dub_video(
                         config,
                         runner,
                         job,
                         qwen_base_url=tts_url,
-                        aligner_base_url=aligner_service.base_url,
                     )
                     runner.logger(f"配音输出：{output}")
         finally:

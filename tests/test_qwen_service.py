@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from videodub.qwen_service import (
-    _alignment_items,
     _generate_tts_batch,
     _generate_tts_one,
     _timestamp_segments,
@@ -55,21 +54,6 @@ class QwenServiceTests(unittest.TestCase):
         self.assertEqual(model.generate.call_count, 2)
         self.assertEqual(model.generate.call_args_list[0].kwargs["max_tokens"], 600)
         self.assertEqual(model.generate.call_args_list[1].kwargs["temperature"], 0.5)
-
-    def test_forced_alignment_items_keep_word_timestamps(self) -> None:
-        alignment = SimpleNamespace(
-            items=[
-                SimpleNamespace(text="你", start_time=0.08, end_time=0.24),
-                SimpleNamespace(text="好", start_time=0.24, end_time=0.48),
-            ]
-        )
-        self.assertEqual(
-            _alignment_items(alignment),
-            [
-                {"text": "你", "start": 0.08, "end": 0.24},
-                {"text": "好", "start": 0.24, "end": 0.48},
-            ],
-        )
 
     def test_mlx_base_tts_uses_shared_reference_batch_generation(self) -> None:
         model = SimpleNamespace()

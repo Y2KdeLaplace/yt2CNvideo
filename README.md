@@ -5,7 +5,7 @@ scip 是一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 1. 用 yt-dlp 下载视频，优先取视频作者提供的字幕，没有时再取 YouTube 自动字幕。
 2. 用 Qwen3-ASR 从音轨生成一份独立识别字幕。
 3. 用一个 OpenAI 兼容语言模型比对两份字幕、修复原文并翻译为简体中文。
-4. 保存完整翻译文稿，用 Qwen3-TTS 一次生成整段语音，再通过 Qwen3 Forced Aligner 和 ffmpeg 按整句对齐、替换音轨并嵌入字幕。
+4. 把翻译字幕按自然句组成 TTS 单元，每句独立生成语音，再按原字幕时间窗做全局与局部语速适配，用 ffmpeg 放回时间轴、替换音轨并嵌入字幕。
 
 ASR 不会被当作 YouTube 字幕缺失时的自动后备。修复步骤同时需要下载字幕与识别字幕；缺少下载字幕会明确报错。
 
@@ -75,7 +75,6 @@ uv run scip
 - ASR 对齐：`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`
 - TTS Base：`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit`
 - TTS CustomVoice：`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`
-- TTS 对齐：`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`
 
 uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 [royisme/qwen-speech-mlx](https://github.com/royisme/qwen-speech-mlx)
@@ -93,7 +92,6 @@ uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 - 官方 TTS Base：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
 - 官方 TTS CustomVoice：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
 - GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。
-- TTS Forced Aligner：安装 TTS 时同时准备与 0.6B TTS 配套的 `Qwen/Qwen3-ForcedAligner-0.6B`；GGUF TTS 的对齐阶段也使用该官方模型。
 
 GGUF 使用按当前系统下载的 CrispASR 预编译运行时。选择“其他模型”后可输入 Hugging Face 的 `owner/model`，例如 `seanghay/Qwen3-ASR-0.6B-Khmer`。
 
@@ -150,9 +148,9 @@ work/
 
 ASR 不需要先生成 MP3。程序让 ffmpeg 直接把视频音轨解码为临时的 16 kHz 单声道无损 WAV，识别结束即删除。
 
-字幕修复与翻译只通过纯文本和语言模型交互；模型会判断领域、统一专业名词，并允许在修复字幕中保留 LaTeX 公式。翻译完成时会把完整译文同时保存为视频旁边的 TXT；进入配音后直接读取该 TXT 与对应 SRT，不复制到缓存，也不再次调用语言模型改写。
+字幕修复与翻译只通过纯文本和语言模型交互；模型会判断领域、统一专业名词，并允许在修复字幕中保留 LaTeX 公式。翻译完成时会把完整译文同时保存为视频旁边的 TXT；进入配音后读取翻译 SRT，不再次调用语言模型改写。
 
-配音阶段把完整 TXT 交给 Qwen3-TTS。短文稿一次生成；超过模型单次生成容量的长文稿会在自然句末拆成受控小批次，随后重新拼成一条完整长音频，并记录每段的精确音频位置供 Forced Aligner 使用。单次生成失败或批次缺失音频时会自动重试一次；再次失败则明确报错，不会用静音代替。旧模型无法批量生成时自动顺序处理。原始长音频和 Forced Aligner 结果仅写入缓存 `tmp`。没有 TTS 分段记录的长音频超过对齐模型单段限制时，程序会根据实际 TTS 音频进度映射字幕边界，并逐级扩大静音搜索窗、放宽静音判定；仍找不到安全静音时停止，不硬切语音。对齐后以完整句子为最小单位：拉长优先补静音，缩短时允许按目标时间窗强制变速；即使时长比例超出 0.75–1.25 也只记录提示，不再停止任务。所有接缝加入 15 ms 淡入淡出以避免爆音。
+配音阶段把翻译字幕按自然句组成 TTS 单元，每个自然句独立生成，再根据原字幕时间窗做全局与局部语速适配并放回原时间轴。全局适配统一修正整段配音的总体快慢；局部适配只进一步压缩明显过长的句子，短句不会被强行拉满窗口，剩余时间保留为自然静音。单个自然句超过模型单次安全长度时，只在该句内部拆成受控小批次并重新合成一个句级 WAV。生成失败或批次缺失音频时会自动重试一次；再次失败则明确报错，不会用静音代替。变速使用 FFmpeg `atempo`，不通过改变采样率修改音高；句间保留最多 15 ms 的受控交叠，最终生成与视频等长的单声道配音轨。
 
 ## 更新与版本
 
