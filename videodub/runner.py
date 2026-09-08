@@ -82,7 +82,8 @@ class ProcessRunner:
         process = subprocess.Popen(
             args,
             cwd=str(cwd) if cwd else None,
-            stdin=subprocess.PIPE if input_text is not None else None,
+            # Background GUI jobs must not read the launch terminal (SIGTTIN).
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=False,

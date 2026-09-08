@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import math
+import json
+import tempfile
 import re
 import shutil
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace, asdict
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -14,11 +16,12 @@ from .config import AppConfig
 from .media import VideoJob, media_duration
 from .qwen_speech import (
     check_qwen_service,
+    resolve_tts_reference,
     synthesize_qwen,
     synthesize_qwen_batch,
 )
 from .runner import CancelledError, ProcessRunner
-from .subtitles import Cue, read_srt
+from .sentences import SentenceUnit, read_units, spoken_text, validate_units
 
 
 LANGUAGE_METADATA_CODES = {
@@ -45,20 +48,10 @@ TTS_BATCH_SIZE = 2
 TTS_CHUNK_MAX_CHARS = 600
 TTS_CHUNK_SILENCE_MS = 120
 TTS_SYNTHESIS_ATTEMPTS = 2
-SENTENCE_END_RE = re.compile(r"[.!?。！？][\"'”’》〉】』〕〗〙〛）)\]]*$")
 TTS_SENTENCE_BREAK_RE = re.compile(
     r"[.!?。！？…]+[\"'”’》〉】』〕〗〙〛）)\]]*\s*"
 )
 TTS_SOFT_BREAK_RE = re.compile(r"[,;:，；：、]+\s*|\s+")
-
-
-@dataclass(frozen=True)
-class SentenceUnit:
-    first_cue: int
-    last_cue: int
-    start_ms: int
-    end_ms: int
-    text: str
 
 
 @dataclass(frozen=True)
@@ -143,57 +136,14 @@ def _join_tts_audio(parts: list[Path], output: Path) -> None:
         combined.export(destination, format="wav")
 
 
-def _joined_speech_text(cues: list[Cue]) -> str:
-    parts: list[str] = []
-    for cue in cues:
-        text = cue.text.strip()
-        if not text:
-            continue
-        if (
-            parts
-            and parts[-1][-1].isascii()
-            and parts[-1][-1].isalnum()
-            and text[0].isascii()
-            and text[0].isalnum()
-        ):
-            parts.append(" ")
-        parts.append(text)
-    return "".join(parts)
-
-
-def _sentence_units(cues: list[Cue]) -> list[SentenceUnit]:
-    units: list[SentenceUnit] = []
-    pending: list[Cue] = []
-    for cue in cues:
-        pending.append(cue)
-        text = _joined_speech_text(pending)
-        if SENTENCE_END_RE.search(text):
-            units.append(
-                SentenceUnit(
-                    pending[0].index,
-                    pending[-1].index,
-                    pending[0].start_ms,
-                    pending[-1].end_ms,
-                    text,
-                )
-            )
-            pending = []
-    if pending:
-        units.append(
-            SentenceUnit(
-                pending[0].index,
-                pending[-1].index,
-                pending[0].start_ms,
-                pending[-1].end_ms,
-                _joined_speech_text(pending),
-            )
-        )
-    return units
-
-
 def _audio_duration_ms(path: Path) -> int:
     try:
         with wave.open(str(path), "rb") as source:
+            if source.getnframes() <= 0 or source.getframerate() <= 0:
+                raise ValueError(f"WAV 没有音频帧：{path}")
+            frames = source.readframes(source.getnframes())
+            if len(frames) != source.getnframes() * source.getnchannels() * source.getsampwidth():
+                raise ValueError(f"WAV 数据不完整：{path}")
             return max(1, round(source.getnframes() / source.getframerate() * 1000))
     except (EOFError, wave.Error, ZeroDivisionError) as exc:
         raise ValueError(f"无法读取 WAV 时长：{path}") from exc
@@ -206,41 +156,36 @@ def _run_tts_request(
     outputs: list[Path],
     base_url: str,
 ) -> None:
+    pending = list(zip(texts, outputs, strict=True))
     for attempt in range(1, TTS_SYNTHESIS_ATTEMPTS + 1):
         runner.check_cancelled()
-        for output in outputs:
-            output.unlink(missing_ok=True)
+        error = ""
         try:
-            if len(texts) == 1:
-                synthesize_qwen(
-                    config,
-                    texts[0],
-                    outputs[0],
-                    runner,
-                    base_url=base_url,
-                )
+            requested_texts, requested_paths = map(list, zip(*pending))
+            for path in requested_paths:
+                path.unlink(missing_ok=True)
+            if len(pending) == 1:
+                synthesize_qwen(config, requested_texts[0], requested_paths[0], runner, base_url=base_url)
             else:
-                synthesize_qwen_batch(
-                    config,
-                    texts,
-                    outputs,
-                    runner,
-                    base_url=base_url,
-                )
-            if any(
-                not path.is_file() or path.stat().st_size == 0
-                for path in outputs
-            ):
-                raise RuntimeError("Qwen3-TTS 没有返回完整音频")
-            return
+                synthesize_qwen_batch(config, requested_texts, requested_paths, runner, base_url=base_url)
         except CancelledError:
             raise
-        except (OSError, RuntimeError) as exc:
-            if attempt == TTS_SYNTHESIS_ATTEMPTS:
-                raise RuntimeError(
-                    f"Qwen3-TTS 连续 {TTS_SYNTHESIS_ATTEMPTS} 次生成失败：{exc}"
-                ) from exc
-            runner.logger(f"Qwen3-TTS 生成失败，正在自动重试：{exc}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            error = str(exc)
+        failed = []
+        for text, path in pending:
+            try:
+                _audio_duration_ms(path)
+            except (OSError, ValueError):
+                path.unlink(missing_ok=True)
+                failed.append((text, path))
+        if not failed:
+            return
+        pending = failed
+        detail = "; ".join(f'{p.name} text={t!r}' for t, p in failed)
+        if attempt == TTS_SYNTHESIS_ATTEMPTS:
+            raise RuntimeError(f"Qwen3-TTS 连续 2 次生成失败：{detail}；{error or '没有有效音频'}")
+        runner.logger(f"Qwen3-TTS 生成失败，正在自动重试：{detail}；{error}")
 
 
 def _synthesize_sentence(
@@ -252,7 +197,10 @@ def _synthesize_sentence(
     base_url: str,
 ) -> SentenceAudio:
     output = work_dir / f"sentence-{index:05d}.raw.wav"
-    chunks = _tts_text_chunks(unit.text)
+    text = spoken_text(unit.text)
+    if not text:
+        raise ValueError("TTS 输入为空、纯标点或纯声效")
+    chunks = _tts_text_chunks(text)
     if len(chunks) == 1:
         _run_tts_request(config, runner, chunks, [output], base_url)
     else:
@@ -274,49 +222,110 @@ def _synthesize_sentence(
     return SentenceAudio(unit, output, duration_ms, duration_ms)
 
 
+def _voice_cache_identity(config: AppConfig) -> dict:
+    settings = {k: v for k, v in asdict(config).items() if k.startswith("tts_")}
+    # Resolve preset/custom reference exactly as model startup does.
+    if config.tts_voice_preset or config.tts_use_custom_voice:
+        audio, text = resolve_tts_reference(config)
+        settings["resolved_reference_text"] = text
+        settings["reference_sha256"] = hashlib.sha256(Path(audio).read_bytes()).hexdigest()
+    elif config.tts_reference_audio:
+        settings["reference_sha256"] = hashlib.sha256(Path(config.tts_reference_audio).read_bytes()).hexdigest()
+    if config.tts_reference_text_file:
+        settings["reference_text_sha256"] = hashlib.sha256(Path(config.tts_reference_text_file).read_bytes()).hexdigest()
+    model_path = Path(config.tts_model_path) if config.tts_model_path else None
+    if model_path is not None and model_path.exists():
+        # Weight replacement at the same local model id invalidates old speech.
+        files = [model_path] if model_path.is_file() else sorted(
+            p for p in model_path.rglob("*") if p.is_file() and p.suffix in {".json", ".safetensors", ".gguf", ".bin"})
+        settings["model_files"] = [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in files]
+    return {"generation_version": 2, "settings": settings,
+            "mlx_sampling": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096},
+            "chunk_chars": TTS_CHUNK_MAX_CHARS, "chunk_silence_ms": TTS_CHUNK_SILENCE_MS}
+
+
+def _cache_key(identity: dict, text: str) -> str:
+    return hashlib.sha256(json.dumps({**identity, "text": text}, ensure_ascii=False,
+                                     sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _save_cached_audio(source: Path, target: Path) -> None:
+    _audio_duration_ms(source)
+    with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".wav", delete=False) as temp:
+        temporary = Path(temp.name)
+    try:
+        shutil.copyfile(source, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _synthesize_sentence_units(
-    config: AppConfig,
-    runner: ProcessRunner,
-    units: list[SentenceUnit],
-    work_dir: Path,
-    base_url: str,
+    config: AppConfig, runner: ProcessRunner, units: list[SentenceUnit],
+    work_dir: Path, base_url: str,
 ) -> list[SentenceAudio]:
-    sentences: list[SentenceAudio] = []
-    index = 0
-    while index < len(units):
-        unit = units[index]
-        if config.tts_backend == "gguf" or len(_tts_text_chunks(unit.text)) > 1:
-            sentences.append(
-                _synthesize_sentence(config, runner, unit, index, work_dir, base_url)
-            )
-            index += 1
-        else:
-            last = index
-            while (
-                last < len(units)
-                and last - index < TTS_BATCH_SIZE
-                and len(_tts_text_chunks(units[last].text)) == 1
-            ):
-                last += 1
-            batch_units = units[index:last]
-            paths = [
-                work_dir / f"sentence-{i:05d}.raw.wav"
-                for i in range(index, last)
-            ]
-            _run_tts_request(
-                config,
-                runner,
-                [item.text for item in batch_units],
-                paths,
-                base_url,
-            )
-            for item, path in zip(batch_units, paths, strict=True):
-                duration_ms = _audio_duration_ms(path)
-                sentences.append(SentenceAudio(item, path, duration_ms, duration_ms))
-            index = last
-        if index % 10 == 0 or index == len(units):
-            runner.logger(f"自然句 TTS 进度：{index}/{len(units)}")
-    return sentences
+    normalized = [replace(u, text=spoken_text(u.text)) for u in units if u.kind == "spoken"]
+    if any(not u.text for u in normalized):
+        raise ValueError("TTS 输入为空、纯标点或纯声效")
+    units = normalized
+    cache = Path(config.cache_dir) / "tts-sentences-v2"
+    cache.mkdir(parents=True, exist_ok=True)
+    identity = _voice_cache_identity(config)
+    paths = [work_dir / f"sentence-{i:05d}.raw.wav" for i in range(len(units))]
+    cached = [cache / (_cache_key(identity, u.text) + ".wav") for u in units]
+    results: dict[int, SentenceAudio] = {}
+    for i, unit in enumerate(units):
+        runner.check_cancelled()
+        try:
+            duration = _audio_duration_ms(cached[i])
+        except (OSError, ValueError):
+            continue
+        shutil.copyfile(cached[i], paths[i])
+        results[i] = SentenceAudio(unit, paths[i], duration, duration)
+    runner.logger(f"自然句 TTS：{len(units)} 句，复用缓存 {len(results)} 句")
+    missing = [i for i in range(len(units)) if i not in results]
+    cursor = 0
+    while cursor < len(missing):
+        i = missing[cursor]
+        batch = [i]
+        if config.tts_backend != "gguf" and len(_tts_text_chunks(units[i].text)) == 1:
+            for following in missing[cursor + 1:cursor + TTS_BATCH_SIZE]:
+                if len(_tts_text_chunks(units[following].text)) > 1:
+                    break
+                batch.append(following)
+        for j in batch:
+            paths[j].unlink(missing_ok=True)
+        try:
+            if len(batch) == 1:
+                _synthesize_sentence(config, runner, units[i], i, work_dir, base_url)
+            else:
+                _run_tts_request(config, runner, [units[j].text for j in batch],
+                                 [paths[j] for j in batch], base_url)
+        except CancelledError:
+            raise
+        except (RuntimeError, ValueError, OSError) as exc:
+            failed = []
+            for j in batch:
+                try:
+                    _audio_duration_ms(paths[j])
+                except (OSError, ValueError):
+                    u = units[j]
+                    failed.append(f'自然句 TTS {j + 1}/{len(units)} cue: {u.first_cue}–{u.last_cue} text={u.text!r} target={u.end_ms-u.start_ms}ms')
+            detail = "\n".join(failed)
+            raise RuntimeError(f"{detail}\nmodel={config.tts_model_id or config.tts_model_path} backend={config.tts_backend}\n{exc}") from exc
+        finally:
+            # Commit each successful sentence even if its batch peer failed.
+            for j in batch:
+                try:
+                    duration = _audio_duration_ms(paths[j])
+                except (OSError, ValueError):
+                    continue
+                _save_cached_audio(paths[j], cached[j])
+                results[j] = SentenceAudio(units[j], paths[j], duration, duration)
+        cursor += len(batch)
+        if len(results) % 10 == 0 or len(results) == len(units):
+            runner.logger(f"自然句 TTS 进度：{len(results)}/{len(units)}")
+    return [results[i] for i in range(len(units))]
 
 
 def _global_duration_factor(sentences: list[SentenceAudio]) -> float:
@@ -359,6 +368,10 @@ def _adjust_sentence_audio(
     work_dir: Path,
 ) -> SentenceAudio:
     target_ms = max(1, sentence.unit.end_ms - sentence.unit.start_ms)
+    # Preserve natural speed for already-short sentences; leave room as silence.
+    global_duration_ratio = min(1.0, global_duration_ratio)
+    if sentence.raw_duration_ms <= target_ms:
+        global_duration_ratio = 1.0
     local_duration_ratio = _local_duration_factor(
         sentence.raw_duration_ms,
         target_ms,
@@ -428,7 +441,8 @@ def _fit_sentence_durations(
         )
         if unusual or (index + 1) % 10 == 0 or index + 1 == len(sentences):
             runner.logger(
-                f"句子 {index + 1}/{len(sentences)}：目标时长 {target_ms}ms，"
+                f"自然句 TTS {index + 1}/{len(sentences)} cue: {fitted.unit.first_cue}–{fitted.unit.last_cue} "
+                f"text={fitted.unit.text!r} target: {target_ms}ms，"
                 f"原始 TTS {fitted.raw_duration_ms}ms，"
                 f"global factor {fitted.global_duration_ratio:.3f}，"
                 f"local factor {fitted.local_duration_ratio:.3f}，"
@@ -608,23 +622,16 @@ def dub_video(
     subtitle_path = job.translated_subtitle_path(config.translation_language)
     if not subtitle_path.exists():
         raise RuntimeError(f"缺少翻译字幕：{subtitle_path.name}")
-    cues = read_srt(subtitle_path)
-    if not cues:
-        raise RuntimeError(f"翻译字幕为空：{subtitle_path}")
-    for previous, current in zip(cues, cues[1:]):
-        if current.start_ms < previous.end_ms:
-            runner.logger(
-                f"字幕 {previous.index} 与 {current.index} 时间轴重叠 "
-                f"{previous.end_ms - current.start_ms}ms，"
-                "配音阶段将按自然句顺序串行调度。"
-            )
-    units = _sentence_units(cues)
+    units = read_units(subtitle_path)
+    validate_units(units)
+    subtitle_end_ms = max((u.end_ms for u in units), default=0)
+    units = [u for u in units if u.kind == "spoken"]
     if not units:
-        raise RuntimeError(f"翻译字幕没有可配音的自然句：{subtitle_path}")
+        raise RuntimeError(f"翻译句级数据没有可配音的自然句：{subtitle_path}")
     total_duration = (
         media_duration(config, runner, job.video_path)
         if job.has_video
-        else max(cue.end_ms for cue in cues) / 1000
+        else subtitle_end_ms / 1000
     )
     work_dir = _job_temp_dir(config, job)
     if config.tts_backend != "gguf":

@@ -7,11 +7,14 @@ installed model, waits for /health, runs one task, and always terminates it.
 import argparse
 import base64
 import io
+import math
 import tempfile
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+from .sentences import TimelineError, spoken_text
 
 
 def _torch_options() -> dict[str, Any]:
@@ -120,6 +123,23 @@ def _alignment_to_segments(
     items = list(getattr(alignment, "items", []) or [])
     if not items:
         return []
+    previous_start = previous_end = -1.0
+    for index, item in enumerate(items):
+        start = float(getattr(item, "start_time", 0.0))
+        end = float(getattr(item, "end_time", 0.0))
+        if (not math.isfinite(start) or not math.isfinite(end) or start < 0
+                or end <= start or start < previous_start or end < previous_end
+                or previous_end - start > 0.1):
+            reason = "invalid_or_non_monotonic_timeline"
+            if end == start:
+                reason = "zero_duration_word（词语时长为 0）"
+            raise TimelineError(
+                f"ASR 声学对齐无效：word {index + 1} "
+                f"text={getattr(item, 'text', '')!r} "
+                f"start={start + offset_seconds:.3f}s end={end + offset_seconds:.3f}s；"
+                f"{reason}。未生成字幕，也未人为扩大时间窗。"
+            )
+        previous_start, previous_end = start, end
     display_tokens = _aligned_display_tokens(transcript, items)
     segments: list[dict[str, Any]] = []
     first = 0
@@ -288,6 +308,8 @@ def create_asr_app(args: argparse.Namespace) -> Any:
                 "model": args.model,
                 "segments": _timestamp_segments(result),
             }
+        except TimelineError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
@@ -300,7 +322,10 @@ def _audio_bytes(audio: Any, sample_rate: int) -> str:
     import soundfile as sf
 
     buffer = io.BytesIO()
-    sf.write(buffer, np.asarray(audio).squeeze(), sample_rate, format="WAV")
+    samples = np.asarray(audio).squeeze()
+    if samples.ndim != 1 or samples.size == 0 or not np.isfinite(samples).all() or sample_rate <= 0:
+        raise RuntimeError("Qwen3-TTS 返回空音频或非法采样数据")
+    sf.write(buffer, samples, sample_rate, format="WAV")
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
@@ -310,6 +335,9 @@ def _generate_tts_one(
     text: str,
     language: str,
 ) -> tuple[Any, int]:
+    text = spoken_text(text)
+    if not text:
+        raise RuntimeError("TTS 输入为空、纯标点或纯声效")
     if args.backend == "mlx":
         tokenizer = getattr(model, "tokenizer", None)
         try:
@@ -317,39 +345,20 @@ def _generate_tts_one(
         except (AttributeError, TypeError, ValueError):
             text_tokens = len(text)
         max_tokens = min(4096, max(512, text_tokens * 6))
-        for temperature, top_p in ((0.7, 0.9), (0.5, 0.85)):
-            options = {
-                "temperature": temperature,
-                "top_p": top_p,
-                "max_tokens": max_tokens,
-            }
-            if args.variant == "base":
-                results = model.generate(
-                    text=text,
-                    ref_audio=args.reference_audio,
-                    ref_text=args.reference_text,
-                    lang_code=language,
-                    **options,
-                )
-            else:
-                results = model.generate_custom_voice(
-                    text=text,
-                    speaker=args.speaker,
-                    language=language,
-                    **options,
-                )
-            result = (
-                next(iter(results)) if hasattr(results, "__iter__") else results
-            )
-            token_count = int(getattr(result, "token_count", 0) or 0)
-            if not token_count or token_count < max_tokens:
-                return (
-                    getattr(result, "audio", result),
-                    int(getattr(result, "sample_rate", 24000)),
-                )
-        raise RuntimeError(
-            "MLX Qwen3-TTS 连续两次达到生成长度上限，拒绝返回退化音频"
-        )
+        options = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
+        if args.variant == "base":
+            results = model.generate(text=text, ref_audio=args.reference_audio,
+                                     ref_text=args.reference_text, lang_code=language, **options)
+        else:
+            results = model.generate_custom_voice(text=text, speaker=args.speaker,
+                                                  language=language, **options)
+        result = next(iter(results), None) if hasattr(results, "__iter__") else results
+        if result is None:
+            raise RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}")
+        token_count = int(getattr(result, "token_count", 0) or 0)
+        if token_count >= max_tokens:
+            raise RuntimeError(f"MLX Qwen3-TTS 达到生成长度上限，拒绝返回退化音频：text={text!r}")
+        return (getattr(result, "audio", result), int(getattr(result, "sample_rate", 24000)))
     if args.variant == "base":
         wavs, sample_rate = model.generate_voice_clone(
             text=text,
@@ -371,9 +380,10 @@ def _generate_tts_batch(
     args: argparse.Namespace,
     texts: list[str],
     language: str,
-) -> list[tuple[Any, int]]:
+) -> list[tuple[Any, int] | RuntimeError]:
     if args.backend == "mlx" and len(texts) > 1 and hasattr(model, "batch_generate"):
-        kwargs: dict[str, Any] = {"lang_code": language}
+        kwargs: dict[str, Any] = {"lang_code": language, "temperature": 0.7,
+                                  "top_p": 0.9, "max_tokens": 4096}
         if args.variant == "base":
             kwargs.update(
                 ref_audio=args.reference_audio,
@@ -383,23 +393,30 @@ def _generate_tts_batch(
             kwargs["voices"] = [args.speaker] * len(texts)
         try:
             results = list(model.batch_generate(texts, **kwargs))
-        except (AttributeError, TypeError):
-            results = []
-        indexed = {
-            int(getattr(result, "sequence_idx", -1)): (
-                getattr(result, "audio", result),
-                int(getattr(result, "sample_rate", 24000)),
-            )
-            for result in results
-        }
-        if len(indexed) == len(texts) and all(
-            index in indexed for index in range(len(texts))
-        ):
-            return [indexed[index] for index in range(len(texts))]
-    return [
-        _generate_tts_one(model, args, text, language)
-        for text in texts
-    ]
+        except (AttributeError, TypeError, NotImplementedError):
+            # Older model API: use the sequential implementation below.
+            pass
+        except (RuntimeError, ValueError) as exc:
+            return [RuntimeError(f"MLX Qwen3-TTS batch text={text!r}: {exc}") for text in texts]
+        else:
+            indexed = {}
+            for result in results:
+                index = int(getattr(result, "sequence_idx", -1))
+                if index in indexed or index not in range(len(texts)):
+                    return [RuntimeError("MLX Qwen3-TTS 批量音频索引重复或无效") for _ in texts]
+                if int(getattr(result, "token_count", 0) or 0) >= 4096:
+                    indexed[index] = RuntimeError("MLX Qwen3-TTS 达到生成长度上限")
+                else:
+                    indexed[index] = (getattr(result, "audio", result), int(getattr(result, "sample_rate", 24000)))
+            return [indexed.get(i, RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}"))
+                    for i, text in enumerate(texts)]
+    outputs = []
+    for text in texts:
+        try:
+            outputs.append(_generate_tts_one(model, args, text, language))
+        except (RuntimeError, ValueError) as exc:
+            outputs.append(RuntimeError(str(exc)))
+    return outputs
 
 
 def create_tts_app(args: argparse.Namespace) -> Any:
@@ -445,7 +462,8 @@ def create_tts_app(args: argparse.Namespace) -> Any:
     @app.post("/v1/tts")
     def synthesize(request: TTSRequest) -> dict[str, Any]:
         texts = request.texts if request.texts is not None else [request.text]
-        if not texts or any(not text.strip() for text in texts):
+        texts = [spoken_text(text) for text in texts]
+        if not texts or any(not text for text in texts):
             raise HTTPException(status_code=400, detail="TTS text is empty")
         outputs = _generate_tts_batch(
             state["model"],
@@ -453,9 +471,22 @@ def create_tts_app(args: argparse.Namespace) -> Any:
             texts,
             request.language,
         )
-        encoded = [_audio_bytes(audio, sample_rate) for audio, sample_rate in outputs]
+        encoded: list[str | None] = []
+        errors: list[str | None] = []
+        for text, output in zip(texts, outputs, strict=True):
+            try:
+                if isinstance(output, RuntimeError):
+                    raise output
+                encoded.append(_audio_bytes(*output))
+                errors.append(None)
+            except (RuntimeError, ValueError) as exc:
+                encoded.append(None)
+                errors.append(f"model={args.model} backend={args.backend} text={text!r}: {exc}")
+        if request.texts is None and errors[0]:
+            raise HTTPException(status_code=500, detail=errors[0])
         response: dict[str, Any] = {
             "audio_base64_list": encoded,
+            "errors": errors,
             "model": args.model,
         }
         if request.texts is None:

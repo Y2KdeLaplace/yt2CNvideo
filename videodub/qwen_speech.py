@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, PROJECT_ROOT
-from .media import VideoJob, media_duration
+from .media import VideoJob
 from .model_manager import (
     InstalledModel,
     crispasr_executable,
@@ -152,6 +152,12 @@ def _post_audio(
             value = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and isinstance(parsed.get("detail"), str):
+                detail = parsed["detail"]
+        except ValueError:
+            pass
         raise RuntimeError(f"Qwen3-ASR 返回 HTTP {exc.code}：{detail[:1200]}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"无法连接 Qwen3-ASR：{exc.reason}") from exc
@@ -163,7 +169,6 @@ def _post_audio(
 def _segments_to_cues(
     segments: Any,
     fallback_text: str,
-    duration_seconds: float,
 ) -> list[Cue]:
     cues: list[Cue] = []
     if isinstance(segments, list):
@@ -174,20 +179,15 @@ def _segments_to_cues(
             if not text:
                 continue
             try:
-                start_ms = max(0, round(float(item.get("start") or 0) * 1000))
-                end_ms = max(start_ms + 1, round(float(item.get("end")) * 1000))
-            except (TypeError, ValueError):
-                continue
+                start_ms = round(float(item["start"]) * 1000)
+                end_ms = round(float(item["end"]) * 1000)
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(f"ASR 时间戳无效：cue {len(cues)+1} text={text!r} start={item.get('start')} end={item.get('end')}") from exc
             cues.append(Cue(len(cues) + 1, start_ms, end_ms, text))
     if not cues and fallback_text.strip():
-        cues.append(
-            Cue(
-                1,
-                0,
-                max(1, round(duration_seconds * 1000)),
-                fallback_text.strip(),
-            )
-        )
+        raise RuntimeError("ASR 只有文本，没有声学时间戳；不能用整段视频时长代替句子时间窗")
+    from .sentences import validate_timeline
+    validate_timeline(cues, allow_punctuation=True)
     return cues
 
 
@@ -286,6 +286,7 @@ def extract_asr_subtitle(
         runner.run(
             [
                 config.ffmpeg_path,
+                "-nostdin",
                 "-y",
                 "-i",
                 job.video_path,
@@ -301,6 +302,7 @@ def extract_asr_subtitle(
                 wav_path,
             ]
         )
+        runner.logger("16 kHz 音频解码完成，准备提交 ASR 识别…")
         runner.check_cancelled()
         if config.asr_backend == "gguf":
             executable = crispasr_executable()
@@ -360,7 +362,6 @@ def extract_asr_subtitle(
     cues = _segments_to_cues(
         result.get("segments"),
         str(result.get("text") or ""),
-        media_duration(config, runner, job.video_path),
     )
     if not cues:
         raise RuntimeError("Qwen3-ASR 没有返回可写入的字幕内容")
@@ -405,10 +406,15 @@ def synthesize_qwen_batch(
     encoded = response.get("audio_base64_list")
     if not isinstance(encoded, list) or len(encoded) != len(outputs):
         raise RuntimeError("Qwen3-TTS 批量返回的音频数量不一致")
-    for value, output in zip(encoded, outputs, strict=True):
+    failures = []
+    for i, (value, output) in enumerate(zip(encoded, outputs, strict=True)):
         if not isinstance(value, str) or not value:
-            raise RuntimeError("Qwen3-TTS 批量返回包含无效音频")
+            errors = response.get("errors") or []
+            failures.append(str(errors[i]) if i < len(errors) else f"text={texts[i]!r} 没有音频")
+            continue
         output.write_bytes(base64.b64decode(value))
+    if failures:
+        raise RuntimeError("Qwen3-TTS 批量生成部分失败：" + "; ".join(failures))
 
 
 def synthesize_qwen(

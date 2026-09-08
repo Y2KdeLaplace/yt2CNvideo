@@ -62,7 +62,6 @@ class QwenSpeechTests(unittest.TestCase):
                 {"text": "world", "start": 1.5, "end": 2.0},
             ],
             "",
-            3.0,
         )
         self.assertEqual([cue.index for cue in cues], [1, 2])
         self.assertEqual(cues[0].start_ms, 250)
@@ -87,7 +86,6 @@ class QwenSpeechTests(unittest.TestCase):
                 {"text": "history.", "start": 65.76, "end": 66.32},
             ],
             "",
-            66.32,
         )
 
         self.assertEqual(
@@ -117,7 +115,6 @@ class QwenSpeechTests(unittest.TestCase):
                 }
             ],
             "",
-            8,
         )
 
         self.assertEqual(
@@ -125,11 +122,13 @@ class QwenSpeechTests(unittest.TestCase):
             [Cue(1, 0, 8000, "one two three four five six seven eight")],
         )
 
-    def test_asr_text_without_segments_uses_video_duration(self) -> None:
-        cues = _segments_to_cues(None, "Fallback", 4.2)
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].text, "Fallback")
-        self.assertEqual(cues[0].end_ms, 4200)
+    def test_asr_text_without_timestamps_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "没有声学时间戳"):
+            _segments_to_cues(None, "Fallback")
+
+    def test_asr_invalid_end_is_not_replaced_with_one_millisecond(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid_duration"):
+            _segments_to_cues([{"text": "Isn't", "start": 3, "end": 2}], "")
 
     def test_old_gguf_conversion_is_rejected_before_crispasr_crashes(self) -> None:
         installed = InstalledModel(
@@ -299,6 +298,21 @@ class QwenSpeechTests(unittest.TestCase):
 
         self.assertEqual(captured["texts"], ["一", "二"])
         self.assertEqual(audio_bytes, [b"first", b"second"])
+
+class PartialTTSResponseTests(unittest.TestCase):
+    def test_partial_batch_response_writes_success_before_reporting_failure(self):
+        import base64
+        from videodub.qwen_speech import synthesize_qwen_batch
+        with tempfile.TemporaryDirectory() as temp:
+            paths = [Path(temp) / "one.wav", Path(temp) / "two.wav"]
+            with patch("videodub.qwen_speech._json_request", return_value={
+                "audio_base64_list": [base64.b64encode(b"valid-bytes").decode(), None],
+                "errors": [None, "empty iterable"],
+            }):
+                with self.assertRaisesRegex(RuntimeError, "empty iterable"):
+                    synthesize_qwen_batch(AppConfig(tts_backend="mlx"), ["one", "two"], paths, RecordingRunner())
+            self.assertEqual(paths[0].read_bytes(), b"valid-bytes")
+            self.assertFalse(paths[1].exists())
 
 
 if __name__ == "__main__":

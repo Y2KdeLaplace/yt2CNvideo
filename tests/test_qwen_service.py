@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from videodub.qwen_service import (
+    _alignment_to_segments,
     _generate_tts_batch,
     _generate_tts_one,
     _timestamp_segments,
@@ -14,7 +15,15 @@ from videodub.qwen_service import (
 
 
 class QwenServiceTests(unittest.TestCase):
-    def test_mlx_tts_retries_when_generation_reaches_token_limit(self) -> None:
+    def test_zero_duration_word_reports_absolute_time_without_repairing_it(self):
+        from videodub.sentences import TimelineError
+        word = SimpleNamespace(text="You", start_time=1.232, end_time=1.232)
+        with self.assertRaisesRegex(TimelineError, "zero_duration_word") as error:
+            _alignment_to_segments(SimpleNamespace(items=[word]), "You", 240.0)
+        self.assertIn("start=241.232s end=241.232s", str(error.exception))
+        self.assertEqual(word.end_time, 1.232)
+
+    def test_mlx_tts_limit_is_reported_for_caller_owned_retry(self) -> None:
         model = SimpleNamespace(
             tokenizer=SimpleNamespace(encode=lambda _text: list(range(100))),
             generate=Mock(
@@ -48,12 +57,24 @@ class QwenServiceTests(unittest.TestCase):
             speaker="Vivian",
         )
 
-        output = _generate_tts_one(model, args, "完整文稿", "Chinese")
+        with self.assertRaisesRegex(RuntimeError, "生成长度上限"):
+            _generate_tts_one(model, args, "完整文稿", "Chinese")
+        self.assertEqual(model.generate.call_count, 1)
 
-        self.assertEqual(output, ("good", 24000))
-        self.assertEqual(model.generate.call_count, 2)
-        self.assertEqual(model.generate.call_args_list[0].kwargs["max_tokens"], 600)
-        self.assertEqual(model.generate.call_args_list[1].kwargs["temperature"], 0.5)
+    def test_empty_iterator_is_a_clear_error(self) -> None:
+        args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
+                               reference_text="ref", speaker="Vivian")
+        model = SimpleNamespace(generate=Mock(return_value=iter([])))
+        with self.assertRaisesRegex(RuntimeError, "未生成任何音频.*你好"):
+            _generate_tts_one(model, args, "你好", "Chinese")
+
+    def test_sequential_batch_preserves_success_when_peer_is_empty(self) -> None:
+        args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
+                               reference_text="ref", speaker="Vivian")
+        model = SimpleNamespace(generate=Mock(side_effect=[iter([SimpleNamespace(audio="good")]), iter([])]))
+        result = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
+        self.assertEqual(result[0], ("good", 24000))
+        self.assertIsInstance(result[1], RuntimeError)
 
     def test_mlx_base_tts_uses_shared_reference_batch_generation(self) -> None:
         model = SimpleNamespace()
@@ -79,9 +100,21 @@ class QwenServiceTests(unittest.TestCase):
         model.batch_generate.assert_called_once_with(
             ["一", "二"],
             lang_code="Chinese",
+            temperature=0.7,
+            top_p=0.9,
+            max_tokens=4096,
             ref_audio="voice.wav",
             ref_text="reference",
         )
+
+    def test_empty_native_batch_does_not_add_hidden_generation_retries(self):
+        args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
+                               reference_text="ref", speaker="Vivian")
+        model = SimpleNamespace(batch_generate=Mock(return_value=iter([])), generate=Mock())
+        results = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
+        self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
+        model.generate.assert_not_called()
+        model.batch_generate.assert_called_once()
 
     def test_official_qwen_preserves_spaces_and_uses_natural_segments(self) -> None:
         words = (

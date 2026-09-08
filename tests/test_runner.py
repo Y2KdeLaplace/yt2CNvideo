@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+from unittest.mock import patch
 import time
 import unittest
 
@@ -70,3 +72,18 @@ class ProcessRunnerTests(unittest.TestCase):
         runner.cancel()
 
         self.assertEqual(called, ["retained"])
+
+    def test_background_commands_do_not_inherit_terminal_stdin(self) -> None:
+        with patch("videodub.runner.subprocess.Popen", wraps=subprocess.Popen) as spawn:
+            lines = ProcessRunner().run([
+                sys.executable, "-c",
+                "import sys; print(repr(sys.stdin.read()))",
+            ])
+        self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(lines, ["''"])
+
+    def test_explicit_input_still_uses_pipe(self) -> None:
+        lines = ProcessRunner().run([
+            sys.executable, "-c", "import sys; print(sys.stdin.read())",
+        ], input_text="字幕文本")
+        self.assertEqual(lines, ["字幕文本"])

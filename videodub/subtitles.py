@@ -3,9 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
-from bisect import bisect_left
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -29,7 +27,7 @@ class Cue:
 
     @property
     def duration_ms(self) -> int:
-        return max(1, self.end_ms - self.start_ms)
+        return self.end_ms - self.start_ms
 
 
 def _to_ms(hours: str, minutes: str, seconds: str, milliseconds: str) -> int:
@@ -100,6 +98,9 @@ def _timestamp(milliseconds: int) -> str:
 
 
 def write_srt(path: str | Path, cues: list[Cue]) -> None:
+    from .sentences import validate_timeline
+
+    validate_timeline(cues)
     blocks = []
     for number, cue in enumerate(cues, 1):
         blocks.append(
@@ -143,121 +144,6 @@ def subtitle_transcript(cues: list[Cue]) -> str:
                 break
         transcript_tokens.extend(current[overlap:])
     return _join_tokens(transcript_tokens)
-
-
-def align_transcript_to_cues(
-    source_cues: list[Cue],
-    transcript: str,
-    *,
-    merge_empty_cues: bool = False,
-) -> list[Cue]:
-    """Map a corrected same-language transcript onto an existing SRT timeline."""
-    source_tokens: list[str] = []
-    boundaries: list[int] = []
-    for cue in source_cues:
-        current = _tokens(cue.text)
-        normalized = [token.casefold() for token in current]
-        existing = [token.casefold() for token in source_tokens]
-        overlap = 0
-        for size in range(min(len(existing), len(normalized), 80), 0, -1):
-            if existing[-size:] == normalized[:size]:
-                overlap = size
-                break
-        source_tokens.extend(current[overlap:])
-        boundaries.append(len(source_tokens))
-    target_tokens = _tokens(transcript)
-    if not source_tokens or not target_tokens:
-        return []
-
-    matcher = SequenceMatcher(
-        None,
-        [token.casefold() for token in source_tokens],
-        [token.casefold() for token in target_tokens],
-        autojunk=False,
-    )
-    anchor_map = {0: 0, len(source_tokens): len(target_tokens)}
-    for match in matcher.get_matching_blocks():
-        if match.size:
-            anchor_map[match.a] = match.b
-            anchor_map[match.a + match.size] = match.b + match.size
-    anchor_source = sorted(anchor_map)
-
-    def target_boundary(source_boundary: int) -> int:
-        position = bisect_left(anchor_source, source_boundary)
-        if position < len(anchor_source) and anchor_source[position] == source_boundary:
-            return anchor_map[source_boundary]
-        left = anchor_source[max(0, position - 1)]
-        right = anchor_source[min(position, len(anchor_source) - 1)]
-        if left == right:
-            return anchor_map[left]
-        ratio = (source_boundary - left) / (right - left)
-        return round(anchor_map[left] + ratio * (anchor_map[right] - anchor_map[left]))
-
-    mapped = [0]
-    for boundary in boundaries:
-        mapped.append(max(mapped[-1], min(len(target_tokens), target_boundary(boundary))))
-    mapped[-1] = len(target_tokens)
-
-    aligned: list[Cue] = []
-    pending_start_ms: int | None = None
-    for cue, start, end in zip(source_cues, mapped[:-1], mapped[1:], strict=True):
-        text = _join_tokens(target_tokens[start:end])
-        if text:
-            aligned.append(
-                Cue(
-                    len(aligned) + 1 if merge_empty_cues else cue.index,
-                    pending_start_ms if pending_start_ms is not None else cue.start_ms,
-                    cue.end_ms,
-                    text,
-                )
-            )
-            pending_start_ms = None
-        elif merge_empty_cues:
-            if aligned:
-                previous = aligned[-1]
-                aligned[-1] = Cue(
-                    previous.index,
-                    previous.start_ms,
-                    cue.end_ms,
-                    previous.text,
-                )
-            elif pending_start_ms is None:
-                pending_start_ms = cue.start_ms
-    return aligned
-
-
-def semantic_cues(
-    cues: list[Cue],
-    *,
-    max_duration_ms: int = 12_000,
-    max_characters: int = 240,
-) -> list[Cue]:
-    """Join subtitle fragments into sentence-like units while retaining time ranges."""
-    grouped: list[Cue] = []
-    pending: list[Cue] = []
-    for cue in cues:
-        pending.append(cue)
-        text = " ".join(item.text.strip() for item in pending).strip()
-        duration = pending[-1].end_ms - pending[0].start_ms
-        if (
-            SENTENCE_END_RE.search(text)
-            or duration >= max_duration_ms
-            or len(text) >= max_characters
-        ):
-            grouped.append(
-                Cue(len(grouped) + 1, pending[0].start_ms, pending[-1].end_ms, text)
-            )
-            pending = []
-    if pending:
-        grouped.append(
-            Cue(
-                len(grouped) + 1,
-                pending[0].start_ms,
-                pending[-1].end_ms,
-                " ".join(item.text.strip() for item in pending).strip(),
-            )
-        )
-    return grouped
 
 
 def extract_json_array(text: str) -> list[dict]:
