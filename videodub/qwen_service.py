@@ -17,6 +17,12 @@ from typing import Any
 from .sentences import TimelineError, spoken_text
 
 
+MLX_SAMPLE_RATE = 16000
+MLX_CHUNK_DURATIONS = (240.0, 120.0, 60.0)
+CHUNK_BOUND_TOLERANCE_SECONDS = 0.001
+MAX_ALIGNMENT_OVERLAP_SECONDS = 0.1
+
+
 def _torch_options() -> dict[str, Any]:
     import torch
 
@@ -55,18 +61,29 @@ def _mlx_segments(result: Any) -> list[dict[str, Any]]:
     return segments
 
 
-def _mlx_audio_chunks(audio_path: Path) -> list[tuple[Any, float]]:
+def _split_mlx_audio(
+    audio: Any,
+    max_duration_seconds: float,
+) -> list[tuple[Any, float]]:
     import numpy as np
     from mlx_audio.stt.models.qwen3_asr.qwen3_asr import (
         split_audio_into_chunks,
     )
-    from mlx_audio.stt.utils import load_audio
 
     return split_audio_into_chunks(
-        np.array(load_audio(str(audio_path))),
-        sr=16000,
-        chunk_duration=240.0,
+        np.array(audio),
+        sr=MLX_SAMPLE_RATE,
+        chunk_duration=max_duration_seconds,
         min_chunk_duration=1.0,
+    )
+
+
+def _mlx_audio_chunks(audio_path: Path) -> list[tuple[Any, float]]:
+    from mlx_audio.stt.utils import load_audio
+
+    return _split_mlx_audio(
+        load_audio(str(audio_path)),
+        MLX_CHUNK_DURATIONS[0],
     )
 
 
@@ -115,21 +132,14 @@ def _ends_with(text: str, punctuation: str) -> bool:
     return stripped.endswith(tuple(punctuation))
 
 
-def _alignment_to_segments(
-    alignment: Any,
-    transcript: str,
-    offset_seconds: float,
-) -> list[dict[str, Any]]:
-    items = list(getattr(alignment, "items", []) or [])
-    if not items:
-        return []
+def _validate_word_alignment(items: list[Any], offset_seconds: float) -> None:
     previous_start = previous_end = -1.0
     for index, item in enumerate(items):
         start = float(getattr(item, "start_time", 0.0))
         end = float(getattr(item, "end_time", 0.0))
         if (not math.isfinite(start) or not math.isfinite(end) or start < 0
                 or end < start or start < previous_start or end < previous_end
-                or previous_end - start > 0.1):
+                or previous_end - start > MAX_ALIGNMENT_OVERLAP_SECONDS):
             reason = "invalid_or_non_monotonic_timeline"
             raise TimelineError(
                 f"ASR 声学对齐无效：word {index + 1} "
@@ -138,6 +148,63 @@ def _alignment_to_segments(
                 f"{reason}。未生成字幕，也未人为扩大时间窗。"
             )
         previous_start, previous_end = start, end
+
+
+def _validate_chunk_alignment_bounds(
+    items: list[Any],
+    chunk_duration_seconds: float,
+    offset_seconds: float,
+) -> None:
+    for index, item in enumerate(items):
+        start = float(getattr(item, "start_time", 0.0))
+        end = float(getattr(item, "end_time", 0.0))
+        if (
+            start > chunk_duration_seconds + CHUNK_BOUND_TOLERANCE_SECONDS
+            or end > chunk_duration_seconds + CHUNK_BOUND_TOLERANCE_SECONDS
+        ):
+            raise TimelineError(
+                f"MLX ASR chunk 对齐越界：word {index + 1} "
+                f"text={getattr(item, 'text', '')!r} "
+                f"start={start + offset_seconds:.3f}s "
+                f"end={end + offset_seconds:.3f}s；"
+                f"chunk={offset_seconds:.3f}s–"
+                f"{offset_seconds + chunk_duration_seconds:.3f}s；"
+                "chunk_bound_violation。未截断或修改时间戳。"
+            )
+
+
+def _validate_segment_timeline(
+    segments: list[dict[str, Any]],
+    label: str,
+) -> None:
+    previous_start = previous_end = -1.0
+    for index, segment in enumerate(segments):
+        start = float(segment["start"])
+        end = float(segment["end"])
+        issues: list[str] = []
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0:
+            issues.append("invalid_segment_timestamp")
+        if end <= start:
+            issues.append("invalid_segment_duration")
+        if start < previous_start or end < previous_end:
+            issues.append("non_monotonic_segment_timeline")
+        if previous_end - start > MAX_ALIGNMENT_OVERLAP_SECONDS:
+            issues.append("abnormal_segment_overlap")
+        if issues:
+            raise TimelineError(
+                f"{label} 无效：segment {index + 1} "
+                f"text={str(segment.get('text') or '')!r} "
+                f"start={start:.3f}s end={end:.3f}s；"
+                f"{', '.join(issues)}。未修改时间戳。"
+            )
+        previous_start, previous_end = start, end
+
+
+def _alignment_items_to_segments(
+    items: list[Any],
+    transcript: str,
+    offset_seconds: float,
+) -> list[dict[str, Any]]:
     display_tokens = _aligned_display_tokens(transcript, items)
     segments: list[dict[str, Any]] = []
     first = 0
@@ -173,6 +240,15 @@ def _alignment_to_segments(
         )
         if not boundary:
             continue
+        if current_end <= start_time:
+            if next_item is None and spoken_text(text):
+                raise TimelineError(
+                    "ASR 声学对齐无效：chunk 结束时仍有零时长 spoken segment "
+                    f"text={text!r} start={start_time + offset_seconds:.3f}s "
+                    f"end={current_end + offset_seconds:.3f}s；"
+                    "zero_duration_spoken_segment。未扩大或伪造时间窗。"
+                )
+            continue
         start_item = items[first]
         segments.append(
             {
@@ -189,7 +265,89 @@ def _alignment_to_segments(
             }
         )
         first = index + 1
+    _validate_segment_timeline(segments, "ASR segment 时间轴")
     return segments
+
+
+def _alignment_to_segments(
+    alignment: Any,
+    transcript: str,
+    offset_seconds: float,
+) -> list[dict[str, Any]]:
+    items = list(getattr(alignment, "items", []) or [])
+    if not items:
+        return []
+    _validate_word_alignment(items, offset_seconds)
+    return _alignment_items_to_segments(items, transcript, offset_seconds)
+
+
+def _transcribe_mlx_chunk(
+    model: Any,
+    aligner: Any,
+    audio_chunk: Any,
+    offset_seconds: float,
+    language: str,
+    retry_level: int,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    chunk_duration_seconds = len(audio_chunk) / MLX_SAMPLE_RATE
+    try:
+        result = model.generate(audio_chunk, language=language or None)
+        text = str(
+            (
+                result.get("text")
+                if isinstance(result, dict)
+                else getattr(result, "text", "")
+            )
+            or ""
+        ).strip()
+        if not text:
+            return [], []
+        alignment = aligner.generate(audio_chunk, text, language)
+        items = list(getattr(alignment, "items", []) or [])
+        if not items:
+            raise TimelineError("MLX Forced Aligner 没有返回逐词时间戳")
+        _validate_word_alignment(items, offset_seconds)
+        _validate_chunk_alignment_bounds(
+            items,
+            chunk_duration_seconds,
+            offset_seconds,
+        )
+        aligned = _alignment_items_to_segments(items, text, offset_seconds)
+        if not aligned:
+            raise TimelineError("MLX Forced Aligner 没有生成正时长 segment")
+        return [text], aligned
+    except TimelineError as exc:
+        if retry_level + 1 >= len(MLX_CHUNK_DURATIONS):
+            raise TimelineError(
+                "MLX ASR chunk 在 240→120→60 秒细分后仍无法可靠对齐："
+                f"chunk={offset_seconds:.3f}s–"
+                f"{offset_seconds + chunk_duration_seconds:.3f}s；{exc}"
+            ) from exc
+
+        child_chunks = _split_mlx_audio(
+            audio_chunk,
+            MLX_CHUNK_DURATIONS[retry_level + 1],
+        )
+        if not child_chunks:
+            raise TimelineError(
+                f"MLX ASR chunk 无法细分：chunk={offset_seconds:.3f}s–"
+                f"{offset_seconds + chunk_duration_seconds:.3f}s；{exc}"
+            ) from exc
+        texts: list[str] = []
+        segments: list[dict[str, Any]] = []
+        for child_audio, child_local_offset in child_chunks:
+            child_texts, child_segments = _transcribe_mlx_chunk(
+                model,
+                aligner,
+                child_audio,
+                offset_seconds + float(child_local_offset),
+                language,
+                retry_level + 1,
+            )
+            texts.extend(child_texts)
+            segments.extend(child_segments)
+        _validate_segment_timeline(segments, "MLX 子 chunk 拼接时间轴")
+        return texts, segments
 
 
 def _transcribe_mlx(
@@ -201,23 +359,17 @@ def _transcribe_mlx(
     texts: list[str] = []
     segments: list[dict[str, Any]] = []
     for audio_chunk, offset_seconds in _mlx_audio_chunks(audio_path):
-        result = model.generate(audio_chunk, language=language or None)
-        text = str(
-            (
-                result.get("text")
-                if isinstance(result, dict)
-                else getattr(result, "text", "")
-            )
-            or ""
-        ).strip()
-        if not text:
-            continue
-        alignment = aligner.generate(audio_chunk, text, language)
-        aligned = _alignment_to_segments(alignment, text, offset_seconds)
-        if not aligned:
-            raise RuntimeError("MLX Forced Aligner 没有返回逐词时间戳")
-        texts.append(text)
-        segments.extend(aligned)
+        chunk_texts, chunk_segments = _transcribe_mlx_chunk(
+            model,
+            aligner,
+            audio_chunk,
+            float(offset_seconds),
+            language,
+            0,
+        )
+        texts.extend(chunk_texts)
+        segments.extend(chunk_segments)
+    _validate_segment_timeline(segments, "MLX ASR 全局时间轴")
     return {"text": " ".join(texts), "segments": segments}
 
 

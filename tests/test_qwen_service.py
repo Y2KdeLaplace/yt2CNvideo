@@ -11,7 +11,18 @@ from videodub.qwen_service import (
     _generate_tts_one,
     _timestamp_segments,
     _transcribe_mlx,
+    _validate_chunk_alignment_bounds,
 )
+from videodub.sentences import TimelineError
+
+
+class SizedAudio:
+    def __init__(self, duration_seconds: float, name: str) -> None:
+        self.sample_count = round(duration_seconds * 16000)
+        self.name = name
+
+    def __len__(self) -> int:
+        return self.sample_count
 
 
 class QwenServiceTests(unittest.TestCase):
@@ -42,7 +53,6 @@ class QwenServiceTests(unittest.TestCase):
         )
 
     def test_reversed_word_reports_absolute_time_without_repairing_it(self):
-        from videodub.sentences import TimelineError
         word = SimpleNamespace(text="You", start_time=1.3, end_time=1.2)
         with self.assertRaisesRegex(
             TimelineError,
@@ -53,8 +63,6 @@ class QwenServiceTests(unittest.TestCase):
         self.assertEqual((word.start_time, word.end_time), (1.3, 1.2))
 
     def test_non_monotonic_and_abnormal_overlap_remain_invalid(self):
-        from videodub.sentences import TimelineError
-
         cases = [
             [("one", 0.14, 0.15), ("two", 0.13, 0.3)],
             [("one", 0.0, 0.5), ("two", 0.35, 0.8)],
@@ -78,6 +86,53 @@ class QwenServiceTests(unittest.TestCase):
                     "one two",
                     0.0,
                 )
+
+    def test_zero_duration_word_at_segment_start_waits_for_positive_duration(self):
+        words = [
+            SimpleNamespace(text="Wait", start_time=10.0, end_time=10.0),
+            SimpleNamespace(text="here", start_time=10.8, end_time=10.88),
+        ]
+
+        segments = _alignment_to_segments(
+            SimpleNamespace(items=words),
+            "Wait here.",
+            0.0,
+        )
+
+        self.assertEqual(
+            segments,
+            [{"text": "Wait here.", "start": 10.0, "end": 10.88}],
+        )
+        self.assertEqual((words[0].start_time, words[0].end_time), (10.0, 10.0))
+
+    def test_isolated_zero_duration_word_is_an_alignment_failure(self):
+        word = SimpleNamespace(text="You", start_time=1.232, end_time=1.232)
+        with self.assertRaisesRegex(
+            TimelineError,
+            "zero_duration_spoken_segment",
+        ) as error:
+            _alignment_to_segments(SimpleNamespace(items=[word]), "You", 240.0)
+
+        self.assertIn("start=241.232s end=241.232s", str(error.exception))
+        self.assertEqual((word.start_time, word.end_time), (1.232, 1.232))
+
+    def test_chunk_bound_violation_is_not_clamped(self):
+        within_tolerance = SimpleNamespace(
+            text="Edge",
+            start_time=119.92,
+            end_time=120.0005,
+        )
+        _validate_chunk_alignment_bounds([within_tolerance], 120.0, 240.0)
+
+        word = SimpleNamespace(text="Beyond", start_time=119.92, end_time=132.0)
+        with self.assertRaisesRegex(
+            TimelineError,
+            "chunk_bound_violation",
+        ) as error:
+            _validate_chunk_alignment_bounds([word], 120.0, 240.0)
+
+        self.assertIn("chunk=240.000s–360.000s", str(error.exception))
+        self.assertEqual((word.start_time, word.end_time), (119.92, 132.0))
 
     def test_mlx_tts_limit_is_reported_for_caller_owned_retry(self) -> None:
         model = SimpleNamespace(
@@ -262,9 +317,10 @@ class QwenServiceTests(unittest.TestCase):
                 )
 
         aligner = Aligner()
+        audio_chunk = SizedAudio(5.0, "audio-chunk")
         with patch(
             "videodub.qwen_service._mlx_audio_chunks",
-            return_value=[("audio-chunk", 10.0)],
+            return_value=[(audio_chunk, 10.0)],
         ):
             result = _transcribe_mlx(
                 Model(),
@@ -273,8 +329,8 @@ class QwenServiceTests(unittest.TestCase):
                 "English",
             )
 
-        self.assertEqual(calls, [("audio-chunk", "English")])
-        self.assertEqual(aligner.call[0], "audio-chunk")
+        self.assertEqual(calls, [(audio_chunk, "English")])
+        self.assertIs(aligner.call[0], audio_chunk)
         self.assertEqual(
             result["segments"],
             [
@@ -290,6 +346,156 @@ class QwenServiceTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_failed_parent_chunk_retries_at_120_seconds_with_absolute_offset(self):
+        parent = SizedAudio(240.0, "parent")
+        child = SizedAudio(120.0, "child")
+        model = SimpleNamespace(
+            generate=Mock(side_effect=lambda audio, **_kwargs: {"text": audio.name})
+        )
+
+        def align(audio, _text, _language):
+            if audio is parent:
+                start = end = 1.0
+            else:
+                start = 2.0
+                end = 3.0
+            return SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        text=audio.name,
+                        start_time=start,
+                        end_time=end,
+                    )
+                ]
+            )
+
+        aligner = SimpleNamespace(generate=Mock(side_effect=align))
+        with patch(
+            "videodub.qwen_service._mlx_audio_chunks",
+            return_value=[(parent, 240.0)],
+        ), patch(
+            "videodub.qwen_service._split_mlx_audio",
+            return_value=[(child, 60.0)],
+        ) as split:
+            result = _transcribe_mlx(model, aligner, Path("audio.wav"), "English")
+
+        split.assert_called_once_with(parent, 120.0)
+        self.assertEqual(result["text"], "child")
+        self.assertEqual(
+            result["segments"],
+            [{"text": "child", "start": 302.0, "end": 303.0}],
+        )
+
+    def test_alignment_failure_after_60_second_retry_reports_chunk_range(self):
+        parent = SizedAudio(240.0, "parent")
+        child = SizedAudio(120.0, "child")
+        grandchild = SizedAudio(60.0, "grandchild")
+        model = SimpleNamespace(
+            generate=Mock(side_effect=lambda audio, **_kwargs: {"text": audio.name})
+        )
+
+        def align(audio, _text, _language):
+            duration = len(audio) / 16000
+            return SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        text=audio.name,
+                        start_time=0.0,
+                        end_time=duration + 1.0,
+                    )
+                ]
+            )
+
+        def split(audio, max_duration):
+            if audio is parent and max_duration == 120.0:
+                return [(child, 0.0)]
+            if audio is child and max_duration == 60.0:
+                return [(grandchild, 0.0)]
+            self.fail("unexpected subdivision")
+
+        aligner = SimpleNamespace(generate=Mock(side_effect=align))
+        with patch(
+            "videodub.qwen_service._mlx_audio_chunks",
+            return_value=[(parent, 240.0)],
+        ), patch(
+            "videodub.qwen_service._split_mlx_audio",
+            side_effect=split,
+        ):
+            with self.assertRaisesRegex(
+                TimelineError,
+                "240→120→60.*chunk=240.000s–300.000s.*chunk_bound_violation",
+            ):
+                _transcribe_mlx(model, aligner, Path("audio.wav"), "English")
+
+        self.assertEqual(model.generate.call_count, 3)
+        self.assertEqual(aligner.generate.call_count, 3)
+
+    def test_multiple_mlx_chunks_produce_global_monotonic_segments(self):
+        first = SizedAudio(5.0, "First")
+        second = SizedAudio(5.0, "Second")
+        model = SimpleNamespace(
+            generate=Mock(side_effect=lambda audio, **_kwargs: {"text": audio.name})
+        )
+        aligner = SimpleNamespace(
+            generate=Mock(
+                side_effect=lambda audio, _text, _language: SimpleNamespace(
+                    items=[
+                        SimpleNamespace(
+                            text=audio.name,
+                            start_time=0.1,
+                            end_time=0.5,
+                        )
+                    ]
+                )
+            )
+        )
+        with patch(
+            "videodub.qwen_service._mlx_audio_chunks",
+            return_value=[(first, 0.0), (second, 5.0)],
+        ):
+            result = _transcribe_mlx(model, aligner, Path("audio.wav"), "English")
+
+        self.assertEqual(
+            result["segments"],
+            [
+                {"text": "First", "start": 0.1, "end": 0.5},
+                {"text": "Second", "start": 5.1, "end": 5.5},
+            ],
+        )
+
+    def test_global_segment_regression_is_rejected_inside_asr_service(self):
+        first = SizedAudio(300.0, "First")
+        second = SizedAudio(10.0, "Second")
+        timestamps = {
+            "First": (256.0, 256.72),
+            "Second": (0.164, 0.564),
+        }
+        model = SimpleNamespace(
+            generate=Mock(side_effect=lambda audio, **_kwargs: {"text": audio.name})
+        )
+        aligner = SimpleNamespace(
+            generate=Mock(
+                side_effect=lambda audio, _text, _language: SimpleNamespace(
+                    items=[
+                        SimpleNamespace(
+                            text=audio.name,
+                            start_time=timestamps[audio.name][0],
+                            end_time=timestamps[audio.name][1],
+                        )
+                    ]
+                )
+            )
+        )
+        with patch(
+            "videodub.qwen_service._mlx_audio_chunks",
+            return_value=[(first, 0.0), (second, 244.0)],
+        ):
+            with self.assertRaisesRegex(
+                TimelineError,
+                "MLX ASR 全局时间轴.*non_monotonic_segment_timeline",
+            ):
+                _transcribe_mlx(model, aligner, Path("audio.wav"), "English")
 
     def test_official_qwen_does_not_force_split_without_natural_boundary(self) -> None:
         words = [

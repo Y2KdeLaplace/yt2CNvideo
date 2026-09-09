@@ -23,8 +23,13 @@ class ASRHttpTests(unittest.TestCase):
                   "mlx_audio.stt": ModuleType("mlx_audio.stt"),
                   "mlx_audio.stt.utils": module}
         args = SimpleNamespace(backend="mlx", model="model", aligner="aligner")
+        audio_chunk = bytes(20 * 16000)
         with patch.dict(sys.modules, mocked), patch(
-            "videodub.qwen_service._mlx_audio_chunks", return_value=[("audio", 0.0)]
+            "videodub.qwen_service._mlx_audio_chunks",
+            return_value=[(audio_chunk, 0.0)],
+        ), patch(
+            "videodub.qwen_service._split_mlx_audio",
+            side_effect=lambda audio, _duration: [(audio, 0.0)],
         ), TestClient(create_asr_app(args)) as client:
             return client.post("/v1/asr", files={"audio": ("a.wav", b"stub")})
 

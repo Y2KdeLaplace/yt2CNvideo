@@ -62,8 +62,6 @@ def validate_timeline(cues: list[Cue], logger: Callable[[str], None] | None = No
             if previous.end_ms - cue.start_ms > MAX_OVERLAP_MS:
                 issues.append("abnormal_overlap")
         kind = text_kind(cue.text)
-        if kind == "spoken" and cue.end_ms - cue.start_ms <= 100:
-            issues.append("short_language_fragment<=100ms")
         if cue.end_ms - cue.start_ms > MAX_SENTENCE_WINDOW_MS and kind == "spoken":
             issues.append("sentence_window_too_long")
         if kind == "punctuation":

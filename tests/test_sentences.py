@@ -18,13 +18,16 @@ from videodub.subtitle_workflow import SubtitleRepairWorkflow
 
 
 class TimelineTests(unittest.TestCase):
-    def test_real_short_fragments_cannot_bridge_seven_or_thirty_four_seconds(self):
-        for text, start, end, following, tail in [
-            ("You", 1280, 1360, 8800, "guys see anything?"),
-            ("I'll", 182000, 182080, 216800, "never get used to those final death throes."),
-        ]:
-            with self.subTest(text=text), self.assertRaisesRegex(TimelineError, "cue 1.*short_language_fragment"):
-                build_sentence_units([Cue(1, start, end, text), Cue(2, following, following + 5920, tail)])
+    def test_eighty_millisecond_spoken_cue_is_valid(self):
+        cue = Cue(1, 1280, 1360, "You")
+
+        validate_timeline([cue])
+        units = build_sentence_units([cue])
+
+        self.assertEqual(
+            [(unit.start_ms, unit.end_ms, unit.text) for unit in units],
+            [(1280, 1360, "You")],
+        )
 
     def test_timestamp_regression_and_overlap_include_text_and_time(self):
         messages = []
@@ -58,7 +61,7 @@ class TimelineTests(unittest.TestCase):
             build_sentence_units([Cue(1, 0, 40000, "One sentence.")])
 
     def test_final_srt_rejects_bad_timing_and_punctuation_before_writing(self):
-        for cues in [[Cue(1, 0, 1, "Isn't")], [Cue(1, 1, 1, "Hi")],
+        for cues in [[Cue(1, 1, 1, "Hi")],
                      [Cue(1, 0, 1000, ".")], [Cue(1, 1000, 2000, "Hi"), Cue(2, 0, 800, "No")]]:
             with tempfile.TemporaryDirectory() as temp:
                 path = Path(temp) / "out.srt"
@@ -168,7 +171,7 @@ class SentenceWorkflowTests(unittest.TestCase):
         workflow = self.workflow()
         workflow.client.chat = Mock()
         with self.assertRaises(TimelineError):
-            workflow.repair(self.source(), [Cue(1, 0, 1, "You")], {})
+            workflow.repair(self.source(), [Cue(1, 0, 0, "You")], {})
         workflow.client.chat.assert_not_called()
 
     def test_malformed_model_json_is_bounded_and_cancellation_is_immediate(self):
