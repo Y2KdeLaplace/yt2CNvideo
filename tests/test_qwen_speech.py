@@ -130,6 +130,12 @@ class QwenSpeechTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_duration"):
             _segments_to_cues([{"text": "Isn't", "start": 3, "end": 2}], "")
 
+    def test_asr_zero_duration_spoken_segment_is_rejected(self) -> None:
+        segment = {"text": "Yet", "start": 10.32, "end": 10.32}
+        with self.assertRaisesRegex(ValueError, "invalid_duration"):
+            _segments_to_cues([segment], "")
+        self.assertEqual(segment, {"text": "Yet", "start": 10.32, "end": 10.32})
+
     def test_old_gguf_conversion_is_rejected_before_crispasr_crashes(self) -> None:
         installed = InstalledModel(
             "asr",

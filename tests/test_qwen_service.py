@@ -15,13 +15,69 @@ from videodub.qwen_service import (
 
 
 class QwenServiceTests(unittest.TestCase):
-    def test_zero_duration_word_reports_absolute_time_without_repairing_it(self):
+    def test_zero_duration_word_inside_sentence_builds_segment_without_repair(self):
+        words = [
+            SimpleNamespace(text="I'm", start_time=10.0, end_time=10.08),
+            SimpleNamespace(text="not", start_time=10.08, end_time=10.18),
+            SimpleNamespace(text="ready", start_time=10.18, end_time=10.3),
+            SimpleNamespace(text="yet", start_time=10.32, end_time=10.32),
+        ]
+        original_timestamps = [
+            (word.start_time, word.end_time) for word in words
+        ]
+
+        segments = _alignment_to_segments(
+            SimpleNamespace(items=words),
+            "I'm not ready yet.",
+            0.0,
+        )
+
+        self.assertEqual(
+            segments,
+            [{"text": "I'm not ready yet.", "start": 10.0, "end": 10.32}],
+        )
+        self.assertEqual(
+            [(word.start_time, word.end_time) for word in words],
+            original_timestamps,
+        )
+
+    def test_reversed_word_reports_absolute_time_without_repairing_it(self):
         from videodub.sentences import TimelineError
-        word = SimpleNamespace(text="You", start_time=1.232, end_time=1.232)
-        with self.assertRaisesRegex(TimelineError, "zero_duration_word") as error:
+        word = SimpleNamespace(text="You", start_time=1.3, end_time=1.2)
+        with self.assertRaisesRegex(
+            TimelineError,
+            "invalid_or_non_monotonic_timeline",
+        ) as error:
             _alignment_to_segments(SimpleNamespace(items=[word]), "You", 240.0)
-        self.assertIn("start=241.232s end=241.232s", str(error.exception))
-        self.assertEqual(word.end_time, 1.232)
+        self.assertIn("start=241.300s end=241.200s", str(error.exception))
+        self.assertEqual((word.start_time, word.end_time), (1.3, 1.2))
+
+    def test_non_monotonic_and_abnormal_overlap_remain_invalid(self):
+        from videodub.sentences import TimelineError
+
+        cases = [
+            [("one", 0.14, 0.15), ("two", 0.13, 0.3)],
+            [("one", 0.0, 0.5), ("two", 0.35, 0.8)],
+        ]
+        for words in cases:
+            with self.subTest(words=words), self.assertRaisesRegex(
+                TimelineError,
+                "invalid_or_non_monotonic_timeline",
+            ):
+                _alignment_to_segments(
+                    SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                text=text,
+                                start_time=start,
+                                end_time=end,
+                            )
+                            for text, start, end in words
+                        ]
+                    ),
+                    "one two",
+                    0.0,
+                )
 
     def test_mlx_tts_limit_is_reported_for_caller_owned_retry(self) -> None:
         model = SimpleNamespace(

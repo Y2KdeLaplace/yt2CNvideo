@@ -128,11 +128,9 @@ def _alignment_to_segments(
         start = float(getattr(item, "start_time", 0.0))
         end = float(getattr(item, "end_time", 0.0))
         if (not math.isfinite(start) or not math.isfinite(end) or start < 0
-                or end <= start or start < previous_start or end < previous_end
+                or end < start or start < previous_start or end < previous_end
                 or previous_end - start > 0.1):
             reason = "invalid_or_non_monotonic_timeline"
-            if end == start:
-                reason = "zero_duration_word（词语时长为 0）"
             raise TimelineError(
                 f"ASR 声学对齐无效：word {index + 1} "
                 f"text={getattr(item, 'text', '')!r} "

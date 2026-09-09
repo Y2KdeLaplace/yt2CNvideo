@@ -34,6 +34,12 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(any("cue 88" in m and "244164" in m and "it?" in m for m in messages))
         self.assertTrue(any("abnormal_overlap" in m for m in messages))
 
+    def test_zero_duration_spoken_cue_cannot_become_sentence_unit(self):
+        cue = Cue(1, 10_320, 10_320, "Yet")
+        with self.assertRaisesRegex(TimelineError, "invalid_duration"):
+            build_sentence_units([cue])
+        self.assertEqual(cue, Cue(1, 10_320, 10_320, "Yet"))
+
     def test_punctuation_and_sound_are_never_spoken(self):
         for text in [".", "。", "”", "……", '.”', "[fly buzzing]", "[wrapper crinkles]", "[stammers]", "[grunts]"]:
             self.assertEqual(spoken_text(text), "")
