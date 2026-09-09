@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 from dataclasses import asdict, dataclass
@@ -11,7 +12,7 @@ from typing import Callable
 from .subtitles import Cue, SENTENCE_END_RE
 
 MAX_SENTENCE_GAP_MS = 1000
-MAX_SENTENCE_WINDOW_MS = 12000
+TARGET_SENTENCE_WINDOW_MS = 12000
 MAX_OVERLAP_MS = 100
 SOUND_RE = re.compile(r"\[[^\]]*\]|【[^】]*】")
 
@@ -54,16 +55,21 @@ def validate_timeline(cues: list[Cue], logger: Callable[[str], None] | None = No
     previous: Cue | None = None
     for cue in cues:
         issues: list[str] = []
-        if cue.start_ms < 0 or cue.end_ms <= cue.start_ms:
+        finite = math.isfinite(cue.start_ms) and math.isfinite(cue.end_ms)
+        if not finite:
+            issues.append("non_finite_timestamp")
+        elif cue.start_ms < 0 or cue.end_ms <= cue.start_ms:
             issues.append("invalid_duration")
-        if previous is not None:
+        previous_finite = previous is not None and (
+            math.isfinite(previous.start_ms) and math.isfinite(previous.end_ms)
+        )
+        if finite and previous_finite:
+            assert previous is not None
             if cue.start_ms < previous.start_ms or cue.end_ms < previous.end_ms:
                 issues.append("non_monotonic_timeline")
             if previous.end_ms - cue.start_ms > MAX_OVERLAP_MS:
                 issues.append("abnormal_overlap")
         kind = text_kind(cue.text)
-        if cue.end_ms - cue.start_ms > MAX_SENTENCE_WINDOW_MS and kind == "spoken":
-            issues.append("sentence_window_too_long")
         if kind == "punctuation":
             message = f'timeline QC cue {cue.index} text={cue.text!r} start={cue.start_ms} end={cue.end_ms}: punctuation_or_empty'
             if logger:
@@ -126,12 +132,11 @@ def build_sentence_units(cues: list[Cue], logger: Callable[[str], None] | None =
                 if logger:
                     logger(f'timeline QC cue {cue.index} text={cue.text!r} start={cue.start_ms} end={cue.end_ms}: sentence_gap={gap}ms; 保留独立句界')
                 flush()
-            elif window > MAX_SENTENCE_WINDOW_MS:
-                # Only an actual pause or punctuation can end an overlong group.
-                if gap >= 250 or re.search(r"[,;:，；：]$", pending[-1].text):
-                    flush()
-                else:
-                    raise TimelineError(f'timeline QC cue {pending[0].index}–{cue.index} text={_join_text(pending + [cue])!r} start={pending[0].start_ms} end={cue.end_ms}: sentence_window_too_long; 缺少可靠句界')
+            elif window > TARGET_SENTENCE_WINDOW_MS and (
+                gap >= 250 or re.search(r"[,;:，；：]$", pending[-1].text)
+            ):
+                # The target is a segmentation preference, never timeline QC.
+                flush()
         pending.append(cue)
         if SENTENCE_END_RE.search(cue.text):
             flush()

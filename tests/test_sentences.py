@@ -11,7 +11,7 @@ from videodub.openai_compatible import ChatResult
 from videodub.runner import ProcessRunner
 from videodub.sentences import (
     SentenceUnit, TimelineError, build_sentence_units, display_cues, read_units,
-    write_units, spoken_text, validate_timeline,
+    write_units, spoken_text, validate_timeline, validate_units,
 )
 from videodub.subtitles import Cue, write_srt, read_srt
 from videodub.subtitle_workflow import SubtitleRepairWorkflow
@@ -28,6 +28,37 @@ class TimelineTests(unittest.TestCase):
             [(unit.start_ms, unit.end_ms, unit.text) for unit in units],
             [(1280, 1360, "You")],
         )
+
+    def test_long_spoken_cues_are_valid_timeline_and_sentence_units(self):
+        natural_sentence = Cue(
+            1,
+            33_600,
+            45_920,
+            "These Americans proved to be no obstacle at all.",
+        )
+        thirty_seconds = Cue(2, 46_000, 76_000, "A longer spoken passage.")
+
+        validate_timeline([natural_sentence, thirty_seconds])
+        validate_units([
+            SentenceUnit(1, 1, 33_600, 45_920, natural_sentence.text, 1),
+            SentenceUnit(2, 2, 46_000, 76_000, thirty_seconds.text, 2),
+        ])
+
+    def test_zero_and_reversed_durations_remain_invalid(self):
+        for cue in [Cue(1, 1000, 1000, "Zero"), Cue(1, 1001, 1000, "Reversed")]:
+            with self.subTest(cue=cue), self.assertRaisesRegex(
+                TimelineError,
+                "invalid_duration",
+            ):
+                validate_timeline([cue])
+
+    def test_non_finite_timestamps_remain_invalid(self):
+        for cue in [Cue(1, float("nan"), 1000, "NaN"), Cue(1, 0, float("inf"), "Inf")]:
+            with self.subTest(cue=cue), self.assertRaisesRegex(
+                TimelineError,
+                "non_finite_timestamp",
+            ):
+                validate_timeline([cue])
 
     def test_timestamp_regression_and_overlap_include_text_and_time(self):
         messages = []
@@ -54,11 +85,33 @@ class TimelineTests(unittest.TestCase):
         units = build_sentence_units([Cue(1, 0, 500, "Hello"), Cue(2, 7500, 8200, "there.")])
         self.assertEqual([(u.start_ms, u.end_ms) for u in units], [(0, 500), (7500, 8200)])
 
-    def test_window_limit_needs_real_boundary(self):
-        with self.assertRaisesRegex(TimelineError, "sentence_window_too_long"):
-            build_sentence_units([Cue(1, 0, 8000, "A long"), Cue(2, 8000, 16000, "sentence.")])
-        with self.assertRaisesRegex(TimelineError, "sentence_window_too_long"):
-            build_sentence_units([Cue(1, 0, 40000, "One sentence.")])
+    def test_soft_window_target_keeps_long_unit_without_natural_boundary(self):
+        cues = [Cue(1, 0, 8000, "A long"), Cue(2, 8000, 16000, "sentence.")]
+
+        units = build_sentence_units(cues)
+
+        self.assertEqual(
+            [(unit.first_cue, unit.last_cue, unit.start_ms, unit.end_ms, unit.text)
+             for unit in units],
+            [(1, 2, 0, 16000, "A long sentence.")],
+        )
+        self.assertEqual(build_sentence_units([Cue(1, 0, 40000, "One sentence.")])[0].end_ms, 40000)
+
+    def test_soft_window_target_splits_only_at_natural_cue_boundary(self):
+        cues = [
+            Cue(1, 0, 8000, "A long,"),
+            Cue(2, 8000, 13000, "but natural continuation."),
+        ]
+
+        units = build_sentence_units(cues)
+
+        self.assertEqual(
+            [(unit.first_cue, unit.last_cue, unit.start_ms, unit.end_ms)
+             for unit in units],
+            [(1, 1, 0, 8000), (2, 2, 8000, 13000)],
+        )
+        self.assertEqual(cues[0], Cue(1, 0, 8000, "A long,"))
+        self.assertEqual(cues[1], Cue(2, 8000, 13000, "but natural continuation."))
 
     def test_final_srt_rejects_bad_timing_and_punctuation_before_writing(self):
         for cues in [[Cue(1, 1, 1, "Hi")],
