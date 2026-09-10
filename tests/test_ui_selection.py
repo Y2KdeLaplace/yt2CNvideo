@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 import queue
 import tempfile
@@ -11,9 +12,163 @@ from unittest.mock import Mock, patch
 from videodub.ui import VideoDubApp
 from videodub.config import AppConfig
 from videodub.media import VideoJob
+from videodub.runner import CancelledError, ProcessRunner
 
 
 class VideoSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _lock_app():
+        app = SimpleNamespace(mlx_inference_lock=threading.Lock())
+        app._acquire_mlx_inference = lambda runner: (
+            VideoDubApp._acquire_mlx_inference(app, runner)
+        )
+        return app
+
+    def test_parallel_mlx_stages_share_one_inference_slot(self) -> None:
+        app = self._lock_app()
+        first_inside = threading.Event()
+        release_first = threading.Event()
+        second_inside = threading.Event()
+        active = 0
+        peak_active = 0
+        state_lock = threading.Lock()
+
+        def stage(is_first: bool) -> None:
+            nonlocal active, peak_active
+            with VideoDubApp._mlx_inference_slot(
+                app,
+                ProcessRunner(),
+                enabled=True,
+            ):
+                with state_lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                (first_inside if is_first else second_inside).set()
+                if is_first:
+                    release_first.wait(1)
+                with state_lock:
+                    active -= 1
+
+        first = threading.Thread(target=stage, args=(True,))
+        second = threading.Thread(target=stage, args=(False,))
+        first.start()
+        self.assertTrue(first_inside.wait(1))
+        second.start()
+        self.assertFalse(second_inside.wait(0.1))
+        release_first.set()
+        first.join(1)
+        second.join(1)
+
+        self.assertTrue(second_inside.is_set())
+        self.assertEqual(peak_active, 1)
+
+    def test_waiting_for_mlx_slot_can_be_cancelled(self) -> None:
+        app = self._lock_app()
+        app.mlx_inference_lock.acquire()
+        waiting = threading.Event()
+        runner = ProcessRunner(
+            lambda message: waiting.set() if "等待" in message else None
+        )
+        errors: list[Exception] = []
+
+        def acquire() -> None:
+            try:
+                VideoDubApp._acquire_mlx_inference(app, runner)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=acquire)
+        worker.start()
+        self.assertTrue(waiting.wait(1))
+        runner.cancel()
+        worker.join(1)
+        app.mlx_inference_lock.release()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], CancelledError)
+
+    def test_non_mlx_stage_does_not_wait_for_mlx_slot(self) -> None:
+        app = self._lock_app()
+        app.mlx_inference_lock.acquire()
+        entered = False
+
+        with VideoDubApp._mlx_inference_slot(
+            app,
+            ProcessRunner(),
+            enabled=False,
+        ):
+            entered = True
+
+        app.mlx_inference_lock.release()
+        self.assertTrue(entered)
+
+    def test_gui_heartbeat_normal_does_not_log(self) -> None:
+        app = SimpleNamespace(
+            _last_gui_heartbeat=10.0,
+            _gui_stall_started_at=None,
+            _gui_stall_detected=False,
+            _emit_watchdog_event=Mock(),
+        )
+
+        VideoDubApp._check_gui_heartbeat(app, now=12.9)
+
+        app._emit_watchdog_event.assert_not_called()
+
+    def test_gui_stall_logs_once_and_then_logs_recovery(self) -> None:
+        app = SimpleNamespace(
+            _last_gui_heartbeat=10.0,
+            _gui_stall_started_at=None,
+            _gui_stall_detected=False,
+            _emit_watchdog_event=Mock(),
+        )
+
+        VideoDubApp._check_gui_heartbeat(app, now=13.4)
+        VideoDubApp._check_gui_heartbeat(app, now=15.0)
+        self.assertEqual(app._emit_watchdog_event.call_count, 1)
+        self.assertIn("stalled for 3.4 s", app._emit_watchdog_event.call_args.args[0])
+
+        app._last_gui_heartbeat = 15.1
+        VideoDubApp._check_gui_heartbeat(app, now=15.2)
+
+        self.assertEqual(app._emit_watchdog_event.call_count, 2)
+        self.assertIn("recovered after 5.2 s", app._emit_watchdog_event.call_args.args[0])
+
+    def test_watchdog_thread_body_does_not_call_tk(self) -> None:
+        source = inspect.getsource(VideoDubApp._watch_gui_heartbeat)
+        self.assertNotIn("self.after", source)
+        self.assertNotIn("self.update", source)
+        self.assertNotIn("self.destroy", source)
+
+    def test_on_close_stops_watchdog_before_destroy(self) -> None:
+        calls: list[str] = []
+        app = SimpleNamespace(
+            model_download_runner=None,
+            download_worker=None,
+            process_worker=None,
+            _persist_config=Mock(),
+            _stop_gui_watchdog=Mock(side_effect=lambda: calls.append("watchdog")),
+            destroy=Mock(side_effect=lambda: calls.append("destroy")),
+        )
+
+        VideoDubApp._on_close(app)
+
+        self.assertEqual(calls, ["watchdog", "destroy"])
+
+    def test_stop_watchdog_sets_event_and_joins_thread(self) -> None:
+        stop = threading.Event()
+        thread = Mock()
+        app = SimpleNamespace(
+            _watchdog_stop=stop,
+            _watchdog_thread=thread,
+            _gui_stall_detected=True,
+        )
+
+        VideoDubApp._stop_gui_watchdog(app)
+
+        self.assertTrue(stop.is_set())
+        thread.join.assert_called_once_with(timeout=2)
+
     def test_parallel_failure_does_not_cancel_other_jobs(self) -> None:
         events = queue.Queue()
         completed: list[str] = []

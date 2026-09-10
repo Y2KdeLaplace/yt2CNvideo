@@ -53,6 +53,7 @@ class DownloaderTests(unittest.TestCase):
         )
         self.assertIn("--no-playlist", command)
         self.assertNotIn("--yes-playlist", command)
+        self.assertEqual(command[command.index("-t") + 1], "mp4")
         self.assertEqual(command[-1], "https://youtu.be/x")
 
     def test_playlist_command_has_index_template(self) -> None:

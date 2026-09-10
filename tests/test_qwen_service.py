@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from videodub.qwen_service import (
     _alignment_to_segments,
     _generate_tts_batch,
     _generate_tts_one,
+    _log_mlx_peak_memory,
+    _reset_mlx_peak_memory,
     _timestamp_segments,
     _transcribe_mlx,
     _validate_chunk_alignment_bounds,
@@ -26,6 +28,55 @@ class SizedAudio:
 
 
 class QwenServiceTests(unittest.TestCase):
+    def test_missing_mlx_memory_diagnostics_do_not_break_tts(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx",
+            variant="base",
+            reference_audio="voice.wav",
+            reference_text="reference",
+            speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(
+                return_value=iter(
+                    [SimpleNamespace(audio="audio", sample_rate=24000)]
+                )
+            )
+        )
+
+        with (
+            patch("videodub.qwen_service._reset_mlx_peak_memory", return_value=None),
+            patch("builtins.print") as output,
+        ):
+            result = _generate_tts_one(model, args, "你好", "Chinese")
+
+        self.assertEqual(result, ("audio", 24000))
+        output.assert_not_called()
+
+    def test_result_peak_memory_is_logged_in_gigabytes(self) -> None:
+        result = SimpleNamespace(peak_memory_usage=6.42)
+
+        with patch("builtins.print") as output:
+            _log_mlx_peak_memory("request=23", [result], None)
+
+        output.assert_called_once_with(
+            "[TTS] MLX memory: request=23 peak=6.42 GB",
+            flush=True,
+        )
+
+    def test_mlx_memory_api_detection_is_best_effort(self) -> None:
+        with patch.dict("sys.modules", {"mlx": None, "mlx.core": None}):
+            self.assertIsNone(_reset_mlx_peak_memory())
+
+    def test_peak_reset_failure_still_allows_peak_reading(self) -> None:
+        mlx = ModuleType("mlx")
+        core = ModuleType("mlx.core")
+        core.reset_peak_memory = Mock(side_effect=RuntimeError("unsupported"))
+        mlx.core = core
+
+        with patch.dict("sys.modules", {"mlx": mlx, "mlx.core": core}):
+            self.assertIs(_reset_mlx_peak_memory(), core)
+
     def test_zero_duration_word_inside_sentence_builds_segment_without_repair(self):
         words = [
             SimpleNamespace(text="I'm", start_time=10.0, end_time=10.08),
@@ -192,8 +243,10 @@ class QwenServiceTests(unittest.TestCase):
         model.batch_generate = Mock(
             return_value=iter(
                 [
-                    SimpleNamespace(sequence_idx=1, audio="second", sample_rate=24000),
-                    SimpleNamespace(sequence_idx=0, audio="first", sample_rate=24000),
+                    SimpleNamespace(sequence_idx=1, audio="second", sample_rate=24000,
+                                    peak_memory_usage=7.18),
+                    SimpleNamespace(sequence_idx=0, audio="first", sample_rate=24000,
+                                    peak_memory_usage=7.18),
                 ]
             )
         )
@@ -205,7 +258,8 @@ class QwenServiceTests(unittest.TestCase):
             speaker="Vivian",
         )
 
-        outputs = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
+        with patch("builtins.print") as output:
+            outputs = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
 
         self.assertEqual(outputs, [("first", 24000), ("second", 24000)])
         model.batch_generate.assert_called_once_with(
@@ -216,6 +270,22 @@ class QwenServiceTests(unittest.TestCase):
             max_tokens=4096,
             ref_audio="voice.wav",
             ref_text="reference",
+        )
+        output.assert_called_once_with(
+            "[TTS] MLX memory: batch=1-2 size=2 peak=7.18 GB",
+            flush=True,
+        )
+
+    def test_mlx_get_peak_memory_is_used_when_result_has_no_peak(self) -> None:
+        mx = SimpleNamespace(get_peak_memory=Mock(return_value=7.18e9))
+
+        with patch("builtins.print") as output:
+            _log_mlx_peak_memory("request=4", [SimpleNamespace()], mx)
+
+        mx.get_peak_memory.assert_called_once_with()
+        output.assert_called_once_with(
+            "[TTS] MLX memory: request=4 peak=7.18 GB",
+            flush=True,
         )
 
     def test_empty_native_batch_does_not_add_hidden_generation_retries(self):

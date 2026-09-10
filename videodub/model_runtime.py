@@ -5,12 +5,64 @@ import signal
 import subprocess
 import threading
 import time
+import wave
+from datetime import datetime
 from pathlib import Path
 
 from .config import AppConfig
 from .model_manager import read_installed_model, uv_runtime_prefix
 from .qwen_speech import check_qwen_service, resolve_tts_reference
 from .runner import ProcessRunner
+
+
+RUNTIME_DIAGNOSTICS_FILENAME = "runtime-diagnostics.log"
+RSS_SAMPLE_INTERVAL_SECONDS = 2.0
+RSS_REPORT_GROWTH_KIB = 256 * 1024
+_DIAGNOSTICS_LOCK = threading.Lock()
+
+
+def append_runtime_diagnostic(cache_dir: str | Path, message: str) -> None:
+    try:
+        path = Path(cache_dir).expanduser() / RUNTIME_DIAGNOSTICS_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with _DIAGNOSTICS_LOCK, path.open("a", encoding="utf-8") as output:
+            output.write(f"{timestamp} {message}\n")
+    except Exception:
+        pass
+
+
+def _reference_audio_summary(path: str | Path, text: str) -> str | None:
+    try:
+        reference = Path(path)
+        with wave.open(str(reference), "rb") as source:
+            duration = source.getnframes() / source.getframerate()
+        size_mb = reference.stat().st_size / 1_000_000
+        return (
+            f"TTS reference: {reference.name} duration={duration:.1f}s "
+            f"size={size_mb:.1f}MB text_chars={len(text)}"
+        )
+    except (OSError, ValueError, ZeroDivisionError, wave.Error):
+        return None
+
+
+def _read_process_rss_kib(pid: int) -> int | None:
+    if os.name == "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        return int(value) if value else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -61,6 +113,12 @@ class ManagedModelService:
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.process: subprocess.Popen[str] | None = None
         self._stop_lock = threading.Lock()
+        self.current_rss_kib = 0
+        self.peak_rss_kib = 0
+        self._last_reported_peak_kib = 0
+        self._rss_lock = threading.Lock()
+        self._rss_stop = threading.Event()
+        self._rss_thread: threading.Thread | None = None
 
     def __enter__(self) -> "ManagedModelService":
         selected_path = (
@@ -106,6 +164,9 @@ class ManagedModelService:
             reference_text = self.config.tts_reference_text
             if installed.variant == "base":
                 reference_audio, reference_text = resolve_tts_reference(self.config)
+            if summary := _reference_audio_summary(reference_audio, reference_text):
+                self.runner.logger(summary)
+                append_runtime_diagnostic(self.config.cache_dir, summary)
             command.extend(
                 [
                     "--variant",
@@ -136,6 +197,19 @@ class ManagedModelService:
         )
         self.runner.add_cancel_callback(self._terminate)
         threading.Thread(target=self._relay_output, daemon=True).start()
+        if self.kind == "tts":
+            self.runner.logger(f"TTS model subprocess: pid={self.process.pid}")
+            append_runtime_diagnostic(
+                self.config.cache_dir,
+                f"TTS model subprocess: pid={self.process.pid} service=tts",
+            )
+            self._rss_stop.clear()
+            self._rss_thread = threading.Thread(
+                target=self._sample_rss,
+                name="tts-rss-sampler",
+                daemon=True,
+            )
+            self._rss_thread.start()
         try:
             for _ in range(180):
                 self.runner.check_cancelled()
@@ -157,7 +231,61 @@ class ManagedModelService:
         for line in self.process.stdout:
             line = line.rstrip()
             if line:
-                self.runner.logger(f"[{self.kind.upper()}] {line}")
+                prefix = f"[{self.kind.upper()}]"
+                message = line if line.startswith(prefix) else f"{prefix} {line}"
+                self.runner.logger(message)
+                if self.kind == "tts" and line.startswith("[TTS] MLX memory:"):
+                    append_runtime_diagnostic(self.config.cache_dir, line)
+
+    def _record_rss_sample(self, process: subprocess.Popen[str]) -> None:
+        rss_kib = _read_process_rss_kib(process.pid)
+        if rss_kib is None:
+            return
+        with self._rss_lock:
+            self.current_rss_kib = rss_kib
+            self.peak_rss_kib = max(self.peak_rss_kib, rss_kib)
+            peak_rss_kib = self.peak_rss_kib
+            should_report = (
+                self._last_reported_peak_kib == 0
+                or peak_rss_kib - self._last_reported_peak_kib
+                >= RSS_REPORT_GROWTH_KIB
+            )
+            if should_report:
+                self._last_reported_peak_kib = peak_rss_kib
+        if should_report:
+            append_runtime_diagnostic(
+                self.config.cache_dir,
+                f"TTS subprocess RSS: pid={process.pid} "
+                f"current={rss_kib / 1024 / 1024:.2f} GB "
+                f"peak={peak_rss_kib / 1024 / 1024:.2f} GB",
+            )
+
+    def _sample_rss(self) -> None:
+        try:
+            while not self._rss_stop.is_set():
+                process = self.process
+                if process is None or process.poll() is not None:
+                    return
+                self._record_rss_sample(process)
+                if self._rss_stop.wait(RSS_SAMPLE_INTERVAL_SECONDS):
+                    return
+        except Exception:
+            return
+
+    def _stop_rss_sampler(self, process: subprocess.Popen[str] | None) -> None:
+        if process is not None and process.poll() is None:
+            self._record_rss_sample(process)
+        self._rss_stop.set()
+        thread = self._rss_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        self._rss_thread = None
+        with self._rss_lock:
+            peak_rss_kib = self.peak_rss_kib
+        if peak_rss_kib:
+            message = f"TTS subprocess RSS peak: {peak_rss_kib / 1024 / 1024:.2f} GB"
+            self.runner.logger(message)
+            append_runtime_diagnostic(self.config.cache_dir, message)
 
     def __exit__(self, *_args: object) -> None:
         self._terminate()
@@ -166,7 +294,12 @@ class ManagedModelService:
         self.runner.remove_cancel_callback(self._terminate)
         with self._stop_lock:
             process = self.process
-            if process is None or process.poll() is not None:
+            if process is None:
+                return
+            if self.kind == "tts":
+                self._stop_rss_sampler(process)
+            if process.poll() is not None:
+                self.process = None
                 return
             self.runner.logger(f"正在停止 {self.kind.upper()} 模型…")
             try:

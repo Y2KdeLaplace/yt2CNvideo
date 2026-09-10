@@ -31,6 +31,7 @@ from videodub.tts import (
     _scheduled_sentence_start,
     _synthesize_sentence,
     _synthesize_sentence_units,
+    _tts_batch_size,
     dub_video,
 )
 
@@ -100,6 +101,10 @@ def sentence_audio(
 
 
 class SentenceUnitTests(unittest.TestCase):
+    def test_tts_batch_size_is_backend_aware(self) -> None:
+        self.assertEqual(_tts_batch_size(AppConfig(tts_backend="mlx")), 1)
+        self.assertEqual(_tts_batch_size(AppConfig(tts_backend="hf")), 2)
+
     def test_natural_sentence_units_keep_cue_and_timeline_boundaries(self) -> None:
         units = build_sentence_units(
             [
@@ -122,7 +127,10 @@ class SentenceUnitTests(unittest.TestCase):
             root = Path(temp)
             unit = SentenceUnit(1, 3, 0, 3000, "第一段。第二段。第三段。")
 
-            def synthesize(_config, _text, output, _runner, **_kwargs):
+            requests: list[str] = []
+
+            def synthesize(_config, text, output, _runner, **_kwargs):
+                requests.append(text)
                 write_tone(output, 100)
 
             def synthesize_batch(_config, texts, outputs, _runner, **_kwargs):
@@ -151,8 +159,9 @@ class SentenceUnitTests(unittest.TestCase):
             self.assertEqual(result.path.name, "sentence-00000.raw.wav")
             self.assertTrue(result.path.is_file())
             self.assertGreater(result.duration_ms, 100)
+            self.assertEqual(requests, ["第一段。", "第二段。", "第三段。"])
 
-    def test_sentence_units_keep_independent_outputs_in_bounded_tts_batches(self) -> None:
+    def test_mlx_sentence_units_are_generated_sequentially(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             units = [
@@ -165,9 +174,11 @@ class SentenceUnitTests(unittest.TestCase):
                 )
                 for index, text in enumerate(("第一句。", "第二句。", "第三句。"))
             ]
+            single_calls: list[str] = []
             batch_calls: list[list[str]] = []
 
-            def synthesize(_config, _text, output, _runner, **_kwargs):
+            def synthesize(_config, text, output, _runner, **_kwargs):
+                single_calls.append(text)
                 write_tone(output, 100)
 
             def synthesize_batch(_config, texts, outputs, _runner, **_kwargs):
@@ -190,7 +201,8 @@ class SentenceUnitTests(unittest.TestCase):
                     "http://tts",
                 )
 
-        self.assertEqual(batch_calls, [["第一句。", "第二句。"]])
+        self.assertEqual(single_calls, ["第一句。", "第二句。", "第三句。"])
+        self.assertEqual(batch_calls, [])
         self.assertEqual(
             [item.path.name for item in results],
             [
@@ -200,6 +212,37 @@ class SentenceUnitTests(unittest.TestCase):
             ],
         )
         self.assertEqual([item.unit for item in results], units)
+
+    def test_non_mlx_sentence_units_keep_default_batch_size_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            units = [
+                SentenceUnit(i + 1, i + 1, i * 1000, i * 1000 + 800, text)
+                for i, text in enumerate(("一。", "二。", "三。"))
+            ]
+            batch_calls: list[list[str]] = []
+
+            def synthesize(_config, _text, output, _runner, **_kwargs):
+                write_tone(output, 100)
+
+            def synthesize_batch(_config, texts, outputs, _runner, **_kwargs):
+                batch_calls.append(texts)
+                for output in outputs:
+                    write_tone(output, 100)
+
+            with (
+                patch("videodub.tts.synthesize_qwen", side_effect=synthesize),
+                patch("videodub.tts.synthesize_qwen_batch", side_effect=synthesize_batch),
+            ):
+                _synthesize_sentence_units(
+                    AppConfig(tts_backend="hf", cache_dir=str(root / "cache")),
+                    AudioRunner(),
+                    units,
+                    root,
+                    "http://tts",
+                )
+
+        self.assertEqual(batch_calls, [["一。", "二。"]])
 
 
 class DurationFittingTests(unittest.TestCase):
@@ -441,7 +484,7 @@ class SentenceCacheTests(unittest.TestCase):
     def test_partial_batch_success_cached_even_when_peer_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = AppConfig(tts_backend="mlx", cache_dir=str(root / "cache"))
+            config = AppConfig(tts_backend="hf", cache_dir=str(root / "cache"))
             units = [SentenceUnit(1, 1, 0, 900, "第一句。", 1), SentenceUnit(2, 2, 1000, 1900, "第二句。", 2)]
             def batch(config, texts, outputs, runner, **kwargs):
                 write_tone(outputs[0], 150)

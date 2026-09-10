@@ -44,7 +44,8 @@ GLOBAL_DURATION_RATIO_MIN = 0.80
 GLOBAL_DURATION_RATIO_MAX = 1.20
 LOCAL_DURATION_RATIO_MIN = 0.90
 LOCAL_DURATION_RATIO_MAX = 1.00
-TTS_BATCH_SIZE = 2
+DEFAULT_TTS_BATCH_SIZE = 2
+MLX_TTS_BATCH_SIZE = 1
 TTS_CHUNK_MAX_CHARS = 600
 TTS_CHUNK_SILENCE_MS = 120
 TTS_SYNTHESIS_ATTEMPTS = 2
@@ -62,6 +63,14 @@ class SentenceAudio:
     raw_duration_ms: int
     global_duration_ratio: float = 1.0
     local_duration_ratio: float = 1.0
+
+
+def _tts_batch_size(config: AppConfig) -> int:
+    return (
+        MLX_TTS_BATCH_SIZE
+        if config.tts_backend == "mlx"
+        else DEFAULT_TTS_BATCH_SIZE
+    )
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -208,8 +217,9 @@ def _synthesize_sentence(
             work_dir / f"sentence-{index:05d}-part-{part:03d}.raw.wav"
             for part in range(len(chunks))
         ]
-        for first in range(0, len(chunks), TTS_BATCH_SIZE):
-            last = min(first + TTS_BATCH_SIZE, len(chunks))
+        batch_size = _tts_batch_size(config)
+        for first in range(0, len(chunks), batch_size):
+            last = min(first + batch_size, len(chunks))
             _run_tts_request(
                 config,
                 runner,
@@ -284,12 +294,13 @@ def _synthesize_sentence_units(
         results[i] = SentenceAudio(unit, paths[i], duration, duration)
     runner.logger(f"自然句 TTS：{len(units)} 句，复用缓存 {len(results)} 句")
     missing = [i for i in range(len(units)) if i not in results]
+    batch_size = _tts_batch_size(config)
     cursor = 0
     while cursor < len(missing):
         i = missing[cursor]
         batch = [i]
         if config.tts_backend != "gguf" and len(_tts_text_chunks(units[i].text)) == 1:
-            for following in missing[cursor + 1:cursor + TTS_BATCH_SIZE]:
+            for following in missing[cursor + 1:cursor + batch_size]:
                 if len(_tts_text_chunks(units[following].text)) > 1:
                     break
                 batch.append(following)

@@ -479,16 +479,56 @@ def _audio_bytes(audio: Any, sample_rate: int) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def _reset_mlx_peak_memory() -> Any | None:
+    try:
+        import mlx.core as mx
+    except Exception:
+        return None
+    reset = getattr(mx, "reset_peak_memory", None)
+    if callable(reset):
+        try:
+            reset()
+        except Exception:
+            pass
+    return mx
+
+
+def _log_mlx_peak_memory(
+    label: str,
+    results: list[Any],
+    mx: Any | None,
+) -> None:
+    try:
+        reported = [
+            float(value)
+            for result in results
+            if (value := getattr(result, "peak_memory_usage", None)) is not None
+        ]
+        if reported:
+            peak_gb = max(reported)
+        else:
+            get_peak = getattr(mx, "get_peak_memory", None)
+            if not callable(get_peak):
+                return
+            peak_gb = float(get_peak()) / 1e9
+        print(f"[TTS] MLX memory: {label} peak={peak_gb:.2f} GB", flush=True)
+    except Exception:
+        pass
+
+
 def _generate_tts_one(
     model: Any,
     args: argparse.Namespace,
     text: str,
     language: str,
+    *,
+    request_number: int = 1,
 ) -> tuple[Any, int]:
     text = spoken_text(text)
     if not text:
         raise RuntimeError("TTS 输入为空、纯标点或纯声效")
     if args.backend == "mlx":
+        mx = _reset_mlx_peak_memory()
         tokenizer = getattr(model, "tokenizer", None)
         try:
             text_tokens = len(tokenizer.encode(text)) if tokenizer is not None else len(text)
@@ -505,6 +545,7 @@ def _generate_tts_one(
         result = next(iter(results), None) if hasattr(results, "__iter__") else results
         if result is None:
             raise RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}")
+        _log_mlx_peak_memory(f"request={request_number}", [result], mx)
         token_count = int(getattr(result, "token_count", 0) or 0)
         if token_count >= max_tokens:
             raise RuntimeError(f"MLX Qwen3-TTS 达到生成长度上限，拒绝返回退化音频：text={text!r}")
@@ -530,8 +571,11 @@ def _generate_tts_batch(
     args: argparse.Namespace,
     texts: list[str],
     language: str,
+    *,
+    request_start: int = 1,
 ) -> list[tuple[Any, int] | RuntimeError]:
     if args.backend == "mlx" and len(texts) > 1 and hasattr(model, "batch_generate"):
+        mx = _reset_mlx_peak_memory()
         kwargs: dict[str, Any] = {"lang_code": language, "temperature": 0.7,
                                   "top_p": 0.9, "max_tokens": 4096}
         if args.variant == "base":
@@ -549,6 +593,11 @@ def _generate_tts_batch(
         except (RuntimeError, ValueError) as exc:
             return [RuntimeError(f"MLX Qwen3-TTS batch text={text!r}: {exc}") for text in texts]
         else:
+            _log_mlx_peak_memory(
+                f"batch={request_start}-{request_start + len(texts) - 1} size={len(texts)}",
+                results,
+                mx,
+            )
             indexed = {}
             for result in results:
                 index = int(getattr(result, "sequence_idx", -1))
@@ -561,9 +610,17 @@ def _generate_tts_batch(
             return [indexed.get(i, RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}"))
                     for i, text in enumerate(texts)]
     outputs = []
-    for text in texts:
+    for index, text in enumerate(texts):
         try:
-            outputs.append(_generate_tts_one(model, args, text, language))
+            outputs.append(
+                _generate_tts_one(
+                    model,
+                    args,
+                    text,
+                    language,
+                    request_number=request_start + index,
+                )
+            )
         except (RuntimeError, ValueError) as exc:
             outputs.append(RuntimeError(str(exc)))
     return outputs
@@ -573,7 +630,7 @@ def create_tts_app(args: argparse.Namespace) -> Any:
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
 
-    state: dict[str, Any] = {"model": None}
+    state: dict[str, Any] = {"model": None, "request_count": 0}
 
     @asynccontextmanager
     async def lifespan(_app: Any):
@@ -615,11 +672,14 @@ def create_tts_app(args: argparse.Namespace) -> Any:
         texts = [spoken_text(text) for text in texts]
         if not texts or any(not text for text in texts):
             raise HTTPException(status_code=400, detail="TTS text is empty")
+        request_start = int(state["request_count"]) + 1
+        state["request_count"] = int(state["request_count"]) + len(texts)
         outputs = _generate_tts_batch(
             state["model"],
             args,
             texts,
             request.language,
+            request_start=request_start,
         )
         encoded: list[str | None] = []
         errors: list[str | None] = []

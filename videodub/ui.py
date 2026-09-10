@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -46,7 +47,7 @@ from videodub.model_manager import (
     read_installed_model,
     uninstall_model,
 )
-from videodub.model_runtime import ManagedModelService
+from videodub.model_runtime import ManagedModelService, append_runtime_diagnostic
 from videodub.platform_utils import open_in_file_manager
 from videodub.qwen_speech import (
     TTS_VOICE_PRESETS,
@@ -60,6 +61,9 @@ from videodub.tts import dub_video
 
 
 GITHUB_REPOSITORY = "Y2KdeLaplace/yt2CNvideo"
+GUI_HEARTBEAT_INTERVAL_MS = 500
+GUI_WATCHDOG_INTERVAL_SECONDS = 1.0
+GUI_STALL_THRESHOLD_SECONDS = 3.0
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -108,6 +112,16 @@ class VideoDubApp(tk.Tk):
         self.config_data.ensure_directories()
         reset_temporary_directory(self.config_data)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.mlx_inference_lock = threading.Lock()
+        self._last_gui_heartbeat = time.monotonic()
+        self._gui_stall_started_at: float | None = None
+        self._gui_stall_detected = False
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watch_gui_heartbeat,
+            name="tk-heartbeat-watchdog",
+            daemon=True,
+        )
         self.download_runner = ProcessRunner(
             lambda line: self.events.put(("log", line))
         )
@@ -151,7 +165,58 @@ class VideoDubApp(tk.Tk):
         self.deiconify()
         self.after(100, self._drain_events)
         self.after(180, self._check_tools)
+        self.after(GUI_HEARTBEAT_INTERVAL_MS, self._gui_heartbeat)
+        self._watchdog_thread.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _gui_heartbeat(self) -> None:
+        if self._watchdog_stop.is_set():
+            return
+        self._last_gui_heartbeat = time.monotonic()
+        self.after(GUI_HEARTBEAT_INTERVAL_MS, self._gui_heartbeat)
+
+    def _emit_watchdog_event(self, message: str) -> None:
+        self.events.put(("log", message))
+        append_runtime_diagnostic(self.config_data.cache_dir, message)
+
+    def _check_gui_heartbeat(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        delay = now - self._last_gui_heartbeat
+        if delay > GUI_STALL_THRESHOLD_SECONDS:
+            if self._gui_stall_started_at is None:
+                self._gui_stall_started_at = self._last_gui_heartbeat
+                self._gui_stall_detected = True
+                self._emit_watchdog_event(
+                    f"GUI watchdog: Tk event loop stalled for {delay:.1f} s"
+                )
+            return
+        if self._gui_stall_started_at is not None:
+            stalled_for = now - self._gui_stall_started_at
+            self._gui_stall_started_at = None
+            self._emit_watchdog_event(
+                f"GUI watchdog: Tk event loop recovered after {stalled_for:.1f} s"
+            )
+
+    def _watch_gui_heartbeat(self) -> None:
+        try:
+            while not self._watchdog_stop.wait(GUI_WATCHDOG_INTERVAL_SECONDS):
+                self._check_gui_heartbeat()
+        except Exception as exc:
+            append_runtime_diagnostic(
+                self.config_data.cache_dir,
+                f"GUI watchdog stopped after internal error: {exc}",
+            )
+
+    def _stop_gui_watchdog(self) -> None:
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        if thread is not threading.current_thread():
+            thread.join(timeout=2)
+        if not self._gui_stall_detected:
+            append_runtime_diagnostic(
+                self.config_data.cache_dir,
+                "GUI watchdog: heartbeat normal; no stalls detected",
+            )
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -846,55 +911,92 @@ class VideoDubApp(tk.Tk):
             self.active_runners.append(runner)
         try:
             runner.reset()
-            with ExitStack() as stack:
-                asr_url = ""
-                if extract and job.has_video:
-                    asr_service = stack.enter_context(
-                        ManagedModelService(
+            asr_url = ""
+            if extract and job.has_video:
+                with self._mlx_inference_slot(
+                    runner,
+                    enabled=config.asr_backend == "mlx",
+                ):
+                    with ManagedModelService(
+                        config,
+                        runner,
+                        "asr",
+                        port=12000 + slot * 2,
+                    ) as asr_service:
+                        asr_url = asr_service.base_url
+                        extract_asr_subtitle(
                             config,
                             runner,
-                            "asr",
-                            port=12000 + slot * 2,
+                            job,
+                            language=config.asr_language,
+                            base_url=asr_url,
                         )
-                    )
-                    asr_url = asr_service.base_url
-                    extract_asr_subtitle(
+            elif extract:
+                runner.logger("未找到视频，已跳过语音提取。")
+            if repair or translate:
+                SubtitleRepairWorkflow(
+                    config,
+                    runner,
+                    api_key=self.session_api_key
+                    or api_key_from_runtime(config=config),
+                ).process_job(job, repair=repair, translate=translate)
+            if dubbing:
+                with self._mlx_inference_slot(
+                    runner,
+                    enabled=config.tts_backend == "mlx",
+                ):
+                    with ManagedModelService(
                         config,
                         runner,
-                        job,
-                        language=config.asr_language,
-                        base_url=asr_url,
-                    )
-                elif extract:
-                    runner.logger("未找到视频，已跳过语音提取。")
-                if repair or translate:
-                    SubtitleRepairWorkflow(
-                        config,
-                        runner,
-                        api_key=self.session_api_key
-                        or api_key_from_runtime(config=config),
-                    ).process_job(job, repair=repair, translate=translate)
-                if dubbing:
-                    tts_service = stack.enter_context(
-                        ManagedModelService(
+                        "tts",
+                        port=12001 + slot * 2,
+                    ) as tts_service:
+                        tts_url = tts_service.base_url
+                        output = dub_video(
                             config,
                             runner,
-                            "tts",
-                            port=12001 + slot * 2,
+                            job,
+                            qwen_base_url=tts_url,
                         )
-                    )
-                    tts_url = tts_service.base_url
-                    output = dub_video(
-                        config,
-                        runner,
-                        job,
-                        qwen_base_url=tts_url,
-                    )
-                    runner.logger(f"配音输出：{output}")
+                        runner.logger(f"配音输出：{output}")
         finally:
             with self.runners_lock:
                 if runner in self.active_runners:
                     self.active_runners.remove(runner)
+
+    def _acquire_mlx_inference(self, runner: ProcessRunner) -> None:
+        runner.check_cancelled()
+        if self.mlx_inference_lock.acquire(blocking=False):
+            try:
+                runner.check_cancelled()
+            except Exception:
+                self.mlx_inference_lock.release()
+                raise
+            runner.logger("已获得 MLX 推理资源")
+            return
+        runner.logger("等待本机 MLX 推理资源…")
+        while True:
+            runner.check_cancelled()
+            if not self.mlx_inference_lock.acquire(timeout=0.2):
+                continue
+            try:
+                runner.check_cancelled()
+            except Exception:
+                self.mlx_inference_lock.release()
+                raise
+            runner.logger("已获得 MLX 推理资源")
+            return
+
+    @contextmanager
+    def _mlx_inference_slot(self, runner: ProcessRunner, *, enabled: bool):
+        if not enabled:
+            yield
+            return
+        self._acquire_mlx_inference(runner)
+        try:
+            yield
+        finally:
+            self.mlx_inference_lock.release()
 
     def _stop_download(self) -> None:
         self.download_runner.cancel()
@@ -1873,6 +1975,7 @@ class VideoDubApp(tk.Tk):
         try:
             self._persist_config()
         finally:
+            self._stop_gui_watchdog()
             self.destroy()
 
 

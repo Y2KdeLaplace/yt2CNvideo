@@ -76,7 +76,7 @@ def build_download_command(
         "--no-write-playlist-metafiles",
         "-f",
         "bv*+ba/b",
-        "--merge-output-format",
+        "-t",
         "mp4",
         "-o",
         str(output),
