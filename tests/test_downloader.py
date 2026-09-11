@@ -53,7 +53,10 @@ class DownloaderTests(unittest.TestCase):
         )
         self.assertIn("--no-playlist", command)
         self.assertNotIn("--yes-playlist", command)
-        self.assertEqual(command[command.index("-t") + 1], "mp4")
+        self.assertNotIn("-t", command)
+        self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
+        self.assertEqual(command[command.index("--remux-video") + 1], "mp4")
+        self.assertEqual(command[command.index("-f") + 1], "bv*+ba/b")
         self.assertEqual(command[-1], "https://youtu.be/x")
 
     def test_playlist_command_has_index_template(self) -> None:
@@ -80,6 +83,22 @@ class DownloaderTests(unittest.TestCase):
         self.assertIn("--write-auto-subs", automatic)
         self.assertNotIn("--write-subs", automatic)
         self.assertIn("--skip-download", automatic)
+        self.assertNotIn("-f", automatic)
+        self.assertNotIn("--merge-output-format", automatic)
+        self.assertNotIn("--remux-video", automatic)
+
+    def test_subtitle_options_do_not_break_explicit_media_options(self) -> None:
+        command = build_download_command(
+            AppConfig(link_type="single", subtitle_languages="en,zh-Hans"),
+            "https://youtu.be/x",
+        )
+
+        self.assertLess(command.index("--write-subs"), command.index("-f"))
+        self.assertEqual(command[command.index("--sub-langs") + 1], "en,zh-Hans")
+        self.assertEqual(command[command.index("-f") + 1], "bv*+ba/b")
+        self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
+        self.assertEqual(command[command.index("--remux-video") + 1], "mp4")
+        self.assertIn("%(title).180B [%(id)s].%(ext)s", command[command.index("-o") + 1])
 
     def test_video_only_fallback_omits_all_subtitle_options(self) -> None:
         command = build_download_command(

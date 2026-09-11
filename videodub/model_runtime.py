@@ -18,6 +18,7 @@ from .runner import ProcessRunner
 RUNTIME_DIAGNOSTICS_FILENAME = "runtime-diagnostics.log"
 RSS_SAMPLE_INTERVAL_SECONDS = 2.0
 RSS_REPORT_GROWTH_KIB = 256 * 1024
+LONG_REFERENCE_WARNING_SECONDS = 20.0
 _DIAGNOSTICS_LOCK = threading.Lock()
 
 
@@ -42,6 +43,14 @@ def _reference_audio_summary(path: str | Path, text: str) -> str | None:
             f"TTS reference: {reference.name} duration={duration:.1f}s "
             f"size={size_mb:.1f}MB text_chars={len(text)}"
         )
+    except (OSError, ValueError, ZeroDivisionError, wave.Error):
+        return None
+
+
+def _reference_audio_duration_seconds(path: str | Path) -> float | None:
+    try:
+        with wave.open(str(Path(path)), "rb") as source:
+            return source.getnframes() / source.getframerate()
     except (OSError, ValueError, ZeroDivisionError, wave.Error):
         return None
 
@@ -112,6 +121,7 @@ class ManagedModelService:
         self.port = port or default_port
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.process: subprocess.Popen[str] | None = None
+        self.service_pid: int | None = None
         self._stop_lock = threading.Lock()
         self.current_rss_kib = 0
         self.peak_rss_kib = 0
@@ -167,6 +177,20 @@ class ManagedModelService:
             if summary := _reference_audio_summary(reference_audio, reference_text):
                 self.runner.logger(summary)
                 append_runtime_diagnostic(self.config.cache_dir, summary)
+            reference_duration = _reference_audio_duration_seconds(reference_audio)
+            if (
+                backend == "mlx"
+                and installed.variant == "base"
+                and reference_duration is not None
+                and reference_duration >= LONG_REFERENCE_WARNING_SECONDS
+            ):
+                warning = (
+                    "警告：当前参考音频较长，MLX Base voice cloning 每次生成都需要使用"
+                    "完整 reference context，可能增加统一内存占用和生成时间。"
+                    "如出现内存压力，可使用更短且文本精确匹配的参考音频。"
+                )
+                self.runner.logger(warning)
+                append_runtime_diagnostic(self.config.cache_dir, warning)
             command.extend(
                 [
                     "--variant",
@@ -203,13 +227,6 @@ class ManagedModelService:
                 self.config.cache_dir,
                 f"TTS model subprocess: pid={self.process.pid} service=tts",
             )
-            self._rss_stop.clear()
-            self._rss_thread = threading.Thread(
-                target=self._sample_rss,
-                name="tts-rss-sampler",
-                daemon=True,
-            )
-            self._rss_thread.start()
         try:
             for _ in range(180):
                 self.runner.check_cancelled()
@@ -217,6 +234,25 @@ class ManagedModelService:
                     raise RuntimeError(f"{self.kind.upper()} 模型启动失败")
                 info = check_qwen_service(self.base_url, self.kind, timeout=1)
                 if info.available:
+                    if self.kind == "tts":
+                        self.service_pid = info.pid
+                        if self.service_pid is not None and os.name != "nt":
+                            message = f"TTS service process: pid={self.service_pid}"
+                            self.runner.logger(message)
+                            append_runtime_diagnostic(self.config.cache_dir, message)
+                            self._rss_stop.clear()
+                            self._rss_thread = threading.Thread(
+                                target=self._sample_rss,
+                                name="tts-rss-sampler",
+                                daemon=True,
+                            )
+                            self._rss_thread.start()
+                        elif self.service_pid is None:
+                            message = (
+                                "TTS service RSS unavailable: /health did not report pid"
+                            )
+                            self.runner.logger(message)
+                            append_runtime_diagnostic(self.config.cache_dir, message)
                     self.runner.logger(f"{self.kind.upper()} 模型已就绪：{info.model}")
                     return self
                 time.sleep(1)
@@ -237,8 +273,8 @@ class ManagedModelService:
                 if self.kind == "tts" and line.startswith("[TTS] MLX memory:"):
                     append_runtime_diagnostic(self.config.cache_dir, line)
 
-    def _record_rss_sample(self, process: subprocess.Popen[str]) -> None:
-        rss_kib = _read_process_rss_kib(process.pid)
+    def _record_rss_sample(self, pid: int) -> None:
+        rss_kib = _read_process_rss_kib(pid)
         if rss_kib is None:
             return
         with self._rss_lock:
@@ -255,7 +291,7 @@ class ManagedModelService:
         if should_report:
             append_runtime_diagnostic(
                 self.config.cache_dir,
-                f"TTS subprocess RSS: pid={process.pid} "
+                f"TTS service RSS: pid={pid} "
                 f"current={rss_kib / 1024 / 1024:.2f} GB "
                 f"peak={peak_rss_kib / 1024 / 1024:.2f} GB",
             )
@@ -266,15 +302,18 @@ class ManagedModelService:
                 process = self.process
                 if process is None or process.poll() is not None:
                     return
-                self._record_rss_sample(process)
+                service_pid = self.service_pid
+                if service_pid is None:
+                    return
+                self._record_rss_sample(service_pid)
                 if self._rss_stop.wait(RSS_SAMPLE_INTERVAL_SECONDS):
                     return
         except Exception:
             return
 
     def _stop_rss_sampler(self, process: subprocess.Popen[str] | None) -> None:
-        if process is not None and process.poll() is None:
-            self._record_rss_sample(process)
+        if process is not None and process.poll() is None and self.service_pid is not None:
+            self._record_rss_sample(self.service_pid)
         self._rss_stop.set()
         thread = self._rss_thread
         if thread is not None and thread is not threading.current_thread():
@@ -283,7 +322,7 @@ class ManagedModelService:
         with self._rss_lock:
             peak_rss_kib = self.peak_rss_kib
         if peak_rss_kib:
-            message = f"TTS subprocess RSS peak: {peak_rss_kib / 1024 / 1024:.2f} GB"
+            message = f"TTS service RSS peak: {peak_rss_kib / 1024 / 1024:.2f} GB"
             self.runner.logger(message)
             append_runtime_diagnostic(self.config.cache_dir, message)
 

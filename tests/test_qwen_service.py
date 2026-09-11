@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -9,6 +10,7 @@ from videodub.qwen_service import (
     _alignment_to_segments,
     _generate_tts_batch,
     _generate_tts_one,
+    _health_payload,
     _log_mlx_peak_memory,
     _reset_mlx_peak_memory,
     _timestamp_segments,
@@ -28,6 +30,9 @@ class SizedAudio:
 
 
 class QwenServiceTests(unittest.TestCase):
+    def test_health_reports_actual_service_pid(self) -> None:
+        self.assertEqual(_health_payload("model", "mlx", "tts")["pid"], os.getpid())
+
     def test_missing_mlx_memory_diagnostics_do_not_break_tts(self) -> None:
         args = SimpleNamespace(
             backend="mlx",

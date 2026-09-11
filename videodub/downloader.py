@@ -74,15 +74,9 @@ def build_download_command(
         # Applying it to the playlist's own metadata creates an invalid nested
         # "...\\000 - playlist\\000 - playlist.info.json" path on Windows.
         "--no-write-playlist-metafiles",
-        "-f",
-        "bv*+ba/b",
-        "-t",
-        "mp4",
-        "-o",
-        str(output),
     ]
     if include_subtitles:
-        command[7:7] = [
+        command.extend([
             "--write-auto-subs" if automatic_subtitles else "--write-subs",
             "--sub-langs",
             config.subtitle_languages,
@@ -90,10 +84,22 @@ def build_download_command(
             "srt/vtt/best",
             "--convert-subs",
             "srt",
-        ]
+        ])
     elif config.link_type == "playlist":
         # A private/deleted item should not prevent the rest of a playlist downloading.
         command.append("--ignore-errors")
+    if not skip_download:
+        command.extend(
+            [
+                "-f",
+                "bv*+ba/b",
+                "--merge-output-format",
+                "mp4",
+                "--remux-video",
+                "mp4",
+            ]
+        )
+    command.extend(["-o", str(output)])
     command.extend(["--force-overwrites", "--no-continue"])
     if skip_download:
         command.append("--skip-download")

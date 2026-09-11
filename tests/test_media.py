@@ -6,6 +6,16 @@ from videodub.media import discover_video_jobs
 
 
 class MediaDiscoveryTests(unittest.TestCase):
+    def test_remuxed_mp4_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "Lecture [abc123].mp4"
+            video.touch()
+
+            jobs = discover_video_jobs(root)
+
+            self.assertEqual([job.video_path for job in jobs], [video])
+
     def test_downloaded_subtitle_without_video_becomes_a_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

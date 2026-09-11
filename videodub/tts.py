@@ -6,6 +6,7 @@ import json
 import tempfile
 import re
 import shutil
+import statistics
 import wave
 from dataclasses import dataclass, replace, asdict
 from pathlib import Path
@@ -37,13 +38,13 @@ LANGUAGE_METADATA_CODES = {
     "Russian": "rus",
 }
 CROSSFADE_MS = 15
-MAX_SENTENCE_DELAY_MS = 250
-MAX_SENTENCE_LEAD_MS = 250
-MAX_TOTAL_DELAY_MS = 800
-GLOBAL_DURATION_RATIO_MIN = 0.80
-GLOBAL_DURATION_RATIO_MAX = 1.20
-LOCAL_DURATION_RATIO_MIN = 0.90
-LOCAL_DURATION_RATIO_MAX = 1.00
+SENTENCE_EDGE_FADE_MS = 5
+BLOCK_BREAK_GAP_MS = 1000
+MIN_INTER_SENTENCE_GAP_MS = 20
+PREFERRED_INTER_SENTENCE_GAP_MS = 60
+BLOCK_DURATION_RATIO_MIN = 0.82
+BLOCK_DURATION_RATIO_MAX = 1.0
+BLOCK_RATIO_SMOOTHING_MAX_DELTA = 0.03
 DEFAULT_TTS_BATCH_SIZE = 2
 MLX_TTS_BATCH_SIZE = 1
 TTS_CHUNK_MAX_CHARS = 600
@@ -61,8 +62,19 @@ class SentenceAudio:
     path: Path
     duration_ms: int
     raw_duration_ms: int
-    global_duration_ratio: float = 1.0
-    local_duration_ratio: float = 1.0
+    duration_ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class SpeechBlock:
+    sentences: tuple[SentenceAudio, ...]
+    start_ms: int
+    deadline_ms: int
+    original_gaps_ms: tuple[int, ...]
+    scheduled_gaps_ms: tuple[int, ...] = ()
+    required_duration_ratio: float = 1.0
+    duration_ratio: float = 1.0
+    spill_ms: int = 0
 
 
 def _tts_batch_size(config: AppConfig) -> int:
@@ -339,35 +351,116 @@ def _synthesize_sentence_units(
     return [results[i] for i in range(len(units))]
 
 
-def _global_duration_factor(sentences: list[SentenceAudio]) -> float:
-    """Return the clamped output/input duration ratio shared by all sentences."""
-    valid = [item for item in sentences if item.raw_duration_ms > 0]
-    if not valid:
+def _build_speech_blocks(
+    sentences: list[SentenceAudio],
+    total_duration_ms: int,
+) -> list[SpeechBlock]:
+    if not sentences:
+        return []
+    groups: list[list[SentenceAudio]] = [[sentences[0]]]
+    for sentence in sentences[1:]:
+        previous = groups[-1][-1]
+        if sentence.unit.start_ms - previous.unit.end_ms >= BLOCK_BREAK_GAP_MS:
+            groups.append([])
+        groups[-1].append(sentence)
+
+    blocks: list[SpeechBlock] = []
+    for index, group in enumerate(groups):
+        deadline = (
+            groups[index + 1][0].unit.start_ms
+            if index + 1 < len(groups)
+            else total_duration_ms
+        )
+        original_gaps = tuple(
+            max(0, following.unit.start_ms - current.unit.end_ms)
+            for current, following in zip(group, group[1:])
+        )
+        blocks.append(
+            SpeechBlock(
+                tuple(group),
+                group[0].unit.start_ms,
+                deadline,
+                original_gaps,
+            )
+        )
+    return blocks
+
+
+def _preferred_block_gaps(block: SpeechBlock) -> tuple[int, ...]:
+    return tuple(
+        max(PREFERRED_INTER_SENTENCE_GAP_MS, gap)
+        for gap in block.original_gaps_ms
+    )
+
+
+def _required_block_duration_ratio(block: SpeechBlock) -> float:
+    raw_speech_ms = sum(sentence.raw_duration_ms for sentence in block.sentences)
+    if raw_speech_ms <= 0:
         return 1.0
-    raw_total = sum(item.raw_duration_ms for item in valid)
-    target_total = sum(
-        max(1, item.unit.end_ms - item.unit.start_ms) for item in valid
-    )
-    return _clamp(
-        target_total / raw_total,
-        GLOBAL_DURATION_RATIO_MIN,
-        GLOBAL_DURATION_RATIO_MAX,
-    )
+    available_ms = max(0, block.deadline_ms - block.start_ms)
+    preferred_total = sum(_preferred_block_gaps(block))
+    minimum_total = len(block.original_gaps_ms) * MIN_INTER_SENTENCE_GAP_MS
+    if raw_speech_ms + preferred_total <= available_ms:
+        return 1.0
+    if raw_speech_ms + minimum_total <= available_ms:
+        return 1.0
+    available_speech_ms = max(0, available_ms - minimum_total)
+    return min(1.0, available_speech_ms / raw_speech_ms)
 
 
-def _local_duration_factor(
-    raw_duration_ms: int,
-    target_duration_ms: int,
-    global_duration_ratio: float,
-) -> float:
-    """Return a per-sentence output/input ratio that only compresses further."""
-    globally_adjusted_ms = max(1.0, raw_duration_ms * global_duration_ratio)
-    needed_ratio = target_duration_ms / globally_adjusted_ms
-    return _clamp(
-        needed_ratio,
-        LOCAL_DURATION_RATIO_MIN,
-        LOCAL_DURATION_RATIO_MAX,
-    )
+def _smooth_block_ratios(required: list[float]) -> list[float]:
+    """Gently speed up already-compressed neighbors without touching 1.0 blocks."""
+    ratios = [
+        _clamp(value, BLOCK_DURATION_RATIO_MIN, BLOCK_DURATION_RATIO_MAX)
+        for value in required
+    ]
+    smoothed = ratios.copy()
+    for index, ratio in enumerate(ratios):
+        if ratio >= BLOCK_DURATION_RATIO_MAX:
+            continue
+        neighbors = [
+            ratios[other]
+            for other in (index - 1, index + 1)
+            if 0 <= other < len(ratios)
+            and ratios[other] < BLOCK_DURATION_RATIO_MAX
+        ]
+        if not neighbors:
+            continue
+        target = sum(neighbors) / len(neighbors)
+        if target < ratio:
+            smoothed[index] = max(
+                BLOCK_DURATION_RATIO_MIN,
+                ratio - min(BLOCK_RATIO_SMOOTHING_MAX_DELTA, (ratio - target) / 2),
+            )
+    return smoothed
+
+
+def _allocate_gap_total(
+    preferred_gaps: tuple[int, ...],
+    total_ms: int,
+    *,
+    minimum_ms: int,
+) -> tuple[int, ...]:
+    if not preferred_gaps:
+        return ()
+    total_ms = max(0, total_ms)
+    minimum_total = minimum_ms * len(preferred_gaps)
+    if total_ms <= minimum_total:
+        base, remainder = divmod(total_ms, len(preferred_gaps))
+        return tuple(base + (index < remainder) for index in range(len(preferred_gaps)))
+    preferred_total = sum(preferred_gaps)
+    if total_ms >= preferred_total:
+        return preferred_gaps
+    flexible = preferred_total - minimum_total
+    available_flexible = total_ms - minimum_total
+    gaps = [
+        minimum_ms + (gap - minimum_ms) * available_flexible // flexible
+        for gap in preferred_gaps
+    ]
+    remainder = total_ms - sum(gaps)
+    for index in range(remainder):
+        gaps[index % len(gaps)] += 1
+    return tuple(gaps)
 
 
 def _adjust_sentence_audio(
@@ -375,20 +468,14 @@ def _adjust_sentence_audio(
     runner: ProcessRunner,
     sentence: SentenceAudio,
     index: int,
-    global_duration_ratio: float,
+    duration_ratio: float,
     work_dir: Path,
 ) -> SentenceAudio:
-    target_ms = max(1, sentence.unit.end_ms - sentence.unit.start_ms)
-    # Preserve natural speed for already-short sentences; leave room as silence.
-    global_duration_ratio = min(1.0, global_duration_ratio)
-    if sentence.raw_duration_ms <= target_ms:
-        global_duration_ratio = 1.0
-    local_duration_ratio = _local_duration_factor(
-        sentence.raw_duration_ms,
-        target_ms,
-        global_duration_ratio,
+    duration_ratio = _clamp(
+        duration_ratio,
+        BLOCK_DURATION_RATIO_MIN,
+        BLOCK_DURATION_RATIO_MAX,
     )
-    duration_ratio = global_duration_ratio * local_duration_ratio
     speed_factor = 1.0 / duration_ratio
     output = work_dir / f"sentence-{index:05d}.fit.wav"
     runner.run(
@@ -414,120 +501,144 @@ def _adjust_sentence_audio(
         output,
         duration_ms,
         sentence.raw_duration_ms,
-        global_duration_ratio,
-        local_duration_ratio,
+        duration_ratio,
     )
 
 
-def _fit_sentence_durations(
+def _fit_speech_blocks(
     config: AppConfig,
     runner: ProcessRunner,
     sentences: list[SentenceAudio],
     work_dir: Path,
-) -> list[SentenceAudio]:
-    global_duration_ratio = _global_duration_factor(sentences)
-    raw_total = sum(item.raw_duration_ms for item in sentences)
-    target_total = sum(
-        max(1, item.unit.end_ms - item.unit.start_ms) for item in sentences
-    )
+    total_duration_ms: int,
+) -> list[SpeechBlock]:
+    blocks = _build_speech_blocks(sentences, total_duration_ms)
+    required_ratios = [_required_block_duration_ratio(block) for block in blocks]
+    duration_ratios = _smooth_block_ratios(required_ratios)
     runner.logger(
-        f"配音全局 duration ratio：{global_duration_ratio:.3f} "
-        f"（原始 {raw_total}ms，目标 {target_total}ms）"
+        f"TTS timing: {len(sentences)} sentences -> {len(blocks)} speech blocks"
     )
-    adjusted: list[SentenceAudio] = []
-    for index, sentence in enumerate(sentences):
-        fitted = _adjust_sentence_audio(
-            config,
-            runner,
-            sentence,
-            index,
-            global_duration_ratio,
-            work_dir,
-        )
-        adjusted.append(fitted)
-        target_ms = max(1, fitted.unit.end_ms - fitted.unit.start_ms)
-        unusual = (
-            fitted.local_duration_ratio < LOCAL_DURATION_RATIO_MAX
-            or fitted.duration_ms > target_ms
-        )
-        if unusual or (index + 1) % 10 == 0 or index + 1 == len(sentences):
-            runner.logger(
-                f"自然句 TTS {index + 1}/{len(sentences)} cue: {fitted.unit.first_cue}–{fitted.unit.last_cue} "
-                f"text={fitted.unit.text!r} target: {target_ms}ms，"
-                f"原始 TTS {fitted.raw_duration_ms}ms，"
-                f"global factor {fitted.global_duration_ratio:.3f}，"
-                f"local factor {fitted.local_duration_ratio:.3f}，"
-                f"最终时长 {fitted.duration_ms}ms"
+    fitted_blocks: list[SpeechBlock] = []
+    sentence_index = 0
+    for block_index, (block, required_ratio, duration_ratio) in enumerate(
+        zip(blocks, required_ratios, duration_ratios, strict=True),
+        start=1,
+    ):
+        fitted_sentences = []
+        for sentence in block.sentences:
+            fitted_sentences.append(
+                _adjust_sentence_audio(
+                    config,
+                    runner,
+                    sentence,
+                    sentence_index,
+                    duration_ratio,
+                    work_dir,
+                )
             )
-    return adjusted
+            sentence_index += 1
+        available_ms = max(0, block.deadline_ms - block.start_ms)
+        speech_ms = sum(sentence.duration_ms for sentence in fitted_sentences)
+        preferred_gaps = _preferred_block_gaps(block)
+        minimum_gap_total = len(preferred_gaps) * MIN_INTER_SENTENCE_GAP_MS
+        if speech_ms + sum(preferred_gaps) <= available_ms:
+            scheduled_gaps = preferred_gaps
+        elif speech_ms + minimum_gap_total <= available_ms:
+            scheduled_gaps = _allocate_gap_total(
+                preferred_gaps,
+                available_ms - speech_ms,
+                minimum_ms=MIN_INTER_SENTENCE_GAP_MS,
+            )
+        else:
+            scheduled_gaps = tuple(
+                MIN_INTER_SENTENCE_GAP_MS for _ in preferred_gaps
+            )
+        spill_ms = max(0, speech_ms + sum(scheduled_gaps) - available_ms)
+        fitted = replace(
+            block,
+            sentences=tuple(fitted_sentences),
+            scheduled_gaps_ms=scheduled_gaps,
+            required_duration_ratio=required_ratio,
+            duration_ratio=duration_ratio,
+            spill_ms=spill_ms,
+        )
+        fitted_blocks.append(fitted)
+        if duration_ratio < 0.999 or spill_ms or scheduled_gaps != preferred_gaps:
+            label = "警告：TTS block" if spill_ms else "TTS block"
+            runner.logger(
+                f"{label} {block_index}: "
+                f"cue={block.sentences[0].unit.first_cue}–{block.sentences[-1].unit.last_cue} "
+                f"timeline={block.start_ms / 1000:.1f}–{block.deadline_ms / 1000:.1f}s "
+                f"raw_speech={sum(item.raw_duration_ms for item in block.sentences) / 1000:.1f}s "
+                f"available={available_ms / 1000:.1f}s "
+                f"original_gaps={sum(block.original_gaps_ms) / 1000:.1f}s "
+                f"scheduled_gaps={sum(scheduled_gaps) / 1000:.1f}s "
+                f"duration_ratio={duration_ratio:.3f} speed={1 / duration_ratio:.2f}x "
+                f"spill={spill_ms}ms"
+            )
+    return fitted_blocks
 
 
 def _scheduled_sentence_start(
     unit: SentenceUnit,
-    next_start_ms: int,
-    audio_duration_ms: int,
     cursor_end_ms: int,
-    total_duration_ms: int,
-    *,
-    is_last: bool,
+    gap_ms: int = 0,
 ) -> int:
-    latest_safe_end = (
-        total_duration_ms if is_last else next_start_ms + MAX_SENTENCE_DELAY_MS
-    )
-    desired_start = min(unit.start_ms, latest_safe_end - audio_duration_ms)
-    desired_start = max(0, unit.start_ms - MAX_SENTENCE_LEAD_MS, desired_start)
-    return max(desired_start, cursor_end_ms - CROSSFADE_MS)
+    return max(0, unit.start_ms, cursor_end_ms + max(0, gap_ms))
 
 
 def _render_sentence_track(
     runner: ProcessRunner,
-    sentences: list[SentenceAudio],
+    blocks: list[SpeechBlock],
     work_dir: Path,
     total_duration_ms: int,
 ) -> Path:
     rendered: list[tuple[AudioSegment, int]] = []
     cursor_end = 0
-    total_delay = 0
-    previous_delay = 0
-    for index, sentence in enumerate(sentences):
-        runner.check_cancelled()
-        with sentence.path.open("rb") as source:
-            audio = AudioSegment.from_wav(source)
-        fade_ms = min(CROSSFADE_MS, len(audio) // 2)
-        if fade_ms:
-            audio = audio.fade_in(fade_ms).fade_out(fade_ms)
-        next_start = (
-            sentences[index + 1].unit.start_ms
-            if index + 1 < len(sentences)
-            else total_duration_ms
+    maximum_spill_ms = 0
+    final_delay_ms = 0
+    for block_index, block in enumerate(blocks):
+        block_unclipped_end = block.start_ms
+        speech_ms = sum(sentence.duration_ms for sentence in block.sentences)
+        block_start = max(block.start_ms, cursor_end)
+        gap_room_ms = max(0, block.deadline_ms - block_start - speech_ms)
+        effective_gaps = _allocate_gap_total(
+            block.scheduled_gaps_ms,
+            min(sum(block.scheduled_gaps_ms), gap_room_ms),
+            minimum_ms=0,
         )
-        start_ms = _scheduled_sentence_start(
-            sentence.unit,
-            next_start,
-            len(audio),
-            cursor_end,
-            total_duration_ms,
-            is_last=index + 1 == len(sentences),
-        )
-        delay_ms = max(0, start_ms - sentence.unit.start_ms)
-        total_delay += max(0, delay_ms - previous_delay)
-        previous_delay = delay_ms
-        if delay_ms > MAX_SENTENCE_DELAY_MS or total_delay > MAX_TOTAL_DELAY_MS:
-            runner.logger(
-                f"字幕 {sentence.unit.first_cue}–{sentence.unit.last_cue} 因串行调度产生 "
-                f"{delay_ms}ms 延迟（累计 {total_delay}ms）。"
-            )
-        end_ms = start_ms + len(audio)
-        if index + 1 == len(sentences) and end_ms > total_duration_ms:
-            runner.logger(
-                f"最后一句超出视频结尾 {end_ms - total_duration_ms}ms，"
-                "已仅在最终视频边界截断。"
-            )
-            audio = audio[: max(0, total_duration_ms - start_ms)]
+        for sentence_index, sentence in enumerate(block.sentences):
+            runner.check_cancelled()
+            with sentence.path.open("rb") as source:
+                audio = AudioSegment.from_wav(source)
+            fade_ms = min(SENTENCE_EDGE_FADE_MS, len(audio) // 2)
+            if fade_ms:
+                audio = audio.fade_in(fade_ms).fade_out(fade_ms)
+            gap_ms = effective_gaps[sentence_index - 1] if sentence_index else 0
+            start_ms = _scheduled_sentence_start(sentence.unit, cursor_end, gap_ms)
+            final_delay_ms = max(0, start_ms - sentence.unit.start_ms)
             end_ms = start_ms + len(audio)
-        if audio and start_ms < total_duration_ms:
-            rendered.append((audio, start_ms))
-        cursor_end = max(cursor_end, end_ms)
+            block_unclipped_end = max(block_unclipped_end, end_ms)
+            is_last = (
+                block_index + 1 == len(blocks)
+                and sentence_index + 1 == len(block.sentences)
+            )
+            if is_last and end_ms > total_duration_ms:
+                runner.logger(
+                    f"最后一句超出视频结尾 {end_ms - total_duration_ms}ms，"
+                    "已仅在最终视频边界截断。"
+                )
+                audio = audio[: max(0, total_duration_ms - start_ms)]
+                end_ms = start_ms + len(audio)
+            if audio and start_ms < total_duration_ms:
+                rendered.append((audio, start_ms))
+            cursor_end = max(cursor_end, end_ms)
+        block_spill_ms = max(0, block_unclipped_end - block.deadline_ms)
+        maximum_spill_ms = max(maximum_spill_ms, block_spill_ms)
+        if block_spill_ms:
+            runner.logger(
+                f"TTS block {block_index + 1} scheduling spill={block_spill_ms}ms"
+            )
 
     canvas = (
         AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
@@ -539,6 +650,14 @@ def _render_sentence_track(
     output = work_dir / "aligned_audio.wav"
     with output.open("wb") as destination:
         canvas.export(destination, format="wav")
+    speeds = [1 / block.duration_ratio for block in blocks]
+    runner.logger(
+        "TTS timing summary: "
+        f"maximum speech speed={max(speeds, default=1.0):.2f}x "
+        f"median speech speed={statistics.median(speeds) if speeds else 1.0:.2f}x "
+        f"maximum block spill={maximum_spill_ms}ms "
+        f"final accumulated delay={final_delay_ms}ms"
+    )
     return output
 
 
@@ -657,15 +776,16 @@ def dub_video(
         work_dir,
         qwen_base_url,
     )
-    adjusted_sentences = _fit_sentence_durations(
+    fitted_blocks = _fit_speech_blocks(
         config,
         runner,
         raw_sentences,
         work_dir,
+        round(total_duration * 1000),
     )
     voice_track = _render_sentence_track(
         runner,
-        adjusted_sentences,
+        fitted_blocks,
         work_dir,
         round(total_duration * 1000),
     )

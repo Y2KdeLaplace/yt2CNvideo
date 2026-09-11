@@ -11,6 +11,7 @@ from videodub.qwen_speech import (
     _crispasr_language_code,
     _segments_to_cues,
     _validate_crispasr_asr_model,
+    check_qwen_service,
     resolve_tts_reference,
     synthesize_qwen,
     synthesize_qwen_batch,
@@ -27,6 +28,28 @@ class RecordingRunner:
 
 
 class QwenSpeechTests(unittest.TestCase):
+    def test_health_pid_is_optional_and_validated(self) -> None:
+        with patch(
+            "videodub.qwen_speech._json_request",
+            return_value={
+                "status": "ok",
+                "type": "tts",
+                "model": "model",
+                "backend": "mlx",
+                "pid": 26762,
+            },
+        ):
+            info = check_qwen_service("http://tts", "tts")
+        self.assertEqual(info.pid, 26762)
+
+        with patch(
+            "videodub.qwen_speech._json_request",
+            return_value={"status": "ok", "type": "tts", "pid": "26762"},
+        ):
+            fallback = check_qwen_service("http://tts", "tts")
+        self.assertTrue(fallback.available)
+        self.assertIsNone(fallback.pid)
+
     def test_crispasr_uses_explicit_language_codes(self) -> None:
         self.assertEqual(_crispasr_language_code("English"), "en")
         self.assertEqual(_crispasr_language_code("Chinese"), "zh")

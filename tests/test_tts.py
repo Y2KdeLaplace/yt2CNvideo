@@ -18,17 +18,20 @@ from videodub.runner import ProcessRunner
 from videodub.subtitles import Cue, write_srt
 from videodub.sentences import build_sentence_units, write_units
 from videodub.tts import (
+    BLOCK_DURATION_RATIO_MIN,
     CROSSFADE_MS,
+    SENTENCE_EDGE_FADE_MS,
     SentenceAudio,
     SentenceUnit,
     _adjust_sentence_audio,
     _atempo_chain,
     _audio_duration_ms,
-    _fit_sentence_durations,
-    _global_duration_factor,
-    _local_duration_factor,
+    _build_speech_blocks,
+    _fit_speech_blocks,
     _render_sentence_track,
+    _required_block_duration_ratio,
     _scheduled_sentence_start,
+    _smooth_block_ratios,
     _synthesize_sentence,
     _synthesize_sentence_units,
     _tts_batch_size,
@@ -158,7 +161,7 @@ class SentenceUnitTests(unittest.TestCase):
             self.assertEqual(result.unit, unit)
             self.assertEqual(result.path.name, "sentence-00000.raw.wav")
             self.assertTrue(result.path.is_file())
-            self.assertGreater(result.duration_ms, 100)
+            self.assertEqual(result.duration_ms, 480)
             self.assertEqual(requests, ["第一段。", "第二段。", "第三段。"])
 
     def test_mlx_sentence_units_are_generated_sequentially(self) -> None:
@@ -246,59 +249,119 @@ class SentenceUnitTests(unittest.TestCase):
 
 
 class DurationFittingTests(unittest.TestCase):
-    def test_short_sentences_are_not_stretched_to_fill_their_windows(self) -> None:
+    def test_short_sentence_uses_following_block_slack_without_speedup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             raw = [
-                sentence_audio(root, 0, start_ms=0, end_ms=1000, raw_ms=300),
-                sentence_audio(root, 1, start_ms=2000, end_ms=3000, raw_ms=300),
+                sentence_audio(root, 0, start_ms=0, end_ms=600, raw_ms=2500),
+                sentence_audio(root, 1, start_ms=4000, end_ms=5000, raw_ms=700),
             ]
             runner = AudioRunner()
 
-            fitted = _fit_sentence_durations(AppConfig(), runner, raw, root)
-            track_path = _render_sentence_track(runner, fitted, root, 3500)
-            with track_path.open("rb") as source:
-                track = AudioSegment.from_wav(source)
+            blocks = _fit_speech_blocks(AppConfig(), runner, raw, root, 6000)
 
-        self.assertEqual(fitted[0].global_duration_ratio, 1.0)
-        self.assertLess(fitted[0].duration_ms, 500)
-        self.assertLess(fitted[1].duration_ms, 500)
-        self.assertEqual(track[600:1900].rms, 0)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0].deadline_ms, 4000)
+        self.assertEqual(blocks[0].duration_ratio, 1.0)
+        self.assertGreater(blocks[0].sentences[0].duration_ms, 2400)
 
-    def test_overlong_sentence_uses_atempo_and_approaches_target_window(self) -> None:
+    def test_rapid_dialogue_forms_one_block_with_one_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            raw = sentence_audio(root, 0, start_ms=0, end_ms=1000, raw_ms=1400)
+            raw = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=1000),
+                sentence_audio(root, 1, start_ms=580, end_ms=1000, raw_ms=1000),
+                sentence_audio(root, 2, start_ms=1120, end_ms=1500, raw_ms=1000),
+            ]
             runner = AudioRunner()
 
-            fitted = _fit_sentence_durations(AppConfig(), runner, [raw], root)[0]
+            blocks = _fit_speech_blocks(AppConfig(), runner, raw, root, 2800)
 
-        self.assertAlmostEqual(fitted.global_duration_ratio, 0.80)
-        self.assertAlmostEqual(fitted.local_duration_ratio, 0.90)
-        self.assertLess(abs(fitted.duration_ms - 1008), 25)
-        self.assertIn("atempo=", runner.commands[0][runner.commands[0].index("-af") + 1])
+        self.assertEqual(len(blocks), 1)
+        self.assertAlmostEqual(blocks[0].duration_ratio, 0.92)
+        self.assertEqual(
+            {sentence.duration_ratio for sentence in blocks[0].sentences},
+            {blocks[0].duration_ratio},
+        )
 
-    def test_global_factor_reflects_multiple_slow_sentences(self) -> None:
+    def test_gap_at_break_threshold_creates_new_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sentences = [
-                sentence_audio(root, 0, start_ms=0, end_ms=1000, raw_ms=1500),
-                sentence_audio(root, 1, start_ms=1200, end_ms=2200, raw_ms=1500),
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=400),
+                sentence_audio(root, 1, start_ms=3000, end_ms=3500, raw_ms=400),
             ]
-            self.assertEqual(_global_duration_factor(sentences), 0.80)
+            blocks = _build_speech_blocks(sentences, 4000)
 
-    def test_abnormally_long_sentence_receives_extra_local_compression(self) -> None:
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0].deadline_ms, 3000)
+
+    def test_block_that_fits_keeps_natural_speed_and_preferred_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sentences = [
-                sentence_audio(root, 0, start_ms=0, end_ms=1000, raw_ms=1000),
-                sentence_audio(root, 1, start_ms=1200, end_ms=2200, raw_ms=2000),
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=400),
+                sentence_audio(root, 1, start_ms=580, end_ms=1000, raw_ms=400),
             ]
-            global_ratio = _global_duration_factor(sentences)
+            block = _fit_speech_blocks(
+                AppConfig(), AudioRunner(), sentences, root, 1500
+            )[0]
 
-        self.assertEqual(global_ratio, 0.80)
-        self.assertEqual(_local_duration_factor(1000, 1000, global_ratio), 1.00)
-        self.assertEqual(_local_duration_factor(2000, 1000, global_ratio), 0.90)
+        self.assertEqual(block.duration_ratio, 1.0)
+        self.assertEqual(block.scheduled_gaps_ms, (80,))
+
+    def test_mild_compression_is_uniform_across_the_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=1000),
+                sentence_audio(root, 1, start_ms=580, end_ms=1000, raw_ms=1000),
+            ]
+            block = _fit_speech_blocks(
+                AppConfig(), AudioRunner(), sentences, root, 1880
+            )[0]
+
+        self.assertAlmostEqual(block.required_duration_ratio, 0.93)
+        self.assertAlmostEqual(block.duration_ratio, 0.93)
+        self.assertEqual(
+            [sentence.duration_ratio for sentence in block.sentences],
+            [block.duration_ratio, block.duration_ratio],
+        )
+
+    def test_gaps_shrink_before_speech_speed_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=800),
+                sentence_audio(root, 1, start_ms=580, end_ms=1000, raw_ms=800),
+            ]
+            block = _fit_speech_blocks(
+                AppConfig(), AudioRunner(), sentences, root, 1650
+            )[0]
+
+        self.assertEqual(block.duration_ratio, 1.0)
+        self.assertEqual(block.scheduled_gaps_ms, (50,))
+
+    def test_smoothing_only_adjusts_already_compressed_blocks(self) -> None:
+        self.assertEqual(_smooth_block_ratios([0.82, 0.93, 0.82]), [0.82, 0.90, 0.82])
+        self.assertEqual(_smooth_block_ratios([0.82, 1.0, 0.82]), [0.82, 1.0, 0.82])
+
+    def test_ratio_floor_allows_spill_instead_of_extreme_speed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=1000),
+                sentence_audio(root, 1, start_ms=580, end_ms=1000, raw_ms=1000),
+            ]
+            raw_block = _build_speech_blocks(sentences, 1320)[0]
+            runner = AudioRunner()
+            block = _fit_speech_blocks(AppConfig(), runner, sentences, root, 1320)[0]
+
+        self.assertAlmostEqual(_required_block_duration_ratio(raw_block), 0.65)
+        self.assertEqual(block.duration_ratio, BLOCK_DURATION_RATIO_MIN)
+        self.assertGreater(block.spill_ms, 0)
+        self.assertLessEqual(1 / block.duration_ratio, 1.22)
+        self.assertTrue(any("警告：TTS block" in message for message in runner.messages))
 
     def test_atempo_chain_supports_speed_factors_above_two(self) -> None:
         self.assertEqual(_atempo_chain(4.5), "atempo=2.0,atempo=2.0,atempo=1.125000")
@@ -316,30 +379,43 @@ class DurationFittingTests(unittest.TestCase):
                 ProcessRunner(),
                 raw,
                 0,
-                0.80,
+                0.82,
                 root,
             )
 
         self.assertEqual(fitted.path.name, "sentence-00000.fit.wav")
-        self.assertLess(abs(fitted.duration_ms - 1008), 50)
+        self.assertLess(abs(fitted.duration_ms - 1148), 50)
 
 
 class TimelineSchedulingTests(unittest.TestCase):
     def test_overlapping_subtitle_windows_are_scheduled_serially(self) -> None:
         first = SentenceUnit(1, 1, 0, 1000, "一。")
         second = SentenceUnit(2, 2, 800, 1600, "二。")
-        first_start = _scheduled_sentence_start(first, 800, 900, 0, 3000, is_last=False)
-        second_start = _scheduled_sentence_start(
-            second,
-            3000,
-            900,
-            first_start + 900,
-            3000,
-            is_last=True,
-        )
+        first_start = _scheduled_sentence_start(first, 0)
+        second_start = _scheduled_sentence_start(second, first_start + 900)
 
         self.assertEqual(first_start, 0)
-        self.assertGreaterEqual(second_start, first_start + 900 - CROSSFADE_MS)
+        self.assertGreaterEqual(second_start, first_start + 900)
+
+    def test_original_gap_is_preserved_when_space_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=500),
+                sentence_audio(root, 1, start_ms=800, end_ms=1300, raw_ms=500),
+            ]
+            runner = AudioRunner()
+            blocks = _fit_speech_blocks(AppConfig(), runner, sentences, root, 1800)
+            output = _render_sentence_track(runner, blocks, root, 1800)
+            with output.open("rb") as source:
+                track = AudioSegment.from_wav(source)
+
+        self.assertEqual(blocks[0].scheduled_gaps_ms, (300,))
+        self.assertEqual(track[550:750].rms, 0)
+
+    def test_sentence_edge_fade_is_shorter_than_chunk_crossfade(self) -> None:
+        self.assertEqual(SENTENCE_EDGE_FADE_MS, 5)
+        self.assertGreater(CROSSFADE_MS, SENTENCE_EDGE_FADE_MS)
 
     def test_only_last_sentence_is_clipped_at_video_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -361,8 +437,10 @@ class TimelineSchedulingTests(unittest.TestCase):
                 frequency=880,
             )
             runner = AudioRunner()
-
-            output = _render_sentence_track(runner, [first, last], root, 2000)
+            blocks = _fit_speech_blocks(
+                AppConfig(), runner, [first, last], root, 2000
+            )
+            output = _render_sentence_track(runner, blocks, root, 2000)
 
             self.assertEqual(_audio_duration_ms(output), 2000)
             with output.open("rb") as source:
@@ -406,7 +484,7 @@ class DubVideoFlowTests(unittest.TestCase):
                     "videodub.tts._synthesize_sentence_units",
                     return_value=raw,
                 ) as synthesize,
-                patch("videodub.tts._fit_sentence_durations", return_value=raw) as fit,
+                patch("videodub.tts._fit_speech_blocks", return_value=[]) as fit,
                 patch("videodub.tts._render_sentence_track", return_value=voice) as render,
             ):
                 result = dub_video(
@@ -428,6 +506,8 @@ class DubVideoFlowTests(unittest.TestCase):
 
         self.assertFalse(hasattr(tts, "align_qwen"))
         self.assertFalse(hasattr(tts, "_align_full_audio"))
+        self.assertFalse(hasattr(tts, "_global_duration_factor"))
+        self.assertFalse(hasattr(tts, "_local_duration_factor"))
 
 class SentenceCacheTests(unittest.TestCase):
     def test_first_empty_then_success_and_two_empty_fail_with_context(self):

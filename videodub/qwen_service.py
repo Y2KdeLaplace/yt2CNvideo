@@ -8,6 +8,7 @@ import argparse
 import base64
 import io
 import math
+import os
 import tempfile
 import unicodedata
 from contextlib import asynccontextmanager
@@ -21,6 +22,16 @@ MLX_SAMPLE_RATE = 16000
 MLX_CHUNK_DURATIONS = (240.0, 120.0, 60.0)
 CHUNK_BOUND_TOLERANCE_SECONDS = 0.001
 MAX_ALIGNMENT_OVERLAP_SECONDS = 0.1
+
+
+def _health_payload(model: str, backend: str, service_type: str) -> dict[str, str | int]:
+    return {
+        "status": "ok",
+        "model": model,
+        "backend": backend,
+        "type": service_type,
+        "pid": os.getpid(),
+    }
 
 
 def _torch_options() -> dict[str, Any]:
@@ -406,15 +417,10 @@ def create_asr_app(args: argparse.Namespace) -> Any:
     app = FastAPI(lifespan=lifespan)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health() -> dict[str, str | int]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {
-            "status": "ok",
-            "model": args.model,
-            "backend": args.backend,
-            "type": "asr",
-        }
+        return _health_payload(args.model, args.backend, "asr")
 
     @app.post("/v1/asr")
     async def transcribe(
@@ -656,15 +662,10 @@ def create_tts_app(args: argparse.Namespace) -> Any:
         language: str = "Chinese"
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health() -> dict[str, str | int]:
         if state["model"] is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        return {
-            "status": "ok",
-            "model": args.model,
-            "backend": args.backend,
-            "type": "tts",
-        }
+        return _health_payload(args.model, args.backend, "tts")
 
     @app.post("/v1/tts")
     def synthesize(request: TTSRequest) -> dict[str, Any]:

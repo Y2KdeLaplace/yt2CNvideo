@@ -46,6 +46,7 @@ class QwenServiceInfo:
     model: str = ""
     backend: str = ""
     error: str = ""
+    pid: int | None = None
 
     @property
     def display(self) -> str:
@@ -93,11 +94,19 @@ def check_qwen_service(
             raise RuntimeError("服务尚未就绪")
         if reported_type != service_type:
             raise RuntimeError(f"端口上运行的是 {reported_type} 服务")
+        reported_pid = data.get("pid")
+        pid = (
+            int(reported_pid)
+            if isinstance(reported_pid, int) and not isinstance(reported_pid, bool)
+            and reported_pid > 0
+            else None
+        )
         return QwenServiceInfo(
             True,
             service_type,
             str(data.get("model") or ""),
             str(data.get("backend") or ""),
+            pid=pid,
         )
     except Exception as exc:
         return QwenServiceInfo(False, service_type, error=str(exc))
