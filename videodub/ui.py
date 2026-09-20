@@ -8,6 +8,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import replace
@@ -30,15 +31,15 @@ from videodub.config import (
     save_language_model_info,
 )
 from videodub.dependencies import (
-    check_dependency_updates,
     inspect_dependency_versions,
+    update_dependencies,
 )
 from videodub.video_download import (
     cleanup_new_download_directories,
     download,
     snapshot_download_directories,
 )
-from videodub.video_download.ui import build_download_tab
+from videodub.video_download.ui import build_download_section
 from videodub.media import VideoJob, discover_video_jobs
 from videodub.model_management import read_installed_model
 from videodub.model_management.dialogs import (
@@ -54,7 +55,7 @@ from videodub.processing import (
     run_repair_stage,
     run_translate_stage,
 )
-from videodub.processing.ui import build_processing_tab, job_status_values
+from videodub.processing.ui import build_processing_section, job_status_values
 from videodub.qwen_speech import resolve_tts_reference
 from videodub.runner import CancelledError, ProcessRunner
 from videodub.subtitle_workflow import SubtitleRepairWorkflow
@@ -65,6 +66,23 @@ GITHUB_REPOSITORY = "Y2KdeLaplace/yt2CNvideo"
 GUI_HEARTBEAT_INTERVAL_MS = 500
 GUI_WATCHDOG_INTERVAL_SECONDS = 1.0
 GUI_STALL_THRESHOLD_SECONDS = 3.0
+FOCUSABLE_WIDGET_CLASSES = {
+    "Entry",
+    "Listbox",
+    "Menu",
+    "Scale",
+    "Scrollbar",
+    "TButton",
+    "TCheckbutton",
+    "TCombobox",
+    "TEntry",
+    "TMenubutton",
+    "TRadiobutton",
+    "TScale",
+    "TScrollbar",
+    "Treeview",
+    "Text",
+}
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -104,7 +122,7 @@ class VideoDubApp(tk.Tk):
         # Keep the initial top-left placement hidden until the final geometry
         # is known, especially on macOS where Tk may paint before construction.
         self.withdraw()
-        self.title("scip - YouTube 视频中文化工具")
+        self.title("YouTube 视频中文化工具")
         self.geometry("1080x738")
         self.minsize(900, 630)
         self.config_data = load_config()
@@ -163,6 +181,7 @@ class VideoDubApp(tk.Tk):
         self._build_ui()
         self._center_main_window()
         self.deiconify()
+        self.after_idle(self.focus_set)
         self.after(100, self._drain_events)
         self.after(180, self._check_tools)
         self.after(GUI_HEARTBEAT_INTERVAL_MS, self._gui_heartbeat)
@@ -174,6 +193,11 @@ class VideoDubApp(tk.Tk):
             return
         self._last_gui_heartbeat = time.monotonic()
         self.after(GUI_HEARTBEAT_INTERVAL_MS, self._gui_heartbeat)
+
+    def _note_gui_activity(self, _event: tk.Event | None = None) -> None:
+        # Native live-resize loops can pause ``after`` callbacks while Tk is
+        # still processing Configure events. Count those events as GUI activity.
+        self._last_gui_heartbeat = time.monotonic()
 
     def _emit_watchdog_event(self, message: str) -> None:
         self.events.put(("log", message))
@@ -226,8 +250,10 @@ class VideoDubApp(tk.Tk):
         style.configure("TLabelframe.Label", font=(self.ui_font, 11, "bold"))
         style.configure("TButton", font=(self.ui_font, 11), padding=(6, 2))
         style.configure("Toolbutton.TButton", font=(self.ui_font, 11), padding=(5, 2))
-        style.configure("Main.TButton", font=(self.ui_font, 10), padding=(5, 1))
-        style.configure("Main.TMenubutton", font=(self.ui_font, 10), padding=(5, 1))
+        style.configure("Main.TLabel", font=(self.ui_font, 11))
+        style.configure("Main.TEntry", font=(self.ui_font, 11))
+        style.configure("Main.TButton", font=(self.ui_font, 11), padding=(5, 1))
+        style.configure("Main.TMenubutton", font=(self.ui_font, 11), padding=(5, 1))
         style.configure("Stage.TCheckbutton", font=(self.ui_font, 11))
         style.configure("Treeview", rowheight=27)
         style.configure("Treeview.Heading", font=(self.ui_font, 10, "bold"))
@@ -253,6 +279,27 @@ class VideoDubApp(tk.Tk):
         dialog.geometry(f"{width}x{height}+{x}+{y}")
         dialog.deiconify()
         dialog.lift()
+        dialog.bind("<Button-1>", self._clear_focus_on_blank_click, add="+")
+        dialog.after_idle(dialog.focus_set)
+
+    def _clear_focus_on_blank_click(self, event: tk.Event) -> None:
+        if event.widget.winfo_class() in FOCUSABLE_WIDGET_CLASSES:
+            return
+        event.widget.winfo_toplevel().focus_set()
+
+    def _release_header_button_focus(self, _event: tk.Event) -> None:
+        self.after_idle(self.focus_set)
+
+    def _keep_cascade_open(self, menu: tk.Menu, event: tk.Event) -> str | None:
+        try:
+            index = menu.index(f"@{event.y}")
+        except tk.TclError:
+            return None
+        if index is None or menu.type(index) != "cascade":
+            return None
+        menu.activate(index)
+        menu.tk.call(menu._w, "postcascade", index)
+        return "break"
 
     def _center_main_window(self) -> None:
         self.update_idletasks()
@@ -265,37 +312,58 @@ class VideoDubApp(tk.Tk):
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=2, uniform="main-resizable-content")
+        outer.rowconfigure(3, weight=1, uniform="main-resizable-content")
 
         header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 9))
-        ttk.Label(header, text="工作路径").pack(side="left")
-        ttk.Entry(header, textvariable=self.work_dir, state="readonly").pack(
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 9))
+        ttk.Label(header, text="工作路径", style="Main.TLabel").pack(side="left")
+        self.work_path_entry = ttk.Entry(
+            header,
+            textvariable=self.work_dir,
+            state="readonly",
+            style="Main.TEntry",
+        )
+        self.work_path_entry.pack(
             side="left", fill="x", expand=True, padx=(9, 7)
         )
         header_actions = ttk.Frame(header)
         header_actions.pack(side="left")
-        ttk.Button(
+        self.select_work_button = ttk.Button(
             header_actions,
             text="选择",
             command=self._browse_work_folder,
             style="Main.TButton",
-        ).grid(row=0, column=0, sticky="ew", padx=3)
-        ttk.Button(
+            takefocus=False,
+        )
+        self.select_work_button.grid(row=0, column=0, sticky="ew", padx=3)
+        self.open_work_button = ttk.Button(
             header_actions,
             text="打开",
             command=self._open_work_folder,
             style="Main.TButton",
-        ).grid(row=0, column=1, sticky="ew", padx=3)
+            takefocus=False,
+        )
+        self.open_work_button.grid(row=0, column=1, sticky="ew", padx=3)
+        for button in (self.select_work_button, self.open_work_button):
+            button.bind(
+                "<ButtonRelease-1>",
+                self._release_header_button_focus,
+                add="+",
+            )
         model_menu = tk.Menu(self, tearoff=False)
         model_menu.add_command(label="语言模型", command=self._show_language_model)
         model_menu.add_command(label="语音模型", command=self._show_speech_models)
         model_menu.add_command(label="语音模型管理", command=self._show_model_manager)
-        ttk.Menubutton(
+        self.model_menu_button = ttk.Menubutton(
             header_actions,
             text="模型",
             menu=model_menu,
             style="Main.TMenubutton",
-        ).grid(row=0, column=2, sticky="ew", padx=3)
+            takefocus=False,
+        )
+        self.model_menu_button.grid(row=0, column=2, sticky="ew", padx=3)
         about_menu = tk.Menu(self, tearoff=False)
         about_menu.add_command(label="更新", command=self._check_update)
         about_menu.add_command(label="版本", command=self._show_version)
@@ -303,30 +371,36 @@ class VideoDubApp(tk.Tk):
         cache_menu.add_command(label="设置缓存目录", command=self._set_cache_directory)
         cache_menu.add_command(label="打开缓存目录", command=self._open_cache_directory)
         about_menu.add_cascade(label="缓存目录", menu=cache_menu)
-        ttk.Menubutton(
+        about_menu.bind(
+            "<ButtonRelease-1>",
+            lambda event: self._keep_cascade_open(about_menu, event),
+            add="+",
+        )
+        self.about_menu_button = ttk.Menubutton(
             header_actions,
             text="关于",
             menu=about_menu,
             style="Main.TMenubutton",
-        ).grid(row=0, column=3, sticky="ew", padx=3)
+            takefocus=False,
+        )
+        self.about_menu_button.grid(row=0, column=3, sticky="ew", padx=3)
         for column in range(4):
             header_actions.columnconfigure(column, weight=1, uniform="header-action")
 
-        self.notebook = ttk.Notebook(outer)
-        self.notebook.pack(fill="both", expand=True)
-        self.download_tab = ttk.Frame(self.notebook, padding=12)
-        self.process_tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(self.download_tab, text="视频下载")
-        self.notebook.add(self.process_tab, text="处理")
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self._build_download_tab()
-        self._build_process_tab()
+        download_section = ttk.Frame(outer)
+        download_section.grid(row=1, column=0, sticky="ew")
+        process_section = ttk.Frame(outer)
+        process_section.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        self._build_download_section(download_section)
+        self._build_processing_section(process_section)
 
         log_box = ttk.LabelFrame(outer, text="运行日志", padding=7)
-        log_box.pack(fill="x", pady=(10, 0))
+        log_box.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        log_box.columnconfigure(0, weight=1)
+        log_box.rowconfigure(0, weight=1)
         self.log = tk.Text(
             log_box,
-            height=8,
+            height=9,
             wrap="word",
             state="disabled",
             font=(self.mono_font, 9),
@@ -336,28 +410,16 @@ class VideoDubApp(tk.Tk):
         )
         scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        self.log.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.bind("<Button-1>", self._clear_focus_on_blank_click, add="+")
+        self.bind_all("<Configure>", self._note_gui_activity, add="+")
 
-    def _on_tab_changed(self, _event: object = None) -> None:
-        selection_locked = getattr(self, "process_running", False)
-        if not selection_locked:
-            self._refresh_jobs()
-        if (
-            not selection_locked
-            and hasattr(self, "job_tree")
-            and self.notebook.select() == str(self.process_tab)
-        ):
-            self.job_tree.selection_remove(*self.job_tree.selection())
-        # Do not leave the first control (the Refresh button on macOS) as the
-        # key-window default when entering the processing page.
-        self.after_idle(self.focus_set)
+    def _build_download_section(self, parent: ttk.Frame) -> None:
+        build_download_section(self, parent)
 
-    def _build_download_tab(self) -> None:
-        build_download_tab(self)
-
-    def _build_process_tab(self) -> None:
-        build_processing_tab(self)
+    def _build_processing_section(self, parent: ttk.Frame) -> None:
+        build_processing_section(self, parent)
 
     def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -370,7 +432,12 @@ class VideoDubApp(tk.Tk):
 
     def _check_tools(self) -> None:
         def worker() -> None:
-            runner = ProcessRunner()
+            runner = ProcessRunner(lambda line: self.events.put(("log", line)))
+            try:
+                summary = update_dependencies(runner)
+            except (OSError, RuntimeError) as exc:
+                summary = f"依赖自动更新失败：{exc}"
+            self.events.put(("log", summary))
             try:
                 versions = inspect_dependency_versions(self.config_data, runner)
                 self.events.put(("log", versions.log_line()))
@@ -516,6 +583,7 @@ class VideoDubApp(tk.Tk):
         if self.job_tree.identify_row(event.y):
             return None
         self.job_tree.selection_remove(*self.job_tree.selection())
+        self.focus_set()
         return "break"
 
     def _toggle_job_selection(self, event: tk.Event) -> str:
@@ -850,14 +918,24 @@ class VideoDubApp(tk.Tk):
         for runner in runners:
             runner.cancel()
 
+    def _defer_model_dialog(
+        self,
+        opener: Callable[[VideoDubApp], None],
+    ) -> None:
+        def open_after_menu_closes() -> None:
+            self.model_menu_button.state(("!pressed", "!active"))
+            opener(self)
+
+        self.after_idle(open_after_menu_closes)
+
     def _show_language_model(self) -> None:
-        show_language_model_dialog(self)
+        self._defer_model_dialog(show_language_model_dialog)
 
     def _show_speech_models(self) -> None:
-        show_speech_model_dialog(self)
+        self._defer_model_dialog(show_speech_model_dialog)
 
     def _show_model_manager(self) -> None:
-        show_model_manager_dialog(self)
+        self._defer_model_dialog(show_model_manager_dialog)
 
     def _set_cache_directory(self) -> None:
         selected = filedialog.askdirectory(
@@ -892,7 +970,7 @@ class VideoDubApp(tk.Tk):
     def _show_version(self) -> None:
         messagebox.showinfo(
             "版本",
-            f"scip - YouTube 视频中文化工具\n版本 {__version__}\n\nGitHub：{GITHUB_REPOSITORY}",
+            f"YouTube 视频中文化工具\n版本 {__version__}\n\nGitHub：{GITHUB_REPOSITORY}",
             parent=self,
         )
 
@@ -900,14 +978,6 @@ class VideoDubApp(tk.Tk):
         self._separator("检查更新")
 
         def worker() -> None:
-            dependency_runner = ProcessRunner(
-                lambda line: self.events.put(("log", line))
-            )
-            try:
-                dependency_summary = check_dependency_updates(dependency_runner)
-            except (OSError, RuntimeError) as exc:
-                dependency_summary = f"依赖更新检查失败：{exc}"
-            self.events.put(("log", dependency_summary))
             try:
                 headers = {"User-Agent": f"scip/{__version__}"}
                 try:
@@ -932,7 +1002,7 @@ class VideoDubApp(tk.Tk):
                     url = f"https://github.com/{GITHUB_REPOSITORY}/tags"
                 if not latest:
                     raise RuntimeError("GitHub 尚未发布版本标签")
-                self.events.put(("update", (latest, url, dependency_summary)))
+                self.events.put(("update", (latest, url)))
             except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
                 self.events.put(("error", RuntimeError(f"检查更新失败：{exc}")))
 
@@ -959,18 +1029,17 @@ class VideoDubApp(tk.Tk):
                     self._append_log(f"错误：{payload}")
                     messagebox.showerror("任务失败", str(payload), parent=self)
                 elif kind == "update":
-                    latest, url, dependency_summary = payload
+                    latest, url = payload
                     if latest and _version_tuple(latest) > _version_tuple(__version__):
                         messagebox.showinfo(
                             "发现新版本",
-                            f"当前版本：{__version__}\n最新版本：{latest}\n{url}"
-                            f"\n\n{dependency_summary}",
+                            f"当前版本：{__version__}\n最新版本：{latest}\n{url}",
                             parent=self,
                         )
                     else:
                         messagebox.showinfo(
                             "更新",
-                            f"当前已是最新版本 {__version__}。\n\n{dependency_summary}",
+                            f"当前已是最新版本 {__version__}。",
                             parent=self,
                         )
         except queue.Empty:

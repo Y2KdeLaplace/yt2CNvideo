@@ -149,7 +149,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
     dialog.transient(app)
     dialog.grab_set()
     dialog.resizable(False, False)
-    frame = ttk.Frame(dialog, padding=16)
+    frame = ttk.Frame(dialog, padding=12)
     frame.pack(fill="both", expand=True)
     models = list_installed_models(config=app.config_data)
     model_paths = {model.path for model in models}
@@ -166,8 +166,8 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
     if asr_path == tts_path:
         tts_path = ""
 
-    ttk.Label(frame, text="语音识别").grid(row=0, column=0, sticky="w", pady=6)
-    ttk.Label(frame, text="语音生成").grid(row=1, column=0, sticky="w", pady=6)
+    ttk.Label(frame, text="语音识别").grid(row=0, column=0, sticky="w", pady=4)
+    ttk.Label(frame, text="语音生成").grid(row=1, column=0, sticky="w", pady=4)
 
     refreshing = False
 
@@ -183,9 +183,9 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         refreshing = False
 
     asr_picker = _ModelPicker(frame, refresh_pickers)
-    asr_picker.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=6)
+    asr_picker.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
     tts_picker = _ModelPicker(frame, refresh_pickers)
-    tts_picker.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=6)
+    tts_picker.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
     asr_picker.set_models(models, asr_path, tts_path)
     tts_picker.set_models(models, tts_path, asr_path)
 
@@ -198,17 +198,17 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
             else ""
         )
     )
+    ttk.Label(frame, text="声音").grid(row=2, column=0, sticky="w", pady=4)
     voice_row = ttk.Frame(frame)
-    voice_row.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(10, 6))
-    ttk.Label(voice_row, text="声音").pack(side="left")
+    voice_row.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=4)
     voice_combo = ttk.Combobox(
         voice_row,
         textvariable=selected_voice,
         values=voice_names,
         state="readonly",
-        width=8,
+        width=12,
     )
-    voice_combo.pack(side="left", padx=(10, 0))
+    voice_combo.pack(side="left")
 
     def show_import_dialog() -> None:
         importer = tk.Toplevel(dialog)
@@ -221,13 +221,18 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         content.pack(fill="both", expand=True)
         media = tk.StringVar()
         text = tk.StringVar()
+        name = tk.StringVar()
         ttk.Label(content, text="音频或视频文件").grid(row=0, column=0, sticky="w", pady=6)
         ttk.Entry(content, textvariable=media, width=55).grid(
             row=0, column=1, sticky="ew", padx=(10, 8), pady=6
         )
-        ttk.Label(content, text="对应文本文件").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(content, text="文本或字幕文件").grid(row=1, column=0, sticky="w", pady=6)
         ttk.Entry(content, textvariable=text, width=55).grid(
             row=1, column=1, sticky="ew", padx=(10, 8), pady=6
+        )
+        ttk.Label(content, text="声音名称").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(content, textvariable=name, width=55).grid(
+            row=2, column=1, sticky="ew", padx=(10, 8), pady=6
         )
 
         def browse_media() -> None:
@@ -241,6 +246,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
             )
             if selected:
                 media.set(selected)
+                name.set(Path(selected).stem)
 
         def browse_text() -> None:
             selected = filedialog.askopenfilename(
@@ -257,7 +263,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         ttk.Button(content, text="选择", command=browse_media).grid(row=0, column=2, pady=6)
         ttk.Button(content, text="选择", command=browse_text).grid(row=1, column=2, pady=6)
         actions = ttk.Frame(content)
-        actions.grid(row=2, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        actions.grid(row=3, column=0, columnspan=3, sticky="e", pady=(10, 0))
         import_button = ttk.Button(actions, text="导入")
         import_button.pack(side="left")
 
@@ -275,9 +281,14 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
                 messagebox.showerror("导入失败", str(error), parent=importer)
 
         def start_import() -> None:
-            if not media.get().strip() or not text.get().strip():
+            media_path = media.get().strip()
+            text_path = text.get().strip()
+            sample_name = name.get().strip()
+            if not media_path or not text_path or not sample_name:
                 messagebox.showwarning(
-                    "信息不完整", "请选择媒体文件和对应文本文件。", parent=importer
+                    "信息不完整",
+                    "请选择媒体文件、文本或字幕文件，并填写声音名称。",
+                    parent=importer,
                 )
                 return
             import_button.configure(state="disabled")
@@ -285,8 +296,8 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
             def worker() -> None:
                 try:
                     sample = import_voice_sample(
-                        media.get(),
-                        text.get(),
+                        media_path,
+                        text_path,
                         app.config_data.ffmpeg_path,
                         ProcessRunner(
                             lambda line: app.after(
@@ -294,6 +305,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
                                 lambda message=line: app._append_log(message),
                             )
                         ),
+                        name=sample_name,
                     )
                     app.after(0, lambda: finish(sample.name))
                 except Exception as exc:
@@ -305,8 +317,9 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         importer.update_idletasks()
         app._center_dialog(importer, max(640, importer.winfo_reqwidth()), importer.winfo_reqheight())
 
-    ttk.Button(frame, text="导入声音", command=show_import_dialog).grid(
-        row=2, column=2, sticky="e", pady=(10, 6)
+    ttk.Button(voice_row, text="导入声音", command=show_import_dialog).pack(
+        side="left",
+        padx=(6, 0),
     )
 
     if not models:
@@ -314,7 +327,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
             frame,
             text="当前清单中没有已下载模型，请先打开“语音模型管理”。",
             foreground="#9a3412",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def apply_model(kind: str, model: InstalledModel | None) -> None:
         prefix = "asr" if kind == "asr" else "tts"
@@ -336,11 +349,11 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         dialog.destroy()
 
     actions = ttk.Frame(frame)
-    actions.grid(row=4, column=0, columnspan=3, sticky="e", pady=(14, 0))
+    actions.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
     ttk.Button(actions, text="保存", command=save).pack(side="left")
     frame.columnconfigure(1, weight=1)
     dialog.update_idletasks()
-    app._center_dialog(dialog, 760, dialog.winfo_reqheight())
+    app._center_dialog(dialog, 700, dialog.winfo_reqheight())
 
 
 def show_model_manager_dialog(app: ModelDialogHost) -> None:
@@ -349,11 +362,21 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     dialog.title("语音模型管理")
     dialog.transient(app)
     dialog.grab_set()
+    dialog.minsize(760, 480)
     frame = ttk.Frame(dialog, padding=14)
     frame.pack(fill="both", expand=True)
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(1, weight=3, uniform="model-manager-content")
+    frame.rowconfigure(2, weight=2, uniform="model-manager-content")
+    style = ttk.Style(dialog)
+    style.map(
+        "ModelManager.Treeview",
+        background=[("selected", "#005a9e")],
+        foreground=[("selected", "#ffffff")],
+    )
 
     download_frame = ttk.LabelFrame(frame, text="下载管理", padding=12)
-    download_frame.pack(fill="both", expand=True)
+    download_frame.grid(row=0, column=0, sticky="ew")
     platform_name = tk.StringVar(value="Hugging Face")
     repo_id = tk.StringVar()
     ttk.Label(download_frame, text="模型平台").grid(row=0, column=0, sticky="w", pady=4)
@@ -370,14 +393,18 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     )
     download_button = ttk.Button(download_frame, text="下载")
     download_button.grid(row=1, column=2, sticky="e", pady=4)
-    ttk.Label(download_frame, text="已下载模型").grid(
-        row=2, column=0, columnspan=3, sticky="w", pady=(12, 4)
-    )
+    download_frame.columnconfigure(1, weight=1)
+
+    model_frame = ttk.LabelFrame(frame, text="已下载模型", padding=8)
+    model_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+    model_frame.columnconfigure(0, weight=1)
+    model_frame.rowconfigure(0, weight=1)
     tree = ttk.Treeview(
-        download_frame,
+        model_frame,
         columns=("platform", "model", "backend", "path"),
         show="headings",
-        height=7,
+        height=6,
+        style="ModelManager.Treeview",
     )
     tree.heading("platform", text="平台")
     tree.heading("model", text="模型")
@@ -387,23 +414,24 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     tree.column("model", width=240, stretch=False)
     tree.column("backend", width=65, stretch=False)
     tree.column("path", width=360, stretch=True)
-    tree.grid(row=3, column=0, columnspan=3, sticky="nsew")
-    uninstall_button = ttk.Button(download_frame, text="卸载", state="disabled")
-    uninstall_button.grid(row=4, column=0, columnspan=3, sticky="e", pady=(9, 0))
-    download_frame.columnconfigure(1, weight=1)
-    download_frame.rowconfigure(3, weight=1)
+    tree.grid(row=0, column=0, sticky="nsew")
+    uninstall_button = ttk.Button(model_frame, text="卸载", state="disabled")
+    uninstall_button.grid(row=1, column=0, sticky="e", pady=(7, 0))
 
-    ttk.Label(frame, text="下载命令输出").pack(anchor="w", pady=(12, 4))
+    log_frame = ttk.LabelFrame(frame, text="下载命令输出", padding=8)
+    log_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+    log_frame.columnconfigure(0, weight=1)
+    log_frame.rowconfigure(0, weight=1)
     log = tk.Text(
-        frame,
-        height=11,
+        log_frame,
+        height=6,
         state="disabled",
         wrap="word",
         font=(app.mono_font, 9),
         background="#111827",
         foreground="#e5e7eb",
     )
-    log.pack(fill="both", expand=True)
+    log.grid(row=0, column=0, sticky="nsew")
     rows: dict[str, InstalledModel] = {}
     state: dict[str, object] = {"busy": False, "runner": None}
     progress_active = False
@@ -452,6 +480,14 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     def selected_model() -> InstalledModel | None:
         selected = tree.selection()
         return rows.get(selected[0]) if selected else None
+
+    def clear_selection_on_blank(event: tk.Event) -> str | None:
+        if tree.identify_row(event.y):
+            return None
+        tree.selection_remove(*tree.selection())
+        uninstall_button.configure(state="disabled")
+        dialog.focus_set()
+        return "break"
 
     def set_busy(busy: bool, runner: ProcessRunner | None = None) -> None:
         state["busy"] = busy
@@ -639,6 +675,7 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
             state="normal" if selected_model() and not state.get("busy") else "disabled"
         ),
     )
+    tree.bind("<Button-1>", clear_selection_on_blank, add="+")
     download_button.configure(command=start_download)
     uninstall_button.configure(command=start_uninstall)
     dialog.protocol("WM_DELETE_WINDOW", close)

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import unittest
 from unittest.mock import patch
 
 from videodub.config import AppConfig
 from videodub.dependencies import (
-    check_dependency_updates,
     inspect_dependency_versions,
+    update_dependencies,
 )
 
 
@@ -55,21 +54,8 @@ class DependencyTests(unittest.TestCase):
             ],
         )
 
-    def test_macos_update_check_uses_homebrew_for_both_dependencies(self) -> None:
-        runner = FakeRunner(
-            {
-                "/opt/homebrew/bin/brew": [
-                    json.dumps(
-                        {
-                            "formulae": [
-                                {"name": "ffmpeg", "current_version": "8.0"},
-                                {"name": "yt-dlp", "current_version": "2026.09.20"},
-                            ]
-                        }
-                    )
-                ]
-            }
-        )
+    def test_macos_startup_update_uses_homebrew_for_both_dependencies(self) -> None:
+        runner = FakeRunner()
         with (
             patch(
                 "videodub.dependencies.resolve_executable",
@@ -77,36 +63,36 @@ class DependencyTests(unittest.TestCase):
             ),
             patch("videodub.dependencies.executable_exists", return_value=True),
         ):
-            result = check_dependency_updates(runner, platform_name="darwin")  # type: ignore[arg-type]
+            result = update_dependencies(runner, platform_name="darwin")  # type: ignore[arg-type]
 
-        self.assertIn("ffmpeg", result)
-        self.assertIn("yt-dlp", result)
+        self.assertIn("自动更新完成", result)
         self.assertEqual(
             runner.commands[0],
             [
                 "/opt/homebrew/bin/brew",
-                "outdated",
+                "upgrade",
                 "--formula",
-                "--json=v2",
-                "yt-dlp",
+                "--no-ask",
                 "ffmpeg",
+                "yt-dlp",
             ],
         )
 
-    def test_windows_update_check_lists_updates_without_installing(self) -> None:
-        runner = FakeRunner({"winget.exe": ["yt-dlp yt-dlp.yt-dlp 1 2"]})
+    def test_windows_startup_updates_both_dependencies_with_winget(self) -> None:
+        runner = FakeRunner()
         with (
             patch("videodub.dependencies.resolve_executable", return_value="winget.exe"),
             patch("videodub.dependencies.executable_exists", return_value=True),
         ):
-            result = check_dependency_updates(runner, platform_name="windows")  # type: ignore[arg-type]
+            result = update_dependencies(runner, platform_name="windows")  # type: ignore[arg-type]
 
-        self.assertEqual(len(runner.commands), 1)
-        self.assertNotIn("--id", runner.commands[0])
-        self.assertEqual(runner.commands[0][1:3], ["list", "--upgrade-available"])
-        self.assertNotIn("install", runner.commands[0])
-        self.assertIn("yt-dlp", result)
-        self.assertIn("winget", result)
+        self.assertEqual(len(runner.commands), 2)
+        self.assertEqual(runner.commands[0][1:5], ["upgrade", "--id", "Gyan.FFmpeg", "--exact"])
+        self.assertEqual(runner.commands[1][1:5], ["upgrade", "--id", "yt-dlp.yt-dlp", "--exact"])
+        for command in runner.commands:
+            self.assertIn("--silent", command)
+            self.assertIn("--disable-interactivity", command)
+        self.assertIn("自动更新完成", result)
 
 
 if __name__ == "__main__":

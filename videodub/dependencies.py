@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 from dataclasses import dataclass
@@ -59,75 +58,62 @@ def inspect_dependency_versions(
     return DependencyVersions(yt_dlp, ffmpeg, ffprobe)
 
 
-def _check_homebrew_updates(runner: ProcessRunner) -> str:
+def _update_homebrew_dependencies(runner: ProcessRunner) -> str:
     brew = resolve_executable("brew", "brew")
     if not executable_exists(brew):
-        return "依赖更新：未找到 Homebrew，无法检查 ffmpeg 与 yt-dlp。"
-    lines = runner.run(
-        [brew, "outdated", "--formula", "--json=v2", "yt-dlp", "ffmpeg"],
-        quiet=True,
-    )
+        return "依赖自动更新：未找到 Homebrew，已跳过 ffmpeg 与 yt-dlp。"
     try:
-        payload = json.loads("\n".join(lines) or "{}")
-        formulae = payload.get("formulae", [])
-        outdated = {
-            str(item.get("name")): str(item.get("current_version") or "有新版本")
-            for item in formulae
-            if isinstance(item, dict) and item.get("name")
-        }
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"无法解析 Homebrew 更新结果：{exc}") from exc
-    if not outdated:
-        return "依赖更新：Homebrew 中的 ffmpeg、yt-dlp 已是最新。"
-    details = "；".join(
-        f"{name} → {outdated[name]}"
-        for name in ("ffmpeg", "yt-dlp")
-        if name in outdated
-    )
-    return f"依赖更新：Homebrew 可更新 {details}（运行 brew upgrade ffmpeg yt-dlp）。"
+        runner.run(
+            [brew, "upgrade", "--formula", "--no-ask", "ffmpeg", "yt-dlp"]
+        )
+    except CommandError as exc:
+        return f"依赖自动更新未完成：Homebrew 退出码 {exc.returncode}，详情见运行日志。"
+    return "依赖自动更新完成：Homebrew 已处理 ffmpeg 与 yt-dlp。"
 
 
-def _check_winget_updates(runner: ProcessRunner) -> str:
+def _update_winget_dependencies(runner: ProcessRunner) -> str:
     winget = resolve_executable("winget", "winget")
     if not executable_exists(winget):
-        return "依赖更新：未找到 winget，无法检查 ffmpeg 与 yt-dlp。"
-    command = [
-        winget,
-        "list",
-        "--upgrade-available",
-        "--source",
-        "winget",
-        "--accept-source-agreements",
-        "--disable-interactivity",
-    ]
-    try:
-        lines = runner.run(command)
-    except CommandError as exc:
-        # Some winget versions use a non-zero code when the update list is empty.
-        runner.logger(exc.tail)
-        lines = exc.tail.splitlines()
-    output = "\n".join(lines).lower()
-    available = [
-        name
-        for package_id, name in (
-            ("gyan.ffmpeg", "ffmpeg"),
-            ("yt-dlp.yt-dlp", "yt-dlp"),
+        return "依赖自动更新：未找到 winget，已跳过 ffmpeg 与 yt-dlp。"
+    failed: list[str] = []
+    for package_id, name in (
+        ("Gyan.FFmpeg", "ffmpeg"),
+        ("yt-dlp.yt-dlp", "yt-dlp"),
+    ):
+        try:
+            runner.run(
+                [
+                    winget,
+                    "upgrade",
+                    "--id",
+                    package_id,
+                    "--exact",
+                    "--source",
+                    "winget",
+                    "--silent",
+                    "--accept-source-agreements",
+                    "--accept-package-agreements",
+                    "--disable-interactivity",
+                ]
+            )
+        except CommandError:
+            failed.append(name)
+    if failed:
+        return (
+            "依赖自动更新未完成："
+            f"{', '.join(failed)} 没有可用更新或 winget 执行失败，详情见运行日志。"
         )
-        if package_id in output
-    ]
-    if available:
-        return f"依赖更新：winget 可更新 {', '.join(available)}，详情见运行日志。"
-    return "依赖更新：winget 未列出 ffmpeg 或 yt-dlp 的可用更新。"
+    return "依赖自动更新完成：winget 已处理 ffmpeg 与 yt-dlp。"
 
 
-def check_dependency_updates(
+def update_dependencies(
     runner: ProcessRunner,
     *,
     platform_name: str | None = None,
 ) -> str:
     current = platform_name or ("windows" if os.name == "nt" else sys.platform)
     if current == "darwin":
-        return _check_homebrew_updates(runner)
+        return _update_homebrew_dependencies(runner)
     if current in {"nt", "win32", "windows"}:
-        return _check_winget_updates(runner)
-    return "依赖更新：当前平台未配置包管理器检查，请手动更新 ffmpeg 与 yt-dlp。"
+        return _update_winget_dependencies(runner)
+    return "依赖自动更新：当前平台未配置包管理器，请手动更新 ffmpeg 与 yt-dlp。"

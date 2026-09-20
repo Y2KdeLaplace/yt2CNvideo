@@ -40,10 +40,12 @@ def job_status_values(
     )
 
 
-def build_processing_tab(app: Any) -> None:
+def build_processing_section(app: Any, parent: ttk.Frame) -> None:
     """Build the four-stage processing UI against the host application."""
-    selection = ttk.LabelFrame(app.process_tab, text="选择视频", padding=8)
-    selection.pack(fill="x")
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=1)
+    selection = ttk.LabelFrame(parent, text="选择视频", padding=8)
+    selection.grid(row=0, column=0, sticky="nsew")
     app.refresh_jobs_button = ttk.Button(
         selection,
         text="刷新",
@@ -57,7 +59,7 @@ def build_processing_tab(app: Any) -> None:
         columns=PROCESS_COLUMNS,
         show="headings",
         selectmode="extended",
-        height=10,
+        height=9,
     )
     labels = {
         "video": "视频/字幕名",
@@ -86,8 +88,8 @@ def build_processing_tab(app: Any) -> None:
     app.job_tree.pack(side="left", fill="both", expand=True)
     scroll.pack(side="right", fill="y")
 
-    controls = ttk.Frame(app.process_tab)
-    controls.pack(fill="x", pady=(10, 0))
+    controls = ttk.Frame(parent)
+    controls.grid(row=1, column=0, sticky="ew", pady=(10, 0))
     app.extract_check = ttk.Checkbutton(
         controls,
         text="提取",

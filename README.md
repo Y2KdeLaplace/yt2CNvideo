@@ -60,7 +60,7 @@ ffmpeg -version
 ffprobe -version
 ```
 
-软件每次启动都会在后台检查这三个命令并在运行日志显示实际版本。顶部“关于 → 更新”除检查 scip 的 GitHub Release 外，还会按平台使用 Homebrew（macOS）或 winget（Windows）检查 ffmpeg 与 yt-dlp；它只报告结果，不会静默升级系统软件。
+软件每次启动都会在后台自动更新 ffmpeg 与 yt-dlp，然后检查 ffmpeg、ffprobe 和 yt-dlp 三个命令并在运行日志显示实际版本。macOS 执行非交互式 `brew upgrade --formula --no-ask ffmpeg yt-dlp`；Windows 分别执行上述两个 `winget upgrade` 命令。顶部“关于 → 更新”只检查 scip 的 GitHub Release，不处理系统依赖。
 
 ```bash
 uv sync
@@ -79,13 +79,13 @@ uv run scip
 
 - “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入系统用户配置目录中的 `settings.json`。
 - “语音模型”：从本地模型清单分别选择语音识别模型和语音生成模型。同一个模型不能同时用于两项，在另一个选择栏中会显示为不可选。声音列表实时读取项目的 `sample_voice` 文件夹，也可以导入新的样本声音。
-- “语音模型管理”：选择 Hugging Face 或 ModelScope，输入 `owner/model` 后下载；窗口上半部管理下载与卸载，下半部显示下载命令输出。
+- “语音模型管理”：选择 Hugging Face 或 ModelScope，输入 `owner/model` 后下载；窗口上半部管理下载与卸载，下半部显示下载命令输出。调整窗口高度时，模型列表和命令输出按约 6:4 的比例同步伸缩。
 
 下载完成后，程序把平台、仓库名、运行后端、实际缓存路径和辅助模型路径写入应用缓存下的 `model-management/models.json`。语音模型列表只读取这份清单；首次升级时会把能够识别的旧缓存模型导入清单。卸载会删除对应平台缓存中的模型仓库，并同步删除清单记录。模型仍保存在 Hugging Face 与 ModelScope 各自的标准缓存位置，不会被移动到项目中。
 
 Hugging Face 保留原有的抗网络限制下载链路：先用官方 `hf download`，失败后依次尝试镜像与 hfd。名称含 GGUF 的 Hugging Face 仓库会先检查文件：单一 GGUF 自动选择，多个量化版本由用户选择，分片 GGUF 成组下载。ModelScope 使用官方 `modelscope download --model owner/model`。下载过程会在管理窗口持续输出日志；下载失败或停止时会清理本次产生的不完整 Hugging Face 模型目录，避免它被误认为可用模型。
 
-导入声音时，第一行可选择常见音频或视频格式，第二行选择常见文本文件。WAV 直接复制；其他音频会转为 24 kHz 单声道 WAV，视频等非音频文件由 ffmpeg 提取音轨。导入结果写入 `sample_voice/<样本名>/`，随后立即出现在声音列表中。
+导入声音时，第一行可选择常见音频或视频格式，第二行选择 TXT、SRT、VTT 等文本或字幕文件，第三行填写声音名称；选择媒体后会自动用不含扩展名的文件名填充名称。所有媒体都由 ffmpeg 统一生成 24 kHz 单声道 PCM WAV，字幕文件只提取实际台词，不保留序号与时间轴。音频和 UTF-8 文本写入 `sample_voice/<声音名称>/`，便于 TTS 直接读取，随后立即出现在声音列表中。
 
 在中国大陆网络环境中，下载非 Qwen 官方的 Hugging Face 模型前可设置镜像：
 
@@ -187,7 +187,7 @@ work/
 - 翻译字幕
 - 配音完成
 
-按行选择一个或多个视频，再组合“提取、修复、翻译、配音”四个步骤。四项默认开启；表格右键菜单可以全选。开启“并行处理”后，可填写一个大于 1 的正整数，同时处理指定数量的视频。运行按钮在任务开始后变为停止按钮。所有标签页共用窗口底部的运行日志，切换标签页或开始新任务都不会清空，任务之间以 `==` 分隔。
+按行选择一个或多个视频，再组合“提取、修复、翻译、配音”四个步骤。四项默认开启；表格右键菜单可以全选。开启“并行处理”后，可填写一个大于 1 的正整数，同时处理指定数量的视频。运行按钮在任务开始后变为停止按钮。下载与处理区域共用窗口底部的运行日志，开始新任务不会清空，任务之间以 `==` 分隔。
 
 ASR 不需要先生成 MP3。程序让 ffmpeg 直接把视频音轨解码为临时的 16 kHz 单声道无损 WAV，识别结束即删除。
 
@@ -207,13 +207,13 @@ MLX 空 iterable 转为明确错误，不再穿透 `StopIteration`。生成最�
 
 ## 更新与版本
 
-顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”读取本项目 GitHub 最新 Release 并比较版本号，同时通过 macOS Homebrew 或 Windows winget 检查 ffmpeg 与 yt-dlp。检查不会自动安装更新，日志会给出对应的升级命令或 winget 检查结果。
+顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”只读取本项目 GitHub 最新 Release 并比较版本号。ffmpeg 与 yt-dlp 由软件启动后的后台任务按平台自动更新，不占用“更新”菜单。
 
 ## 代码结构
 
-视频下载功能集中在 `videodub/video_download/`：`ui.py` 是下载页界面，`backend.py` 是 yt-dlp 命令、字幕回退、任务发现和失败清理。`videodub/downloader.py` 只保留旧导入路径兼容。该目录只依赖少量项目公共类型，单独取出后替换配置和任务类型即可改造成简单的 yt-dlp 下载 GUI。
+视频下载功能集中在 `videodub/video_download/`：`ui.py` 是主窗口中的下载区域，`backend.py` 是 yt-dlp 命令、字幕回退、任务发现和失败清理。`videodub/downloader.py` 只保留旧导入路径兼容。该目录只依赖少量项目公共类型，单独取出后替换配置和任务类型即可改造成简单的 yt-dlp 下载 GUI。
 
-处理功能集中在 `videodub/processing/`：`ui.py` 管理处理页和状态表格，`extract.py`、`repair.py`、`translate.py`、`dubbing.py` 分别承接提取、修复、翻译和配音四阶段。`videodub/ui.py` 负责整个窗口、线程调度以及对这些后端阶段的调用；严格时间轴、模型服务和媒体算法仍由项目公共模块提供。
+处理功能集中在 `videodub/processing/`：`ui.py` 管理主窗口中的处理区域和状态表格，`extract.py`、`repair.py`、`translate.py`、`dubbing.py` 分别承接提取、修复、翻译和配音四阶段。`videodub/ui.py` 负责整个窗口、线程调度以及对这些后端阶段的调用；严格时间轴、模型服务和媒体算法仍由项目公共模块提供。
 
 ## 开发验证
 

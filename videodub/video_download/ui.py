@@ -5,12 +5,16 @@ from tkinter import ttk
 from typing import Any
 
 
-def build_download_tab(app: Any) -> None:
+def build_download_section(app: Any, parent: ttk.Frame) -> None:
     """Build the download feature UI against the host application."""
-    link_box = ttk.LabelFrame(app.download_tab, text="链接", padding=10)
-    link_box.pack(fill="x")
-    app.url_text = tk.Text(link_box, height=8, wrap="word")
-    app.url_text.pack(fill="x")
+    parent.columnconfigure(0, weight=3)
+    parent.columnconfigure(1, weight=2)
+    parent.rowconfigure(0, weight=1)
+
+    link_box = ttk.LabelFrame(parent, text="链接", padding=10)
+    link_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    app.url_text = tk.Text(link_box, height=4, wrap="word")
+    app.url_text.pack(fill="both", expand=True)
     app.url_placeholder = ttk.Label(
         app.url_text,
         text="粘贴一个或多个 YouTube 视频或播放列表链接，每行一个",
@@ -23,8 +27,8 @@ def build_download_tab(app: Any) -> None:
     app.url_text.bind("<Button-3>", app._show_url_menu)
     app.url_text.bind("<Button-2>", app._show_url_menu)
 
-    settings = ttk.LabelFrame(app.download_tab, text="下载设置", padding=10)
-    settings.pack(fill="x", pady=(10, 0))
+    settings = ttk.LabelFrame(parent, text="下载设置", padding=10)
+    settings.grid(row=0, column=1, sticky="nsew")
     ttk.Radiobutton(
         settings,
         text="单个视频",
@@ -51,13 +55,17 @@ def build_download_tab(app: Any) -> None:
         padx=(10, 0),
         pady=(9, 0),
     )
-    settings.columnconfigure(3, weight=1)
-    controls = ttk.Frame(app.download_tab)
-    controls.pack(fill="x", pady=(10, 0))
+    settings.columnconfigure(1, weight=1)
     app.download_button = ttk.Button(
-        controls,
+        settings,
         text="下载",
         command=app._start_download,
         style="Main.TButton",
     )
-    app.download_button.pack(side="right")
+    app.download_button.grid(
+        row=2,
+        column=0,
+        columnspan=4,
+        sticky="e",
+        pady=(10, 0),
+    )

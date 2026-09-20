@@ -12,6 +12,11 @@ from unittest.mock import Mock, patch
 from videodub.ui import VideoDubApp
 from videodub.config import AppConfig
 from videodub.media import VideoJob
+from videodub.model_management.dialogs import (
+    show_model_manager_dialog,
+    show_speech_model_dialog,
+)
+from videodub.processing.ui import build_processing_section
 from videodub.runner import CancelledError, ProcessRunner
 
 
@@ -114,6 +119,14 @@ class VideoSelectionTests(unittest.TestCase):
         VideoDubApp._check_gui_heartbeat(app, now=12.9)
 
         app._emit_watchdog_event.assert_not_called()
+
+    def test_configure_event_counts_as_gui_activity(self) -> None:
+        app = SimpleNamespace(_last_gui_heartbeat=10.0)
+
+        with patch("videodub.ui.time.monotonic", return_value=14.5):
+            VideoDubApp._note_gui_activity(app)
+
+        self.assertEqual(app._last_gui_heartbeat, 14.5)
 
     def test_gui_stall_logs_once_and_then_logs_recovery(self) -> None:
         app = SimpleNamespace(
@@ -249,29 +262,109 @@ class VideoSelectionTests(unittest.TestCase):
                 any("已跳过语音提取" in str(message) for message in messages)
             )
 
-    def test_entering_process_tab_clears_the_selection(self) -> None:
-        tree = Mock()
-        tree.selection.return_value = ("1", "2")
+    def test_main_ui_uses_one_continuous_workspace(self) -> None:
+        source = inspect.getsource(VideoDubApp._build_ui)
+
+        self.assertNotIn("ttk.Notebook", source)
+        self.assertNotIn("NotebookTabChanged", source)
+        self.assertLess(
+            source.index("self._build_download_section"),
+            source.index("self._build_processing_section"),
+        )
+        self.assertFalse(hasattr(VideoDubApp, "_on_tab_changed"))
+
+    def test_main_table_and_log_are_both_resizable(self) -> None:
+        main_source = inspect.getsource(VideoDubApp._build_ui)
+        process_source = inspect.getsource(build_processing_section)
+
+        self.assertIn('rowconfigure(2, weight=2, uniform="main-resizable-content")', main_source)
+        self.assertIn('rowconfigure(3, weight=1, uniform="main-resizable-content")', main_source)
+        self.assertIn("height=9", main_source)
+        self.assertIn("height=9", process_source)
+
+    def test_model_manager_uses_six_to_four_resizable_regions(self) -> None:
+        source = inspect.getsource(show_model_manager_dialog)
+
+        self.assertIn('rowconfigure(1, weight=3, uniform="model-manager-content")', source)
+        self.assertIn('rowconfigure(2, weight=2, uniform="model-manager-content")', source)
+        self.assertIn("dialog.minsize(760, 480)", source)
+
+    def test_voice_import_dialog_has_name_and_subtitle_fields(self) -> None:
+        source = inspect.getsource(show_speech_model_dialog)
+
+        self.assertIn('text="文本或字幕文件"', source)
+        self.assertIn('text="声音名称"', source)
+        self.assertIn("name=sample_name", source)
+
+    def test_model_dialog_waits_until_the_menu_has_closed(self) -> None:
+        pending: list[object] = []
+        button = Mock()
+        opener = Mock()
         app = SimpleNamespace(
-            job_tree=tree,
-            notebook=SimpleNamespace(select=Mock(return_value=".process")),
-            process_tab=".process",
-            _refresh_jobs=Mock(),
-            after_idle=Mock(),
-            _resize_notebook_to_current_tab=Mock(),
-            focus_set=Mock(),
+            model_menu_button=button,
+            after_idle=lambda callback: pending.append(callback),
         )
 
-        VideoDubApp._on_tab_changed(app)
+        VideoDubApp._defer_model_dialog(app, opener)
 
-        app._refresh_jobs.assert_called_once_with()
-        tree.selection_remove.assert_called_once_with("1", "2")
+        opener.assert_not_called()
+        self.assertEqual(len(pending), 1)
+        pending[0]()
+        button.state.assert_called_once_with(("!pressed", "!active"))
+        opener.assert_called_once_with(app)
+
+    def test_clicking_blank_window_space_clears_control_focus(self) -> None:
+        window = Mock()
+        widget = Mock()
+        widget.winfo_class.return_value = "TFrame"
+        widget.winfo_toplevel.return_value = window
+
+        VideoDubApp._clear_focus_on_blank_click(
+            SimpleNamespace(),
+            SimpleNamespace(widget=widget),
+        )
+
+        window.focus_set.assert_called_once_with()
+
+    def test_clicking_an_input_does_not_clear_its_focus(self) -> None:
+        widget = Mock()
+        widget.winfo_class.return_value = "TEntry"
+
+        VideoDubApp._clear_focus_on_blank_click(
+            SimpleNamespace(),
+            SimpleNamespace(widget=widget),
+        )
+
+        widget.winfo_toplevel.assert_not_called()
+
+    def test_cache_cascade_click_keeps_the_menu_open(self) -> None:
+        menu = Mock()
+        menu.index.return_value = 2
+        menu.type.return_value = "cascade"
+        menu._w = ".about"
+
+        result = VideoDubApp._keep_cascade_open(
+            SimpleNamespace(),
+            menu,
+            SimpleNamespace(y=40),
+        )
+
+        self.assertEqual(result, "break")
+        menu.activate.assert_called_once_with(2)
+        menu.tk.call.assert_called_once_with(".about", "postcascade", 2)
+
+    def test_dependency_updates_run_at_startup_not_from_about_menu(self) -> None:
+        startup_source = inspect.getsource(VideoDubApp._check_tools)
+        menu_source = inspect.getsource(VideoDubApp._check_update)
+
+        self.assertIn("update_dependencies", startup_source)
+        self.assertNotIn("update_dependencies", menu_source)
 
     def test_clicking_blank_space_clears_the_selection(self) -> None:
         tree = Mock()
         tree.identify_row.return_value = ""
         tree.selection.return_value = ("1", "2")
-        app = SimpleNamespace(job_tree=tree)
+        app = SimpleNamespace(job_tree=tree, focus_set=Mock())
 
         result = VideoDubApp._clear_job_selection_on_blank(
             app,
@@ -280,6 +373,7 @@ class VideoSelectionTests(unittest.TestCase):
 
         self.assertEqual(result, "break")
         tree.selection_remove.assert_called_once_with("1", "2")
+        app.focus_set.assert_called_once_with()
 
     def test_clicking_a_row_keeps_the_default_single_select_behavior(self) -> None:
         tree = Mock()

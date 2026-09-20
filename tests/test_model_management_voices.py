@@ -40,7 +40,7 @@ class VoiceSampleTests(unittest.TestCase):
             text = source / "speaker.md"
             text.write_text("测试声音。", encoding="utf-8")
             samples = root / "samples"
-            runner = RecordingRunner()
+            runner = RecordingRunner(create_output=True)
 
             imported = import_voice_sample(
                 audio,
@@ -53,7 +53,8 @@ class VoiceSampleTests(unittest.TestCase):
             self.assertEqual(imported.name, "speaker")
             self.assertTrue(imported.audio_path.is_file())
             self.assertEqual(imported.text_path.read_text(encoding="utf-8"), "测试声音。\n")
-            self.assertEqual(runner.commands, [])
+            self.assertEqual(runner.commands[0][0], "ffmpeg")
+            self.assertIn("pcm_s16le", runner.commands[0])
             self.assertEqual(list_voice_samples(samples), [imported])
 
     def test_video_import_extracts_audio_with_ffmpeg(self) -> None:
@@ -80,6 +81,54 @@ class VoiceSampleTests(unittest.TestCase):
             self.assertIn("0:a:0", command)
             self.assertIn("-vn", command)
             self.assertTrue(any("提取音频" in message for message in runner.logs))
+
+    def test_subtitle_text_is_extracted_and_custom_name_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            media = root / "original-name.m4a"
+            media.write_bytes(b"audio")
+            subtitles = root / "reference.srt"
+            subtitles.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n你好。\n\n"
+                "2\n00:00:01,000 --> 00:00:02,000\n欢迎回来。\n",
+                encoding="utf-8",
+            )
+            runner = RecordingRunner(create_output=True)
+
+            imported = import_voice_sample(
+                media,
+                subtitles,
+                "ffmpeg",
+                runner,
+                name="我的声音",
+                root=root / "samples",
+            )
+
+            self.assertEqual(imported.name, "我的声音")
+            self.assertEqual(
+                imported.text_path.read_text(encoding="utf-8"),
+                "你好。欢迎回来。\n",
+            )
+
+    def test_missing_ffmpeg_output_does_not_leave_a_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            media = root / "clip.mp4"
+            media.write_bytes(b"video")
+            text = root / "clip.txt"
+            text.write_text("reference", encoding="utf-8")
+            samples = root / "samples"
+
+            with self.assertRaisesRegex(RuntimeError, "没有生成有效的 WAV"):
+                import_voice_sample(
+                    media,
+                    text,
+                    "ffmpeg",
+                    RecordingRunner(),
+                    root=samples,
+                )
+
+            self.assertEqual(list(samples.iterdir()), [])
 
 
 if __name__ == "__main__":
