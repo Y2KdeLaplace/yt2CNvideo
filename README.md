@@ -23,8 +23,44 @@ ASR 不会被当作 YouTube 字幕缺失时的自动后备。修复步骤同时�
 
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.10 或更高版本，并带 Tk
-- yt-dlp
-- ffmpeg 与 ffprobe
+- yt-dlp（下载视频与字幕）
+- ffmpeg 与 ffprobe（ffprobe 随 ffmpeg 一起安装）
+
+macOS 推荐统一通过 [Homebrew](https://brew.sh/) 安装依赖；官方 formula 名称分别是 [yt-dlp](https://formulae.brew.sh/formula/yt-dlp) 和 [ffmpeg](https://formulae.brew.sh/formula/ffmpeg)：
+
+```bash
+brew install yt-dlp ffmpeg
+```
+
+以后可用下面的命令手动升级：
+
+```bash
+brew upgrade yt-dlp ffmpeg
+```
+
+Windows 推荐使用系统自带或从 Microsoft Store 安装的 [winget](https://learn.microsoft.com/windows/package-manager/winget/)：
+
+```powershell
+winget install --id yt-dlp.yt-dlp --exact --source winget
+winget install --id Gyan.FFmpeg --exact --source winget
+```
+
+安装后重新打开终端或软件。以后可用下面的命令手动升级：
+
+```powershell
+winget upgrade --id yt-dlp.yt-dlp --exact --source winget
+winget upgrade --id Gyan.FFmpeg --exact --source winget
+```
+
+两个平台都可以在终端确认程序是否已进入 PATH：
+
+```text
+yt-dlp --version
+ffmpeg -version
+ffprobe -version
+```
+
+软件每次启动都会在后台检查这三个命令并在运行日志显示实际版本。顶部“关于 → 更新”除检查 scip 的 GitHub Release 外，还会按平台使用 Homebrew（macOS）或 winget（Windows）检查 ffmpeg 与 yt-dlp；它只报告结果，不会静默升级系统软件。
 
 ```bash
 uv sync
@@ -148,7 +184,8 @@ work/
 - 下载字幕
 - 识别字幕
 - 修复字幕
-- 中文字幕
+- 翻译字幕
+- 配音完成
 
 按行选择一个或多个视频，再组合“提取、修复、翻译、配音”四个步骤。四项默认开启；表格右键菜单可以全选。开启“并行处理”后，可填写一个大于 1 的正整数，同时处理指定数量的视频。运行按钮在任务开始后变为停止按钮。所有标签页共用窗口底部的运行日志，切换标签页或开始新任务都不会清空，任务之间以 `==` 分隔。
 
@@ -170,7 +207,13 @@ MLX 空 iterable 转为明确错误，不再穿透 `StopIteration`。生成最�
 
 ## 更新与版本
 
-顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”读取本项目 GitHub 最新 Release 并比较版本号。
+顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”读取本项目 GitHub 最新 Release 并比较版本号，同时通过 macOS Homebrew 或 Windows winget 检查 ffmpeg 与 yt-dlp。检查不会自动安装更新，日志会给出对应的升级命令或 winget 检查结果。
+
+## 代码结构
+
+视频下载功能集中在 `videodub/video_download/`：`ui.py` 是下载页界面，`backend.py` 是 yt-dlp 命令、字幕回退、任务发现和失败清理。`videodub/downloader.py` 只保留旧导入路径兼容。该目录只依赖少量项目公共类型，单独取出后替换配置和任务类型即可改造成简单的 yt-dlp 下载 GUI。
+
+处理功能集中在 `videodub/processing/`：`ui.py` 管理处理页和状态表格，`extract.py`、`repair.py`、`translate.py`、`dubbing.py` 分别承接提取、修复、翻译和配音四阶段。`videodub/ui.py` 负责整个窗口、线程调度以及对这些后端阶段的调用；严格时间轴、模型服务和媒体算法仍由项目公共模块提供。
 
 ## 开发验证
 

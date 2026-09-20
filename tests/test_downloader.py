@@ -3,9 +3,9 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-import videodub.downloader as downloader_module
+import videodub.video_download.backend as downloader_module
 from videodub.config import AppConfig
-from videodub.downloader import (
+from videodub.video_download import (
     build_download_command,
     cleanup_new_download_directories,
     snapshot_download_directories,

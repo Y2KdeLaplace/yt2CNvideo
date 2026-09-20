@@ -29,11 +29,16 @@ from videodub.config import (
     save_config,
     save_language_model_info,
 )
-from videodub.downloader import (
+from videodub.dependencies import (
+    check_dependency_updates,
+    inspect_dependency_versions,
+)
+from videodub.video_download import (
     cleanup_new_download_directories,
     download,
     snapshot_download_directories,
 )
+from videodub.video_download.ui import build_download_tab
 from videodub.media import VideoJob, discover_video_jobs
 from videodub.model_management import read_installed_model
 from videodub.model_management.dialogs import (
@@ -43,14 +48,17 @@ from videodub.model_management.dialogs import (
 )
 from videodub.model_runtime import ManagedModelService, append_runtime_diagnostic
 from videodub.platform_utils import open_in_file_manager
-from videodub.qwen_speech import (
-    extract_asr_subtitle,
-    resolve_tts_reference,
+from videodub.processing import (
+    run_dubbing_stage,
+    run_extract_stage,
+    run_repair_stage,
+    run_translate_stage,
 )
+from videodub.processing.ui import build_processing_tab, job_status_values
+from videodub.qwen_speech import resolve_tts_reference
 from videodub.runner import CancelledError, ProcessRunner
 from videodub.subtitle_workflow import SubtitleRepairWorkflow
 from videodub.subtitles import find_source_subtitle
-from videodub.tts import dub_video
 
 
 GITHUB_REPOSITORY = "Y2KdeLaplace/yt2CNvideo"
@@ -346,166 +354,10 @@ class VideoDubApp(tk.Tk):
         self.after_idle(self.focus_set)
 
     def _build_download_tab(self) -> None:
-        link_box = ttk.LabelFrame(self.download_tab, text="链接", padding=10)
-        link_box.pack(fill="x")
-        self.url_text = tk.Text(link_box, height=8, wrap="word")
-        self.url_text.pack(fill="x")
-        self.url_placeholder = ttk.Label(
-            self.url_text,
-            text="粘贴一个或多个 YouTube 视频或播放列表链接，每行一个",
-            foreground="#808080",
-        )
-        self.url_placeholder.place(x=7, y=6)
-        self.url_placeholder.bind("<Button-1>", lambda _e: self.url_text.focus_set())
-        self.url_text.bind("<KeyRelease>", self._update_url_placeholder)
-        self.url_text.bind("<FocusIn>", self._update_url_placeholder)
-        self.url_text.bind("<Button-3>", self._show_url_menu)
-        self.url_text.bind("<Button-2>", self._show_url_menu)
-
-        settings = ttk.LabelFrame(self.download_tab, text="下载设置", padding=10)
-        settings.pack(fill="x", pady=(10, 0))
-        ttk.Radiobutton(settings, text="单个视频", variable=self.link_type, value="single").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Radiobutton(settings, text="播放列表", variable=self.link_type, value="playlist").grid(
-            row=0, column=1, sticky="w", padx=(18, 0)
-        )
-        ttk.Label(settings, text="字幕语言").grid(row=1, column=0, sticky="w", pady=(9, 0))
-        ttk.Entry(settings, textvariable=self.subtitle_languages).grid(
-            row=1, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(9, 0)
-        )
-        settings.columnconfigure(3, weight=1)
-        controls = ttk.Frame(self.download_tab)
-        controls.pack(fill="x", pady=(10, 0))
-        self.download_button = ttk.Button(
-            controls,
-            text="下载",
-            command=self._start_download,
-            style="Main.TButton",
-        )
-        self.download_button.pack(side="right")
+        build_download_tab(self)
 
     def _build_process_tab(self) -> None:
-        selection = ttk.LabelFrame(self.process_tab, text="选择视频", padding=8)
-        selection.pack(fill="x")
-        self.refresh_jobs_button = ttk.Button(
-            selection,
-            text="刷新",
-            command=self._refresh_jobs,
-            style="Main.TButton",
-            takefocus=False,
-        )
-        self.refresh_jobs_button.pack(anchor="e", pady=(0, 5))
-        columns = ("video", "downloaded", "asr", "corrected", "chinese")
-        self.job_tree = ttk.Treeview(
-            selection,
-            columns=columns,
-            show="headings",
-            selectmode="extended",
-            height=10,
-        )
-        labels = {
-            "video": "视频/字幕名",
-            "downloaded": "下载字幕",
-            "asr": "识别字幕",
-            "corrected": "修复字幕",
-            "chinese": "翻译字幕",
-        }
-        for key in columns:
-            self.job_tree.heading(key, text=labels[key])
-            self.job_tree.column(key, width=105 if key != "video" else 470, anchor="center" if key != "video" else "w")
-        scroll = ttk.Scrollbar(selection, orient="vertical", command=self.job_tree.yview)
-        self.job_tree.configure(yscrollcommand=scroll.set)
-        self.job_tree.bind("<Button-1>", self._clear_job_selection_on_blank)
-        self.job_tree.bind("<Button-3>", self._show_tree_menu)
-        self.job_tree.bind("<Button-2>", self._show_tree_menu)
-        self.job_tree.bind("<Control-Button-1>", self._toggle_job_selection)
-        self.job_tree.bind("<Command-Button-1>", self._toggle_job_selection)
-        self.job_tree.bind("<Control-a>", self._select_all_jobs)
-        self.job_tree.bind("<Control-A>", self._select_all_jobs)
-        self.job_tree.bind("<Command-a>", self._select_all_jobs)
-        self.job_tree.bind("<Command-A>", self._select_all_jobs)
-        self.job_tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        controls = ttk.Frame(self.process_tab)
-        controls.pack(fill="x", pady=(10, 0))
-        self.extract_check = ttk.Checkbutton(
-            controls,
-            text="提取",
-            variable=self.stage_asr,
-            command=self._update_stage_language_states,
-            style="Stage.TCheckbutton",
-        )
-        self.extract_check.pack(side="left")
-        self.asr_language_combo = ttk.Combobox(
-            controls,
-            textvariable=self.asr_language,
-            values=tuple(SUPPORTED_LANGUAGES),
-            state="readonly",
-            width=7,
-        )
-        self.asr_language_combo.pack(side="left", padx=(5, 14))
-        ttk.Checkbutton(
-            controls,
-            text="修复",
-            variable=self.stage_repair,
-            style="Stage.TCheckbutton",
-        ).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(
-            controls,
-            text="翻译",
-            variable=self.stage_translate,
-            command=self._update_stage_language_states,
-            style="Stage.TCheckbutton",
-        ).pack(side="left")
-        self.translation_language_combo = ttk.Combobox(
-            controls,
-            textvariable=self.translation_language,
-            values=tuple(SUPPORTED_LANGUAGES),
-            state="readonly",
-            width=7,
-        )
-        self.translation_language_combo.pack(side="left", padx=(5, 14))
-        ttk.Checkbutton(
-            controls,
-            text="配音",
-            variable=self.stage_dub,
-            command=self._update_stage_language_states,
-            style="Stage.TCheckbutton",
-        ).pack(side="left")
-        self.tts_language_combo = ttk.Combobox(
-            controls,
-            textvariable=self.tts_language,
-            values=tuple(SUPPORTED_LANGUAGES),
-            state="readonly",
-            width=7,
-        )
-        self.tts_language_combo.pack(side="left", padx=(5, 14))
-        ttk.Checkbutton(
-            controls,
-            text="并行处理",
-            variable=self.parallel_enabled,
-            command=self._update_parallel_state,
-            style="Stage.TCheckbutton",
-        ).pack(side="left", padx=(4, 7))
-        self.parallel_entry = ttk.Entry(
-            controls,
-            textvariable=self.parallel_count,
-            width=5,
-            state="disabled",
-            justify="center",
-        )
-        self.parallel_entry.pack(side="left")
-        self.process_button = ttk.Button(
-            controls,
-            text="运行",
-            command=self._start_processing,
-            style="Main.TButton",
-        )
-        self.process_button.pack(side="right")
-        self._update_stage_language_states()
-        self._refresh_jobs()
+        build_processing_tab(self)
 
     def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -517,11 +369,15 @@ class VideoDubApp(tk.Tk):
         self._append_log(f"== {title} " + "=" * max(4, 50 - len(title)))
 
     def _check_tools(self) -> None:
-        problems = self.config_data.validate_core()
-        if problems:
-            self._append_log("\n".join(problems))
-        else:
-            self._append_log("yt-dlp、ffmpeg、ffprobe 检查通过。")
+        def worker() -> None:
+            runner = ProcessRunner()
+            try:
+                versions = inspect_dependency_versions(self.config_data, runner)
+                self.events.put(("log", versions.log_line()))
+            except (OSError, RuntimeError) as exc:
+                self.events.put(("log", f"依赖检查失败：{exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _update_url_placeholder(self, _event: object = None) -> None:
         if self.url_text.get("1.0", "end-1c").strip():
@@ -635,15 +491,12 @@ class VideoDubApp(tk.Tk):
         self.job_tree.delete(*self.job_tree.get_children())
         for index, job in enumerate(self.jobs):
             source = job.source_subtitle_path or find_source_subtitle(job.video_path)
-            translated_path = job.translated_subtitle_path(
-                self.config_data.translation_language
-            )
-            values = (
-                job.title,
-                "●" if source else "—",
-                "●" if job.asr_subtitle_path.is_file() else "—",
-                "●" if job.corrected_subtitle_path.is_file() else "—",
-                "●" if translated_path.is_file() else "—",
+            values = job_status_values(
+                job,
+                source,
+                self.config_data.translation_language,
+                self.config_data.tts_language,
+                self.config_data.output_dir,
             )
             item = self.job_tree.insert("", "end", iid=str(index), values=values)
             if str(job.video_path) in selected_paths:
@@ -906,22 +759,25 @@ class VideoDubApp(tk.Tk):
                         port=12000 + slot * 2,
                     ) as asr_service:
                         asr_url = asr_service.base_url
-                        extract_asr_subtitle(
+                        run_extract_stage(
                             config,
                             runner,
                             job,
-                            language=config.asr_language,
                             base_url=asr_url,
                         )
             elif extract:
-                runner.logger("未找到视频，已跳过语音提取。")
+                run_extract_stage(config, runner, job, base_url=asr_url)
             if repair or translate:
-                SubtitleRepairWorkflow(
+                workflow = SubtitleRepairWorkflow(
                     config,
                     runner,
                     api_key=self.session_api_key
                     or api_key_from_runtime(config=config),
-                ).process_job(job, repair=repair, translate=translate)
+                )
+                if translate:
+                    run_translate_stage(workflow, job, repair_first=repair)
+                else:
+                    run_repair_stage(workflow, job)
             if dubbing:
                 with self._mlx_inference_slot(
                     runner,
@@ -934,11 +790,11 @@ class VideoDubApp(tk.Tk):
                         port=12001 + slot * 2,
                     ) as tts_service:
                         tts_url = tts_service.base_url
-                        output = dub_video(
+                        output = run_dubbing_stage(
                             config,
                             runner,
                             job,
-                            qwen_base_url=tts_url,
+                            base_url=tts_url,
                         )
                         runner.logger(f"配音输出：{output}")
         finally:
@@ -1044,6 +900,14 @@ class VideoDubApp(tk.Tk):
         self._separator("检查更新")
 
         def worker() -> None:
+            dependency_runner = ProcessRunner(
+                lambda line: self.events.put(("log", line))
+            )
+            try:
+                dependency_summary = check_dependency_updates(dependency_runner)
+            except (OSError, RuntimeError) as exc:
+                dependency_summary = f"依赖更新检查失败：{exc}"
+            self.events.put(("log", dependency_summary))
             try:
                 headers = {"User-Agent": f"scip/{__version__}"}
                 try:
@@ -1068,8 +932,8 @@ class VideoDubApp(tk.Tk):
                     url = f"https://github.com/{GITHUB_REPOSITORY}/tags"
                 if not latest:
                     raise RuntimeError("GitHub 尚未发布版本标签")
-                self.events.put(("update", (latest, url)))
-            except (OSError, ValueError, urllib.error.URLError) as exc:
+                self.events.put(("update", (latest, url, dependency_summary)))
+            except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
                 self.events.put(("error", RuntimeError(f"检查更新失败：{exc}")))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1095,15 +959,20 @@ class VideoDubApp(tk.Tk):
                     self._append_log(f"错误：{payload}")
                     messagebox.showerror("任务失败", str(payload), parent=self)
                 elif kind == "update":
-                    latest, url = payload
+                    latest, url, dependency_summary = payload
                     if latest and _version_tuple(latest) > _version_tuple(__version__):
                         messagebox.showinfo(
                             "发现新版本",
-                            f"当前版本：{__version__}\n最新版本：{latest}\n{url}",
+                            f"当前版本：{__version__}\n最新版本：{latest}\n{url}"
+                            f"\n\n{dependency_summary}",
                             parent=self,
                         )
                     else:
-                        messagebox.showinfo("更新", f"当前已是最新版本 {__version__}。", parent=self)
+                        messagebox.showinfo(
+                            "更新",
+                            f"当前已是最新版本 {__version__}。\n\n{dependency_summary}",
+                            parent=self,
+                        )
         except queue.Empty:
             pass
         self.after(100, self._drain_events)

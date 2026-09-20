@@ -681,15 +681,15 @@ def _job_temp_dir(config: AppConfig, job: VideoJob) -> Path:
 
 
 def _output_path(config: AppConfig, job: VideoJob) -> Path:
-    target_dir = job.generated_dir or Path(config.output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{job.video_path.stem}.{config.tts_language}配音.mp4"
+    output = job.dubbed_video_path(config.tts_language, config.output_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
 
 
 def _audio_output_path(config: AppConfig, job: VideoJob) -> Path:
-    target_dir = job.generated_dir or Path(config.output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{job.video_path.stem}.{config.tts_language}配音.m4a"
+    output = job.dubbed_audio_path(config.tts_language, config.output_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
 
 
 def _mux_video(

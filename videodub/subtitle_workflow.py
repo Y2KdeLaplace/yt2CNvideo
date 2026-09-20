@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,6 +9,8 @@ from typing import Any
 from .config import AppConfig
 from .media import VideoJob
 from .openai_compatible import ChatResult, OpenAICompatibleClient
+from .processing.repair import RepairRecord, repair_units
+from .processing.translate import translate_units
 from .runner import CancelledError, ProcessRunner
 from .sentences import (SentenceUnit, build_sentence_units, display_cues, read_units,
                         write_units, validate_units, text_kind)
@@ -26,47 +28,6 @@ DOMAIN_SYSTEM = """你是视频内容与专业术语分析专家。
 输入包含媒体信息、下载字幕文稿样本，并可能包含 Qwen3-ASR 文稿样本。
 判断主题和专业领域，整理专有名词、缩写、符号与公式的规范写法。
 只返回 JSON 对象，不要使用 Markdown，不要臆造原内容中没有依据的信息。"""
-
-TRANSCRIPT_REPAIR_SYSTEM = """你是严格的视频对白校对专家。
-结合 domain、glossary、下载字幕和完整 ASR 上下文，逐个校正 source_sentence_groups。
-group_id 是稳定句子身份：每个必须且只能返回一次，禁止新增、丢失、合并或移动句子内容到另一组。
-只改文本，不能改变时间戳；不得翻译、扩写、摘要或改变原意，不省略重复和停顿。
-以声学句子为边界，下载字幕仅为文本证据。使用正常大小写和自然标点，不继承滚动字幕排版。
-保留声效标签，不把标签解释成对白。只返回 JSON 数组：
-[{"group_id": 1, "corrected_text": "..."}]。"""
-
-TRANSLATION_SYSTEM = """你是专业的视频文稿译者和校对者。
-把无时间戳的完整校正文稿翻译为 {target_language}。先理解全文上下文，再逐个翻译 source_sentence_groups；这些句组按顺序拼接就是完整文稿，此阶段不做字幕分段或定时。
-不得概括成讲义或摘要，不得省略推理、例子、剧情信息及有意义的重复；保留人物重复、停顿、笑点与口头节奏。术语、变量、单位和符号前后一致。
-针对科普、课程或技术内容，准确保留概念关系和推导。遇到数学公式、概率、函数或计算的口语表达时，可以直接整理成紧凑的 ASCII 公式，不要使用 LaTeX。公式本身保持 ASCII，解释文字使用目标语言。例如英文“one minus e to the negative r of t k times delta”中的公式应写成“1 - exp(-r(t_k)*delta)”。
-针对电影、剧集或生活对白，优先保留人物口吻、称谓、关系、情绪、潜台词、幽默和语境；使用目标语言中的自然口语，不要改写成科普讲解或书面总结，也不要无故弱化对剧情有作用的粗口、停顿或重复。
-动作表达必须是可以直接说出口的自然口语，避免机械词典式翻译；不要改成解释说明。保留声效标签，不将声效变成对白。
-目标语言要求：{language_guidance}
-每个输入 group_id 必须且只能返回一次，不得遗漏、合并或新增 group_id。只返回 JSON 数组，每项格式为 {"group_id": 1, "translated_text": "..."}，不要使用 Markdown。"""
-
-@dataclass(frozen=True)
-class RepairRecord:
-    group_id: int
-    first_cue: int
-    last_cue: int
-    source_text: str
-    corrected_text: str
-    changed: bool
-
-
-def _language_guidance(language: str) -> str:
-    if language == "Chinese":
-        return "使用自然简体中文、中文语序和中文标点；字幕宜短而完整，公式保留 ASCII。"
-    if language in {"Japanese", "Korean"}:
-        return (
-            f"使用自然的 {language} 语序、敬语层级、称谓和本语言标点；"
-            "不要按空格机械断句，公式保留 ASCII。"
-        )
-    return (
-        f"遵循自然、规范的 {language} 语法、大小写、词间空格、标点和称谓；"
-        "根据人物关系保持正式或口语语域，公式保留 ASCII。"
-    )
-
 
 def _extract_json_object(text: str) -> dict[str, Any]:
     candidate = text.strip()
@@ -261,33 +222,24 @@ class SubtitleRepairWorkflow(_TextWorkflow):
         self, youtube_cues: list[Cue], asr_cues: list[Cue] | None,
         domain: dict[str, Any], *, source_units: list[SentenceUnit] | None = None,
     ) -> tuple[list[SentenceUnit], list[RepairRecord]]:
-        units = source_units if source_units is not None else build_sentence_units(
-            asr_cues or youtube_cues, self.runner.logger)
-        corrected = self._transform_units(
-            units, domain, TRANSCRIPT_REPAIR_SYSTEM, "corrected_text",
-            {"downloaded_subtitle_transcript": subtitle_transcript(youtube_cues),
-             "full_context_transcript": "\n".join(u.text for u in units)},
+        return repair_units(
+            self,
+            youtube_cues,
+            asr_cues,
+            domain,
+            source_units=source_units,
         )
-        records = [RepairRecord(u.group_id, u.first_cue, u.last_cue, u.text,
-                                c.text, c.text != u.text)
-                   for u, c in zip(units, corrected, strict=True)]
-        self.runner.logger(f"句级校正完成：{len(corrected)} 句，身份和声学时间戳保持不变。")
-        return corrected, records
 
     def translate(
         self, units: list[SentenceUnit], domain: dict[str, Any], *,
         transcript_path: Path | None = None,
     ) -> list[SentenceUnit]:
-        system = TRANSLATION_SYSTEM.replace(
-            "{target_language}", self.config.translation_language
-        ).replace("{language_guidance}", _language_guidance(self.config.translation_language))
-        translated = self._transform_units(
-            units, domain, system, "translated_text",
-            {"complete_corrected_transcript": "\n".join(u.text for u in units)},
+        return translate_units(
+            self,
+            units,
+            domain,
+            transcript_path=transcript_path,
         )
-        if transcript_path is not None:
-            transcript_path.write_text("\n".join(u.text for u in translated) + "\n", encoding="utf-8")
-        return translated
 
     def process_job(
         self,

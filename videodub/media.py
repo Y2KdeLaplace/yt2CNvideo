@@ -66,6 +66,26 @@ class VideoJob:
             return self.base_path.with_name(name + ".zh-CN.txt")
         return self.base_path.with_name(name + f".translated.{suffix}.txt")
 
+    def dubbed_video_path(
+        self,
+        language: str,
+        output_dir: str | Path | None = None,
+    ) -> Path:
+        target = self.generated_dir or Path(
+            output_dir or self.video_path.parent / "output"
+        )
+        return target / f"{self.video_path.stem}.{language}配音.mp4"
+
+    def dubbed_audio_path(
+        self,
+        language: str,
+        output_dir: str | Path | None = None,
+    ) -> Path:
+        target = self.generated_dir or Path(
+            output_dir or self.video_path.parent / "output"
+        )
+        return target / f"{self.video_path.stem}.{language}配音.m4a"
+
     @property
     def corrected_subtitle_path(self) -> Path:
         return self.generated_base_path.with_name(

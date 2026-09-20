@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from videodub.media import discover_video_jobs
+from videodub.processing.ui import job_status_values
 
 
 class MediaDiscoveryTests(unittest.TestCase):
@@ -56,6 +57,21 @@ class MediaDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(len(jobs), 1)
             self.assertTrue(jobs[0].has_video)
+
+    def test_processing_status_includes_completed_dubbing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output"
+            output.mkdir()
+            video = root / "Lecture.mp4"
+            video.touch()
+            job = discover_video_jobs(root, output)[0]
+            job.dubbed_video_path("Chinese", output).touch()
+
+            values = job_status_values(job, None, "Chinese", "Chinese", str(output))
+
+            self.assertEqual(len(values), 6)
+            self.assertEqual(values[-1], "●")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
-"""Backward-compatible imports for the relocated download backend."""
+"""Self-contained YouTube download UI and backend."""
 
-from .video_download.backend import (
-    ID_MARKER,
+from .backend import (
     build_download_command,
     cleanup_new_download_directories,
     download,
@@ -9,7 +8,6 @@ from .video_download.backend import (
 )
 
 __all__ = [
-    "ID_MARKER",
     "build_download_command",
     "cleanup_new_download_directories",
     "download",
