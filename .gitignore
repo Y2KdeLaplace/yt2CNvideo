@@ -20,4 +20,5 @@ settings.json
 *.onnx.json
 work/
 output/
+sample_voice/*/
 .DS_Store

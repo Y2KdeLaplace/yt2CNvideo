@@ -1,4 +1,4 @@
-# scip 2.1.3
+# scip 3.1.0
 
 scip 是一个基于 Tk 的跨平台 YouTube 视频中文化工具：
 
@@ -42,12 +42,14 @@ uv run scip
 打开顶部“模型”菜单：
 
 - “语言模型”：配置 OpenAI 兼容 API 地址、API Key 和模型名称。开启“保存信息”时全部保存；API Key 会以与当前设备绑定的加密形式写入系统用户配置目录中的 `settings.json`。
-- “语音识别模型”：选择并锁定 ASR 模型；点击“管理”打开模型管理窗口。
-- “语音生成模型”：选择并锁定 TTS 模型；点击“管理”打开模型管理窗口。
+- “语音模型”：从本地模型清单分别选择语音识别模型和语音生成模型。同一个模型不能同时用于两项，在另一个选择栏中会显示为不可选。声音列表实时读取项目的 `sample_voice` 文件夹，也可以导入新的样本声音。
+- “语音模型管理”：选择 Hugging Face 或 ModelScope，输入 `owner/model` 后下载；窗口上半部管理下载与卸载，下半部显示下载命令输出。
 
-模型管理窗口会列出当前已安装的模型；选中表格中的模型后可直接卸载。模型锁定状态会在本次程序运行期间保留，关闭模型窗口后再次打开仍然有效；退出并重新启动程序后会回到待锁定状态。处理页只会调用本次会话中已锁定的模型，未锁定表示模型尚未选择完成。锁定时将鼠标放在模型选项上可查看实际路径。
+下载完成后，程序把平台、仓库名、运行后端、实际缓存路径和辅助模型路径写入应用缓存下的 `model-management/models.json`。语音模型列表只读取这份清单；首次升级时会把能够识别的旧缓存模型导入清单。卸载会删除对应平台缓存中的模型仓库，并同步删除清单记录。模型仍保存在 Hugging Face 与 ModelScope 各自的标准缓存位置，不会被移动到项目中。
 
-Qwen 官方模型从 ModelScope 下载且不需要指定单个权重文件；MLX、GGUF 和“其他模型”优先使用 Hugging Face 官方 `hf download`，失败后依次尝试镜像与 hfd。下载 GGUF 或其他 Hugging Face 模型时，程序先检查仓库文件：单一 GGUF 自动选择，多个量化版本则由用户选择具体版本；分片 GGUF 会作为一个版本成组下载。下载过程会在模型窗口的运行日志中持续更新缓存写入进度；下载失败或停止时会清理本次产生的不完整模型目录，避免它被误认为可用模型。下载尚未结束时关闭窗口会先询问是否停止。
+Hugging Face 保留原有的抗网络限制下载链路：先用官方 `hf download`，失败后依次尝试镜像与 hfd。名称含 GGUF 的 Hugging Face 仓库会先检查文件：单一 GGUF 自动选择，多个量化版本由用户选择，分片 GGUF 成组下载。ModelScope 使用官方 `modelscope download --model owner/model`。下载过程会在管理窗口持续输出日志；下载失败或停止时会清理本次产生的不完整 Hugging Face 模型目录，避免它被误认为可用模型。
+
+导入声音时，第一行可选择常见音频或视频格式，第二行选择常见文本文件。WAV 直接复制；其他音频会转为 24 kHz 单声道 WAV，视频等非音频文件由 ffmpeg 提取音轨。导入结果写入 `sample_voice/<样本名>/`，随后立即出现在声音列表中。
 
 在中国大陆网络环境中，下载非 Qwen 官方的 Hugging Face 模型前可设置镜像：
 
@@ -95,11 +97,11 @@ uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 - 官方 TTS CustomVoice：ModelScope 的 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
 - GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。
 
-GGUF 使用按当前系统下载的 CrispASR 预编译运行时。选择“其他模型”后可输入 Hugging Face 的 `owner/model`，例如 `seanghay/Qwen3-ASR-0.6B-Khmer`。
+GGUF 使用按当前系统下载的 CrispASR 预编译运行时。在“语音模型管理”中选择平台后可输入任意 `owner/model`，例如 Hugging Face 的 `seanghay/Qwen3-ASR-0.6B-Khmer`。
 
 模型若以本机服务运行，会在任务开始前启动、就绪后执行，并在任务完成、失败或取消后终止；无需用户手动管理服务。
 
-Qwen3-TTS CustomVoice 使用内置中文音色 Vivian。Base 模型用于声音克隆，锁定 Base 后必须在语音生成模型窗口选择参考 WAV，并填写与音频内容一致的文本；该配置跟随锁定的模型保存。
+Qwen3-TTS CustomVoice 使用内置中文音色 Vivian。Base 模型用于声音克隆，选择 Base 后必须在“语音模型”窗口选择一个声音样本；样本音频与对应文本共同保存于 `sample_voice` 子目录。
 
 ## 应用数据位置
 

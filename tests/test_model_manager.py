@@ -6,18 +6,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from videodub.config import AppConfig
-from videodub.model_manager import (
+from videodub.model_management.backend import (
+    InstalledModel,
     ModelChoice,
     _huggingface_downloaded_bytes,
     _download_huggingface,
     _download_modelscope,
+    download_model,
     group_gguf_files,
     install_model,
     list_installed_models,
     list_huggingface_gguf_options,
+    model_manifest_path,
     model_choices,
     resolve_huggingface_model,
     resolve_modelscope_model,
+    uninstall_model,
     uv_runtime_prefix,
 )
 
@@ -55,6 +59,58 @@ def create_huggingface_snapshot(
 
 
 class ModelManagerTests(unittest.TestCase):
+    def test_manifest_is_the_source_of_the_installed_model_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / "app-cache"
+            model = root / "hf" / "models--owner--speech-model" / "snapshots" / "main"
+            model.mkdir(parents=True)
+            (model / "model.safetensors").write_text("weights", encoding="utf-8")
+            config = AppConfig(cache_dir=str(cache))
+            with (
+                patch("videodub.model_management.backend._download_choice", return_value=model),
+                patch("videodub.model_management.backend._discover_legacy_models", return_value=[]),
+            ):
+                installed = download_model(
+                    config,
+                    "huggingface",
+                    "owner/speech-model",
+                    RecordingRunner(),
+                )
+
+            self.assertTrue(model_manifest_path(config).is_file())
+            self.assertEqual(list_installed_models(config=config), [installed])
+
+            unrelated = root / "hf" / "models--other--asr" / "snapshots" / "main"
+            unrelated.mkdir(parents=True)
+            (unrelated / "model.safetensors").write_text("weights", encoding="utf-8")
+            self.assertEqual(list_installed_models(config=config), [installed])
+
+    def test_uninstall_deletes_platform_repository_and_manifest_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"HF_HUB_CACHE": str(Path(temp) / "hf")},
+        ):
+            cache = Path(temp) / "app-cache"
+            snapshot = create_huggingface_snapshot(
+                Path(temp) / "hf",
+                "owner/speech-model",
+            )
+            config = AppConfig(cache_dir=str(cache))
+            installed = InstalledModel(
+                "unknown",
+                "hf",
+                "owner/speech-model",
+                str(snapshot),
+            )
+            from videodub.model_management.backend import _write_manifest
+
+            _write_manifest(config, [installed])
+            uninstall_model(config, installed, RecordingRunner())
+
+            self.assertFalse(snapshot.parent.parent.exists())
+            self.assertEqual(list_installed_models(config=config), [])
+
     def test_gguf_files_are_grouped_by_quantization_and_shards(self) -> None:
         options = group_gguf_files(
             [
@@ -98,7 +154,7 @@ class ModelManagerTests(unittest.TestCase):
 
         runner = RecordingRunner()
         with patch(
-            "videodub.model_manager.urllib.request.urlopen",
+            "videodub.model_management.backend.urllib.request.urlopen",
             return_value=FakeResponse(),
         ):
             options = list_huggingface_gguf_options(
@@ -270,7 +326,7 @@ class ModelManagerTests(unittest.TestCase):
             repository = Path(temp) / "models--owner--model"
             runner = FailingRunner(repository)
             with patch(
-                "videodub.model_manager._download_with_hfd",
+                "videodub.model_management.backend._download_with_hfd",
                 side_effect=RuntimeError("hfd failed"),
             ), self.assertRaises(RuntimeError):
                 _download_huggingface("owner/model", runner, ("model.gguf",))
@@ -296,7 +352,7 @@ class ModelManagerTests(unittest.TestCase):
                 "existing.gguf",
             )
             with patch(
-                "videodub.model_manager._download_with_hfd",
+                "videodub.model_management.backend._download_with_hfd",
                 side_effect=RuntimeError("hfd failed"),
             ), self.assertRaises(RuntimeError):
                 _download_huggingface("owner/model", FailingRunner())
@@ -330,13 +386,14 @@ class ModelManagerTests(unittest.TestCase):
                 return aligner_root if "forced-aligner" in repo_id else vad_root
 
             with (
-                patch("videodub.model_manager._install_runtime"),
+                patch("videodub.model_management.backend._install_runtime"),
+                patch("videodub.model_management.backend._record_installed_model"),
                 patch(
-                    "videodub.model_manager._download_choice",
+                    "videodub.model_management.backend._download_choice",
                     return_value=root,
                 ),
                 patch(
-                    "videodub.model_manager._download_huggingface",
+                    "videodub.model_management.backend._download_huggingface",
                     side_effect=companion,
                 ),
             ):
@@ -350,7 +407,7 @@ class ModelManagerTests(unittest.TestCase):
                 )
 
         self.assertEqual(installed.backend, "gguf")
-        self.assertEqual(Path(installed.path), selected)
+        self.assertEqual(Path(installed.path), selected.resolve())
         self.assertEqual(Path(installed.vad_path), vad_file)
         self.assertEqual(Path(installed.aligner_path), aligner_file)
 
@@ -368,9 +425,10 @@ class ModelManagerTests(unittest.TestCase):
             return Path("aligner") if "ForcedAligner" in repo_id else Path("asr")
 
         with (
-            patch("videodub.model_manager._install_runtime"),
+            patch("videodub.model_management.backend._install_runtime"),
+            patch("videodub.model_management.backend._record_installed_model"),
             patch(
-                "videodub.model_manager._download_choice",
+                "videodub.model_management.backend._download_choice",
                 side_effect=download,
             ),
         ):
@@ -407,13 +465,14 @@ class ModelManagerTests(unittest.TestCase):
 
         with (
             patch(
-                "videodub.model_manager._install_runtime",
+                "videodub.model_management.backend._install_runtime",
                 side_effect=lambda kind, backend, _runner: runtimes.append(
                     (kind, backend)
                 ),
             ),
+            patch("videodub.model_management.backend._record_installed_model"),
             patch(
-                "videodub.model_manager._download_choice",
+                "videodub.model_management.backend._download_choice",
                 side_effect=download,
             ),
         ):
@@ -486,9 +545,10 @@ class ModelManagerTests(unittest.TestCase):
             [
                 "uvx",
                 "--from",
-                "modelscope-hub",
-                "ms-hub",
+                "modelscope",
+                "modelscope",
                 "download",
+                "--model",
                 "Qwen/Qwen3-ASR-0.6B",
             ],
         )
@@ -501,7 +561,7 @@ class ModelManagerTests(unittest.TestCase):
 
     def test_gguf_asr_choice_uses_crispasr_conversion(self) -> None:
         with patch(
-            "videodub.model_manager.platform.system",
+            "videodub.model_management.backend.platform.system",
             return_value="Windows",
         ):
             choice = next(
@@ -514,10 +574,10 @@ class ModelManagerTests(unittest.TestCase):
             os.environ,
             {"HF_HUB_CACHE": temp},
         ), patch(
-            "videodub.model_manager.platform.system",
+            "videodub.model_management.backend.platform.system",
             return_value="Darwin",
         ), patch(
-            "videodub.model_manager.platform.machine",
+            "videodub.model_management.backend.platform.machine",
             return_value="arm64",
         ):
             asr = create_huggingface_snapshot(
@@ -533,8 +593,9 @@ class ModelManagerTests(unittest.TestCase):
                 "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
             )
 
-            asr_models = list_installed_models("asr")
-            tts_models = list_installed_models("tts")
+            config = AppConfig(cache_dir=str(Path(temp) / "app-cache"))
+            asr_models = list_installed_models("asr", config)
+            tts_models = list_installed_models("tts", config)
 
         self.assertIn(str(asr), [item.path for item in asr_models])
         self.assertEqual(asr_models[0].aligner_path, str(aligner))
@@ -549,3 +610,4 @@ class ModelManagerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    model_manifest_path,

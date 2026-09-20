@@ -18,10 +18,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import __version__
-from .config import AppConfig
-from .platform_utils import application_cache_dir
-from .runner import CancelledError, CommandError, ProcessRunner
+from .. import __version__
+from ..config import AppConfig
+from ..platform_utils import application_cache_dir
+from ..runner import CancelledError, CommandError, ProcessRunner
 
 
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
@@ -36,6 +36,10 @@ HF_MIRROR_ENDPOINTS = (
     "https://hf-cdn.sufy.com",
     "https://hf-mirror.com",
 )
+MODEL_MANIFEST_VERSION = 1
+MODEL_MANIFEST_RELATIVE_PATH = Path("model-management") / "models.json"
+MODEL_SOURCES = ("huggingface", "modelscope")
+_REPOSITORY_ID = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 
 def runtimes_dir() -> Path:
@@ -68,6 +72,104 @@ class InstalledModel:
     source: str = "huggingface"
     variant: str = ""
     vad_path: str = ""
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        return (self.source.casefold(), self.repo_id.casefold(), self.path)
+
+
+def model_manifest_path(config: AppConfig) -> Path:
+    return Path(config.cache_dir).expanduser() / MODEL_MANIFEST_RELATIVE_PATH
+
+
+def normalize_repository_id(repo_id: str) -> str:
+    value = repo_id.strip().strip("/")
+    if not _REPOSITORY_ID.fullmatch(value):
+        raise ValueError("请输入有效的模型名称，例如 owner/model")
+    return value
+
+
+def _model_from_dict(value: object) -> InstalledModel | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        model = InstalledModel(
+            kind=str(value.get("kind") or "unknown"),
+            backend=str(value["backend"]),
+            repo_id=normalize_repository_id(str(value["repo_id"])),
+            path=str(Path(str(value["path"])).expanduser().resolve()),
+            codec_path=str(value.get("codec_path") or ""),
+            aligner_path=str(value.get("aligner_path") or ""),
+            source=str(value["source"]).casefold(),
+            variant=str(value.get("variant") or ""),
+            vad_path=str(value.get("vad_path") or ""),
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if model.source not in MODEL_SOURCES or model.backend not in {
+        "hf",
+        "mlx",
+        "gguf",
+    }:
+        return None
+    return model
+
+
+def _model_to_dict(model: InstalledModel) -> dict[str, str]:
+    return {
+        "kind": model.kind,
+        "backend": model.backend,
+        "repo_id": model.repo_id,
+        "path": model.path,
+        "codec_path": model.codec_path,
+        "aligner_path": model.aligner_path,
+        "source": model.source,
+        "variant": model.variant,
+        "vad_path": model.vad_path,
+    }
+
+
+def _write_manifest(config: AppConfig, models: Iterable[InstalledModel]) -> Path:
+    path = model_manifest_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    unique = {model.identity: model for model in models}
+    payload = {
+        "version": MODEL_MANIFEST_VERSION,
+        "models": [
+            _model_to_dict(model)
+            for model in sorted(
+                unique.values(),
+                key=lambda item: (item.repo_id.casefold(), item.source, item.path),
+            )
+        ],
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
+
+
+def _read_manifest(config: AppConfig) -> list[InstalledModel] | None:
+    path = model_manifest_path(config)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return []
+    if not isinstance(payload, dict) or payload.get("version") != MODEL_MANIFEST_VERSION:
+        return []
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        return []
+    return [
+        model
+        for value in raw_models
+        if (model := _model_from_dict(value)) is not None
+    ]
 
 
 def _is_apple_silicon() -> bool:
@@ -226,7 +328,7 @@ def resolve_huggingface_model(repo_id: str) -> Path | None:
 
 
 def resolve_modelscope_model(repo_id: str) -> Path | None:
-    owner, name = repo_id.split("/", 1)
+    owner, name = normalize_repository_id(repo_id).split("/", 1)
     root = modelscope_cache_root()
     repository = root / "models" / f"{owner}--{name}"
     snapshots = repository / "snapshots"
@@ -241,6 +343,7 @@ def resolve_modelscope_model(repo_id: str) -> Path | None:
     legacy_candidates = (
         root / "models" / owner / name,
         root / owner / name,
+        root / "hub" / owner / name,
         root / "hub" / "models" / owner / name,
         root / "models" / owner.lower() / name,
         root / owner.lower() / name,
@@ -458,6 +561,7 @@ def _installed_from_choice(
         aligner_path,
         source,
         _variant(choice.repo_id),
+        _installed_vad_path(kind, choice.backend),
     )
 
 
@@ -524,13 +628,15 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
     return result
 
 
-def list_installed_models(kind: str) -> list[InstalledModel]:
+def _discover_legacy_models() -> list[InstalledModel]:
     result = [
         installed
+        for kind in ("asr", "tts")
         for choice in model_choices(kind)
         if (installed := _installed_from_choice(kind, choice)) is not None
     ]
-    result.extend(_cached_huggingface_repositories(kind))
+    for kind in ("asr", "tts"):
+        result.extend(_cached_huggingface_repositories(kind))
     unique: dict[tuple[str, str], InstalledModel] = {}
     for item in result:
         unique[(item.repo_id.casefold(), str(Path(item.path)))] = item
@@ -540,12 +646,47 @@ def list_installed_models(kind: str) -> list[InstalledModel]:
     )
 
 
-def read_installed_model(path: str | Path) -> InstalledModel | None:
+def list_installed_models(
+    kind: str | None = None,
+    config: AppConfig | None = None,
+) -> list[InstalledModel]:
+    active_config = config or AppConfig()
+    models = _read_manifest(active_config)
+    if models is None:
+        models = _discover_legacy_models()
+        try:
+            _write_manifest(active_config, models)
+        except OSError:
+            pass
+    available = [model for model in models if Path(model.path).exists()]
+    if len(available) != len(models):
+        try:
+            _write_manifest(active_config, available)
+        except OSError:
+            pass
+    if kind is not None:
+        available = [model for model in available if model.kind in {kind, "unknown"}]
+    return sorted(
+        available,
+        key=lambda item: (item.repo_id.casefold(), item.source, item.path),
+    )
+
+
+def _record_installed_model(config: AppConfig, installed: InstalledModel) -> None:
+    models = list_installed_models(config=config)
+    models = [model for model in models if model.identity != installed.identity]
+    models.append(installed)
+    _write_manifest(config, models)
+
+
+def read_installed_model(
+    path: str | Path,
+    config: AppConfig | None = None,
+) -> InstalledModel | None:
     target = Path(path)
-    for kind in ("asr", "tts"):
-        for item in list_installed_models(kind):
-            if Path(item.path) == target:
-                return item
+    for item in list_installed_models(config=config):
+        if Path(item.path) == target:
+            return item
     return None
 
 
@@ -801,14 +942,16 @@ def _download_huggingface(
 
 
 def _download_modelscope(repo_id: str, runner: ProcessRunner) -> Path:
+    repo_id = normalize_repository_id(repo_id)
     runner.logger(f"正在从 ModelScope 下载：{repo_id}")
     runner.run(
         [
             "uvx",
             "--from",
-            "modelscope-hub",
-            "ms-hub",
+            "modelscope",
+            "modelscope",
             "download",
+            "--model",
             repo_id,
         ]
     )
@@ -824,7 +967,7 @@ def _download_choice(
     runner: ProcessRunner,
     selected_files: tuple[str, ...] = (),
 ) -> Path:
-    if choice.source == "modelscope" and choice.key != "other":
+    if choice.source == "modelscope":
         return _download_modelscope(repo_id, runner)
     return _download_huggingface(repo_id, runner, selected_files)
 
@@ -934,6 +1077,48 @@ def crispasr_executable() -> Path | None:
     return None
 
 
+def _kind_from_repository(repo_id: str) -> str:
+    lowered = repo_id.casefold()
+    if "tts" in lowered:
+        return "tts"
+    if "asr" in lowered:
+        return "asr"
+    return "unknown"
+
+
+def _backend_from_repository(repo_id: str, selected_files: tuple[str, ...]) -> str:
+    lowered = repo_id.casefold()
+    if selected_files or "gguf" in lowered:
+        return "gguf"
+    if lowered.startswith("mlx-community/") or "-mlx" in lowered:
+        return "mlx"
+    return "hf"
+
+
+def download_model(
+    config: AppConfig,
+    source: str,
+    repo_id: str,
+    runner: ProcessRunner,
+    selected_files: tuple[str, ...] = (),
+) -> InstalledModel:
+    source = source.strip().casefold()
+    if source not in MODEL_SOURCES:
+        raise ValueError("模型平台必须是 huggingface 或 modelscope")
+    repo_id = normalize_repository_id(repo_id)
+    kind = _kind_from_repository(repo_id)
+    backend = _backend_from_repository(repo_id, selected_files)
+    choice = ModelChoice("download", "", repo_id, backend, source)
+    return install_model(
+        config,
+        kind,
+        choice,
+        "",
+        runner,
+        selected_files,
+    )
+
+
 def install_model(
     config: AppConfig,
     kind: str,
@@ -943,18 +1128,18 @@ def install_model(
     selected_files: tuple[str, ...] = (),
 ) -> InstalledModel:
     repo_id = custom_repo.strip() if choice.key == "other" else choice.repo_id
-    if not repo_id or "/" not in repo_id:
-        raise ValueError("请输入有效的模型名称，例如 owner/model")
-    if choice.backend == "gguf" and not selected_files:
-        raise ValueError("请选择要下载的 GGUF 模型版本")
+    repo_id = normalize_repository_id(repo_id)
     backend = "gguf" if selected_files else choice.backend
-    _install_runtime(kind, backend, runner)
+    if kind in {"asr", "tts"}:
+        _install_runtime(kind, backend, runner)
     target = _download_choice(
         choice,
         repo_id,
         runner,
         selected_files,
     )
+    if backend != "gguf" and any(target.rglob("*.gguf")):
+        backend = "gguf"
     model_path = target
     if backend == "gguf":
         candidates = [
@@ -1019,13 +1204,14 @@ def install_model(
         kind,
         backend,
         repo_id,
-        str(model_path),
+        str(model_path.resolve()),
         codec_path,
         aligner_path,
         choice.source,
         _variant(repo_id),
         vad_path,
     )
+    _record_installed_model(config, installed)
     runner.logger(f"模型下载完成：{model_path}")
     return installed
 
@@ -1034,17 +1220,19 @@ def _repository_root(installed: InstalledModel) -> tuple[Path, Path]:
     path = Path(installed.path).resolve()
     if installed.source == "modelscope":
         root = modelscope_cache_root().resolve()
-        current = path
-        while (
-            current != root
-            and not (
-                current.parent.name == "models"
-                and "--" in current.name
-            )
-        ):
-            current = current.parent
-        current.relative_to(root)
-        return current if current != root else path, root
+        relative = path.relative_to(root)
+        parts = relative.parts
+        if len(parts) >= 2 and parts[0] not in {"hub", "models"}:
+            return root.joinpath(*parts[:2]), root
+        if len(parts) >= 2 and parts[0] == "models" and "--" in parts[1]:
+            return root.joinpath(*parts[:2]), root
+        if len(parts) >= 3 and parts[0] == "models":
+            return root.joinpath(*parts[:3]), root
+        if len(parts) >= 3 and parts[0] == "hub" and parts[1] != "models":
+            return root.joinpath(*parts[:3]), root
+        if len(parts) >= 4 and parts[:2] == ("hub", "models"):
+            return root.joinpath(*parts[:4]), root
+        raise RuntimeError("无法确定 ModelScope 模型缓存目录")
     root = huggingface_cache_root().resolve()
     current = path
     while current != root and not current.name.startswith("models--"):
@@ -1055,10 +1243,26 @@ def _repository_root(installed: InstalledModel) -> tuple[Path, Path]:
     return current, root
 
 
-def uninstall_model(installed: InstalledModel, runner: ProcessRunner) -> None:
-    target, _root = _repository_root(installed)
-    if target.exists():
+def uninstall_model(
+    config: AppConfig,
+    installed: InstalledModel,
+    runner: ProcessRunner,
+) -> None:
+    target, root = _repository_root(installed)
+    target.relative_to(root)
+    if target == root:
+        raise RuntimeError("拒绝删除整个模型缓存目录")
+    if target.is_dir():
         shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+    retained: list[InstalledModel] = []
+    for model in list_installed_models(config=config):
+        try:
+            Path(model.path).resolve().relative_to(target)
+        except ValueError:
+            retained.append(model)
+    _write_manifest(config, retained)
     runner.logger(f"已卸载模型：{installed.repo_id}")
 
 

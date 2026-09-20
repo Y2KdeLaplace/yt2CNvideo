@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from videodub.config import AppConfig
-from videodub.model_manager import InstalledModel
+from videodub.model_management import InstalledModel
 from videodub.model_runtime import (
     ManagedModelService,
     _read_process_rss_kib,

@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from videodub.config import AppConfig
-from videodub.model_manager import InstalledModel
+from videodub.model_management import InstalledModel
 from videodub.qwen_speech import (
     _crispasr_asr_runtime_options,
     _crispasr_language_code,

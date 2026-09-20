@@ -12,13 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, PROJECT_ROOT
+from .config import AppConfig
 from .media import VideoJob
-from .model_manager import (
+from .model_management import (
     InstalledModel,
     crispasr_executable,
     first_model_file,
     read_installed_model,
+    resolve_voice_sample,
 )
 from .runner import ProcessRunner
 from .subtitles import Cue, read_srt, write_srt
@@ -26,14 +27,6 @@ from .subtitles import Cue, read_srt, write_srt
 
 ASR_SERVICE_URL = "http://127.0.0.1:9956"
 TTS_SERVICE_URL = "http://127.0.0.1:9955"
-TTS_VOICE_PRESETS = {
-    name: (
-        PROJECT_ROOT / "sample_voice" / name / f"{name}.wav",
-        PROJECT_ROOT / "sample_voice" / name / f"{name}.txt",
-    )
-    for name in ("Diana", "Eileen")
-}
-
 _INCOMPATIBLE_CRISPASR_ASR_REPOSITORIES = {
     "handy-computer/qwen3-asr-0.6b-gguf",
 }
@@ -200,8 +193,11 @@ def _segments_to_cues(
     return cues
 
 
-def _validate_crispasr_asr_model(model: Path) -> InstalledModel | None:
-    installed = read_installed_model(model)
+def _validate_crispasr_asr_model(
+    model: Path,
+    config: AppConfig | None = None,
+) -> InstalledModel | None:
+    installed = read_installed_model(model, config)
     if (
         installed is not None
         and installed.repo_id.casefold()
@@ -266,10 +262,10 @@ def resolve_tts_reference(config: AppConfig) -> tuple[str, str]:
         text_file = Path(config.tts_reference_text_file).expanduser()
         label = "自定义声音"
     else:
-        try:
-            audio, text_file = TTS_VOICE_PRESETS[config.tts_voice_preset]
-        except KeyError as exc:
-            raise ValueError("请为 Base TTS 模型选择 Diana、Eileen 或自定义声音。") from exc
+        sample = resolve_voice_sample(config.tts_voice_preset)
+        if sample is None:
+            raise ValueError("请为 Base TTS 模型选择一个声音样本。")
+        audio, text_file = sample.audio_path, sample.text_path
         label = f"预设声音 {config.tts_voice_preset}"
     if not audio.is_file():
         raise ValueError(f"{label}的参考音频不存在：{audio}")
@@ -318,7 +314,7 @@ def extract_asr_subtitle(
             if executable is None:
                 raise RuntimeError("CrispASR 运行环境未安装")
             model = first_model_file(config.asr_model_path, "*.gguf")
-            installed = _validate_crispasr_asr_model(model)
+            installed = _validate_crispasr_asr_model(model, config)
             vad_model = Path(installed.vad_path) if installed else Path()
             aligner_model = (
                 Path(installed.aligner_path) if installed else Path()
@@ -436,7 +432,7 @@ def synthesize_qwen(
 ) -> None:
     if config.tts_backend == "gguf":
         executable = crispasr_executable()
-        installed = read_installed_model(config.tts_model_path)
+        installed = read_installed_model(config.tts_model_path, config)
         if executable is None or installed is None:
             raise RuntimeError("Qwen3-TTS GGUF 运行环境或模型不存在")
         reference_audio = config.tts_reference_audio

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import AppConfig
-from .model_manager import read_installed_model, uv_runtime_prefix
+from .model_management import read_installed_model, uv_runtime_prefix
 from .qwen_speech import check_qwen_service, resolve_tts_reference
 from .runner import ProcessRunner
 
@@ -138,7 +138,7 @@ class ManagedModelService:
         )
         if not selected_path:
             raise RuntimeError(f"请先在“模型”菜单下载并选择{self.kind.upper()}模型")
-        installed = read_installed_model(selected_path)
+        installed = read_installed_model(selected_path, self.config)
         if installed is None:
             raise RuntimeError(f"模型未完整下载或已被移动：{selected_path}")
         path = selected_path
