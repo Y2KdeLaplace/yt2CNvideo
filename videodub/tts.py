@@ -261,7 +261,7 @@ def _voice_cache_identity(config: AppConfig) -> dict:
         files = [model_path] if model_path.is_file() else sorted(
             p for p in model_path.rglob("*") if p.is_file() and p.suffix in {".json", ".safetensors", ".gguf", ".bin"})
         settings["model_files"] = [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in files]
-    return {"generation_version": 2, "settings": settings,
+    return {"generation_version": 3, "settings": settings,
             "mlx_sampling": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096},
             "chunk_chars": TTS_CHUNK_MAX_CHARS, "chunk_silence_ms": TTS_CHUNK_SILENCE_MS}
 
@@ -574,17 +574,16 @@ def _fit_speech_blocks(
                 f"original_gaps={sum(block.original_gaps_ms) / 1000:.1f}s "
                 f"scheduled_gaps={sum(scheduled_gaps) / 1000:.1f}s "
                 f"duration_ratio={duration_ratio:.3f} speed={1 / duration_ratio:.2f}x "
-                f"spill={spill_ms}ms"
+                f"planned_spill={spill_ms}ms"
             )
     return fitted_blocks
 
 
 def _scheduled_sentence_start(
-    unit: SentenceUnit,
     cursor_end_ms: int,
     gap_ms: int = 0,
 ) -> int:
-    return max(0, unit.start_ms, cursor_end_ms + max(0, gap_ms))
+    return max(0, cursor_end_ms + max(0, gap_ms))
 
 
 def _render_sentence_track(
@@ -595,18 +594,16 @@ def _render_sentence_track(
 ) -> Path:
     rendered: list[tuple[AudioSegment, int]] = []
     cursor_end = 0
-    maximum_spill_ms = 0
-    final_delay_ms = 0
+    maximum_planned_spill_ms = max(
+        (block.spill_ms for block in blocks),
+        default=0,
+    )
+    maximum_actual_spill_ms = 0
+    final_accumulated_delay_ms = 0
     for block_index, block in enumerate(blocks):
         block_unclipped_end = block.start_ms
-        speech_ms = sum(sentence.duration_ms for sentence in block.sentences)
         block_start = max(block.start_ms, cursor_end)
-        gap_room_ms = max(0, block.deadline_ms - block_start - speech_ms)
-        effective_gaps = _allocate_gap_total(
-            block.scheduled_gaps_ms,
-            min(sum(block.scheduled_gaps_ms), gap_room_ms),
-            minimum_ms=0,
-        )
+        inherited_delay_ms = block_start - block.start_ms
         for sentence_index, sentence in enumerate(block.sentences):
             runner.check_cancelled()
             with sentence.path.open("rb") as source:
@@ -614,9 +611,13 @@ def _render_sentence_track(
             fade_ms = min(SENTENCE_EDGE_FADE_MS, len(audio) // 2)
             if fade_ms:
                 audio = audio.fade_in(fade_ms).fade_out(fade_ms)
-            gap_ms = effective_gaps[sentence_index - 1] if sentence_index else 0
-            start_ms = _scheduled_sentence_start(sentence.unit, cursor_end, gap_ms)
-            final_delay_ms = max(0, start_ms - sentence.unit.start_ms)
+            if sentence_index:
+                start_ms = _scheduled_sentence_start(
+                    cursor_end,
+                    block.scheduled_gaps_ms[sentence_index - 1],
+                )
+            else:
+                start_ms = block_start
             end_ms = start_ms + len(audio)
             block_unclipped_end = max(block_unclipped_end, end_ms)
             is_last = (
@@ -633,11 +634,15 @@ def _render_sentence_track(
             if audio and start_ms < total_duration_ms:
                 rendered.append((audio, start_ms))
             cursor_end = max(cursor_end, end_ms)
-        block_spill_ms = max(0, block_unclipped_end - block.deadline_ms)
-        maximum_spill_ms = max(maximum_spill_ms, block_spill_ms)
-        if block_spill_ms:
+        actual_spill_ms = max(0, block_unclipped_end - block.deadline_ms)
+        maximum_actual_spill_ms = max(maximum_actual_spill_ms, actual_spill_ms)
+        final_accumulated_delay_ms = actual_spill_ms
+        if block.spill_ms or inherited_delay_ms or actual_spill_ms:
             runner.logger(
-                f"TTS block {block_index + 1} scheduling spill={block_spill_ms}ms"
+                f"TTS block {block_index + 1}: "
+                f"planned_spill={block.spill_ms}ms "
+                f"inherited_delay={inherited_delay_ms}ms "
+                f"actual_spill={actual_spill_ms}ms"
             )
 
     canvas = (
@@ -655,8 +660,9 @@ def _render_sentence_track(
         "TTS timing summary: "
         f"maximum speech speed={max(speeds, default=1.0):.2f}x "
         f"median speech speed={statistics.median(speeds) if speeds else 1.0:.2f}x "
-        f"maximum block spill={maximum_spill_ms}ms "
-        f"final accumulated delay={final_delay_ms}ms"
+        f"maximum planned block spill={maximum_planned_spill_ms}ms "
+        f"maximum actual block spill={maximum_actual_spill_ms}ms "
+        f"final accumulated delay={final_accumulated_delay_ms}ms"
     )
     return output
 

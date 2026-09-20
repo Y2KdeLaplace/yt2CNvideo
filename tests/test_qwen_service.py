@@ -29,6 +29,25 @@ class SizedAudio:
         return self.sample_count
 
 
+class TtsAudio:
+    def __init__(self, duration_ms: int, sample_rate: int = 24000) -> None:
+        self.shape = (round(duration_ms * sample_rate / 1000),)
+
+
+def tts_result(
+    duration_ms: int,
+    *,
+    token_count: int = 100,
+    peak_memory_usage: float | None = None,
+):
+    return SimpleNamespace(
+        audio=TtsAudio(duration_ms),
+        sample_rate=24000,
+        token_count=token_count,
+        peak_memory_usage=peak_memory_usage,
+    )
+
+
 class QwenServiceTests(unittest.TestCase):
     def test_health_reports_actual_service_pid(self) -> None:
         self.assertEqual(_health_payload("model", "mlx", "tts")["pid"], os.getpid())
@@ -43,8 +62,9 @@ class QwenServiceTests(unittest.TestCase):
         )
         model = SimpleNamespace(
             generate=Mock(
-                return_value=iter(
-                    [SimpleNamespace(audio="audio", sample_rate=24000)]
+                side_effect=(
+                    iter([tts_result(1900)]),
+                    iter([tts_result(1960)]),
                 )
             )
         )
@@ -55,7 +75,9 @@ class QwenServiceTests(unittest.TestCase):
         ):
             result = _generate_tts_one(model, args, "你好", "Chinese")
 
-        self.assertEqual(result, ("audio", 24000))
+        self.assertEqual(result[1], 24000)
+        self.assertEqual(result[0].shape, TtsAudio(1960).shape)
+        self.assertEqual(model.generate.call_count, 2)
         output.assert_not_called()
 
     def test_result_peak_memory_is_logged_in_gigabytes(self) -> None:
@@ -194,26 +216,7 @@ class QwenServiceTests(unittest.TestCase):
         model = SimpleNamespace(
             tokenizer=SimpleNamespace(encode=lambda _text: list(range(100))),
             generate=Mock(
-                side_effect=[
-                    iter(
-                        [
-                            SimpleNamespace(
-                                audio="bad",
-                                sample_rate=24000,
-                                token_count=600,
-                            )
-                        ]
-                    ),
-                    iter(
-                        [
-                            SimpleNamespace(
-                                audio="good",
-                                sample_rate=24000,
-                                token_count=200,
-                            )
-                        ]
-                    ),
-                ]
+                side_effect=[iter([tts_result(2000, token_count=600)])] * 3
             ),
         )
         args = SimpleNamespace(
@@ -226,24 +229,213 @@ class QwenServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "生成长度上限"):
             _generate_tts_one(model, args, "完整文稿", "Chinese")
-        self.assertEqual(model.generate.call_count, 1)
+        self.assertEqual(model.generate.call_count, 3)
 
     def test_empty_iterator_is_a_clear_error(self) -> None:
         args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
                                reference_text="ref", speaker="Vivian")
-        model = SimpleNamespace(generate=Mock(return_value=iter([])))
+        model = SimpleNamespace(generate=Mock(side_effect=[iter([])] * 3))
         with self.assertRaisesRegex(RuntimeError, "未生成任何音频.*你好"):
             _generate_tts_one(model, args, "你好", "Chinese")
+        self.assertEqual(model.generate.call_count, 3)
+
+    def test_mlx_generator_is_fully_consumed_before_candidate_selection(self) -> None:
+        cleaned: list[int] = []
+
+        def generated(index: int):
+            try:
+                yield tts_result(1900 + index * 20)
+            finally:
+                cleaned.append(index)
+
+        args = SimpleNamespace(
+            backend="mlx",
+            variant="base",
+            reference_audio="voice.wav",
+            reference_text="ref",
+            speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(side_effect=[generated(1), generated(2)])
+        )
+
+        _generate_tts_one(model, args, "你好", "Chinese")
+
+        self.assertEqual(cleaned, [1, 2])
+
+    def test_mlx_custom_voice_keeps_single_generation_behavior(self) -> None:
+        cleaned = False
+
+        def generated():
+            nonlocal cleaned
+            try:
+                yield tts_result(1200)
+            finally:
+                cleaned = True
+
+        args = SimpleNamespace(
+            backend="mlx",
+            variant="custom_voice",
+            reference_audio="",
+            reference_text="",
+            speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate_custom_voice=Mock(return_value=generated())
+        )
+
+        audio, sample_rate = _generate_tts_one(model, args, "你好", "Chinese")
+
+        self.assertEqual(audio.shape, TtsAudio(1200).shape)
+        self.assertEqual(sample_rate, 24000)
+        self.assertTrue(cleaned)
+        model.generate_custom_voice.assert_called_once()
+
+    def test_hf_base_keeps_single_generation_behavior(self) -> None:
+        model = SimpleNamespace(
+            generate_voice_clone=Mock(return_value=(["audio"], 24000))
+        )
+        args = SimpleNamespace(
+            backend="hf",
+            variant="base",
+            reference_audio="voice.wav",
+            reference_text="ref",
+            speaker="Vivian",
+        )
+
+        result = _generate_tts_one(model, args, "你好", "Chinese")
+
+        self.assertEqual(result, ("audio", 24000))
+        model.generate_voice_clone.assert_called_once()
+
+    def test_mlx_base_consistent_candidates_do_not_generate_third(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx", variant="base", reference_audio="voice.wav",
+            reference_text="ref", speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(
+                side_effect=[iter([tts_result(1900)]), iter([tts_result(1960)])]
+            )
+        )
+
+        audio, _sample_rate = _generate_tts_one(model, args, "你好", "Chinese")
+
+        self.assertEqual(model.generate.call_count, 2)
+        self.assertEqual(audio.shape, TtsAudio(1960).shape)
+
+    def test_mlx_base_consensus_tie_prefers_existing_endpoint_margin(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx", variant="base", reference_audio="voice.wav",
+            reference_text="ref", speaker="Vivian",
+        )
+        first = tts_result(1900)
+        second = tts_result(1900)
+        model = SimpleNamespace(
+            generate=Mock(side_effect=[iter([first]), iter([second])])
+        )
+
+        with patch(
+            "videodub.qwen_service._trailing_low_energy_ms",
+            side_effect=[0, 80],
+        ):
+            audio, _sample_rate = _generate_tts_one(
+                model, args, "你好", "Chinese"
+            )
+
+        self.assertIs(audio, second.audio)
+        self.assertEqual(model.generate.call_count, 2)
+
+    def test_mlx_base_early_eos_outlier_uses_consensus_candidate(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx", variant="base", reference_audio="voice.wav",
+            reference_text="ref", speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(
+                side_effect=[
+                    iter([tts_result(1400, token_count=70)]),
+                    iter([tts_result(1900, token_count=96)]),
+                    iter([tts_result(1880, token_count=95)]),
+                ]
+            )
+        )
+
+        audio, _sample_rate = _generate_tts_one(model, args, "但也没用。", "Chinese")
+
+        self.assertEqual(model.generate.call_count, 3)
+        self.assertIn(audio.shape, (TtsAudio(1880).shape, TtsAudio(1900).shape))
+        self.assertNotEqual(audio.shape, TtsAudio(1400).shape)
+
+    def test_mlx_base_long_degeneration_is_not_selected(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx", variant="base", reference_audio="voice.wav",
+            reference_text="ref", speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(
+                side_effect=[
+                    iter([tts_result(1880, token_count=95)]),
+                    iter([tts_result(8500, token_count=420)]),
+                    iter([tts_result(1920, token_count=97)]),
+                ]
+            )
+        )
+
+        audio, _sample_rate = _generate_tts_one(model, args, "你好。", "Chinese")
+
+        self.assertEqual(model.generate.call_count, 3)
+        self.assertIn(audio.shape, (TtsAudio(1880).shape, TtsAudio(1920).shape))
+        self.assertNotEqual(audio.shape, TtsAudio(8500).shape)
+
+    def test_mlx_base_ambiguous_candidates_select_median_and_warn(self) -> None:
+        args = SimpleNamespace(
+            backend="mlx", variant="base", reference_audio="voice.wav",
+            reference_text="ref", speaker="Vivian",
+        )
+        model = SimpleNamespace(
+            generate=Mock(
+                side_effect=[
+                    iter([tts_result(1000, token_count=50)]),
+                    iter([tts_result(1600, token_count=90)]),
+                    iter([tts_result(2300, token_count=140)]),
+                ]
+            )
+        )
+
+        with patch("builtins.print") as output:
+            audio, _sample_rate = _generate_tts_one(
+                model, args, "没有明显共识。", "Chinese"
+            )
+
+        self.assertEqual(model.generate.call_count, 3)
+        self.assertEqual(audio.shape, TtsAudio(1600).shape)
+        self.assertTrue(
+            any(
+                "no clear cluster; median duration" in str(call)
+                for call in output.call_args_list
+            )
+        )
 
     def test_sequential_batch_preserves_success_when_peer_is_empty(self) -> None:
         args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
                                reference_text="ref", speaker="Vivian")
-        model = SimpleNamespace(generate=Mock(side_effect=[iter([SimpleNamespace(audio="good")]), iter([])]))
+        model = SimpleNamespace(
+            generate=Mock(
+                side_effect=[
+                    iter([tts_result(1000)]),
+                    iter([tts_result(1040)]),
+                    iter([]),
+                    iter([]),
+                    iter([]),
+                ]
+            )
+        )
         result = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
-        self.assertEqual(result[0], ("good", 24000))
+        self.assertEqual(result[0][1], 24000)
         self.assertIsInstance(result[1], RuntimeError)
 
-    def test_mlx_base_tts_uses_shared_reference_batch_generation(self) -> None:
+    def test_mlx_custom_voice_keeps_native_batch_generation(self) -> None:
         model = SimpleNamespace()
         model.batch_generate = Mock(
             return_value=iter(
@@ -257,7 +449,7 @@ class QwenServiceTests(unittest.TestCase):
         )
         args = SimpleNamespace(
             backend="mlx",
-            variant="base",
+            variant="custom_voice",
             reference_audio="voice.wav",
             reference_text="reference",
             speaker="Vivian",
@@ -273,8 +465,7 @@ class QwenServiceTests(unittest.TestCase):
             temperature=0.7,
             top_p=0.9,
             max_tokens=4096,
-            ref_audio="voice.wav",
-            ref_text="reference",
+            voices=["Vivian", "Vivian"],
         )
         output.assert_called_once_with(
             "[TTS] MLX memory: batch=1-2 size=2 peak=7.18 GB",
@@ -294,12 +485,16 @@ class QwenServiceTests(unittest.TestCase):
         )
 
     def test_empty_native_batch_does_not_add_hidden_generation_retries(self):
-        args = SimpleNamespace(backend="mlx", variant="base", reference_audio="voice.wav",
-                               reference_text="ref", speaker="Vivian")
-        model = SimpleNamespace(batch_generate=Mock(return_value=iter([])), generate=Mock())
+        args = SimpleNamespace(backend="mlx", variant="custom_voice",
+                               reference_audio="voice.wav", reference_text="ref",
+                               speaker="Vivian")
+        model = SimpleNamespace(
+            batch_generate=Mock(return_value=iter([])),
+            generate_custom_voice=Mock(),
+        )
         results = _generate_tts_batch(model, args, ["一", "二"], "Chinese")
         self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
-        model.generate.assert_not_called()
+        model.generate_custom_voice.assert_not_called()
         model.batch_generate.assert_called_once()
 
     def test_official_qwen_preserves_spaces_and_uses_natural_segments(self) -> None:

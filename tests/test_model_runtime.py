@@ -64,16 +64,29 @@ class ManagedModelServiceTests(unittest.TestCase):
         self.assertIsNone(service.process)
 
     def test_tts_rss_samples_health_service_pid_not_uv_wrapper(self) -> None:
-        service = ManagedModelService(AppConfig(cache_dir="/unused"), ProcessRunner(), "tts")
+        messages: list[str] = []
+        service = ManagedModelService(
+            AppConfig(cache_dir="/unused"), ProcessRunner(messages.append), "tts"
+        )
         service.service_pid = 654
 
-        with patch(
-            "videodub.model_runtime._read_process_rss_kib", return_value=1024
-        ) as read_rss:
+        with (
+            patch(
+                "videodub.model_runtime._read_process_rss_kib", return_value=1024
+            ) as read_rss,
+            patch("videodub.model_runtime.append_runtime_diagnostic") as diagnostic,
+        ):
             service._record_rss_sample(service.service_pid)
+            service._stop_rss_sampler(None)
 
         read_rss.assert_called_once_with(654)
         self.assertEqual(service.current_rss_kib, 1024)
+        diagnostic_text = "\n".join(call.args[1] for call in diagnostic.call_args_list)
+        self.assertIn("TTS service CPU RSS", diagnostic_text)
+        self.assertIn("Metal/MLX allocation not included", diagnostic_text)
+        self.assertTrue(
+            any("TTS service CPU RSS peak" in message for message in messages)
+        )
 
     def test_managed_tts_starts_rss_sampler_after_health_pid(self) -> None:
         process = Mock(pid=321, stdout=[])

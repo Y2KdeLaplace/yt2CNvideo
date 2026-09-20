@@ -291,9 +291,10 @@ class ManagedModelService:
         if should_report:
             append_runtime_diagnostic(
                 self.config.cache_dir,
-                f"TTS service RSS: pid={pid} "
+                f"TTS service CPU RSS: pid={pid} "
                 f"current={rss_kib / 1024 / 1024:.2f} GB "
-                f"peak={peak_rss_kib / 1024 / 1024:.2f} GB",
+                f"peak={peak_rss_kib / 1024 / 1024:.2f} GB "
+                "(Metal/MLX allocation not included)",
             )
 
     def _sample_rss(self) -> None:
@@ -322,7 +323,10 @@ class ManagedModelService:
         with self._rss_lock:
             peak_rss_kib = self.peak_rss_kib
         if peak_rss_kib:
-            message = f"TTS service RSS peak: {peak_rss_kib / 1024 / 1024:.2f} GB"
+            message = (
+                f"TTS service CPU RSS peak: {peak_rss_kib / 1024 / 1024:.2f} GB "
+                "(Metal/MLX allocation not included)"
+            )
             self.runner.logger(message)
             append_runtime_diagnostic(self.config.cache_dir, message)
 

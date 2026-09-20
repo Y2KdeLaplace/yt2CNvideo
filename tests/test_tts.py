@@ -20,9 +20,11 @@ from videodub.sentences import build_sentence_units, write_units
 from videodub.tts import (
     BLOCK_DURATION_RATIO_MIN,
     CROSSFADE_MS,
+    MIN_INTER_SENTENCE_GAP_MS,
     SENTENCE_EDGE_FADE_MS,
     SentenceAudio,
     SentenceUnit,
+    SpeechBlock,
     _adjust_sentence_audio,
     _atempo_chain,
     _audio_duration_ms,
@@ -389,13 +391,113 @@ class DurationFittingTests(unittest.TestCase):
 
 class TimelineSchedulingTests(unittest.TestCase):
     def test_overlapping_subtitle_windows_are_scheduled_serially(self) -> None:
-        first = SentenceUnit(1, 1, 0, 1000, "一。")
-        second = SentenceUnit(2, 2, 800, 1600, "二。")
-        first_start = _scheduled_sentence_start(first, 0)
-        second_start = _scheduled_sentence_start(second, first_start + 900)
+        first_start = max(0, 0)
+        second_start = _scheduled_sentence_start(first_start + 900, 20)
 
         self.assertEqual(first_start, 0)
-        self.assertGreaterEqual(second_start, first_start + 900)
+        self.assertEqual(second_start, first_start + 920)
+
+    def test_renderer_uses_scheduled_gap_instead_of_restoring_original_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=500),
+                sentence_audio(root, 1, start_ms=1300, end_ms=1800, raw_ms=500),
+            ]
+            runner = AudioRunner()
+            block = _fit_speech_blocks(
+                AppConfig(), runner, sentences, root, 1060
+            )[0]
+            output = _render_sentence_track(runner, [block], root, 2000)
+            with output.open("rb") as source:
+                track = AudioSegment.from_wav(source)
+
+        self.assertEqual(block.original_gaps_ms, (800,))
+        self.assertEqual(block.scheduled_gaps_ms, (60,))
+        self.assertGreater(track[600:950].rms, 0)
+        self.assertEqual(track[1100:1250].rms, 0)
+
+    def test_renderer_preserves_planned_minimum_sentence_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=200, raw_ms=200),
+                sentence_audio(root, 1, start_ms=220, end_ms=420, raw_ms=200),
+                sentence_audio(root, 2, start_ms=440, end_ms=640, raw_ms=200),
+            ]
+            runner = AudioRunner()
+            block = _fit_speech_blocks(
+                AppConfig(), runner, sentences, root, 640
+            )[0]
+            output = _render_sentence_track(runner, [block], root, 640)
+            with output.open("rb") as source:
+                track = AudioSegment.from_wav(source)
+
+        self.assertEqual(
+            block.scheduled_gaps_ms,
+            (MIN_INTER_SENTENCE_GAP_MS, MIN_INTER_SENTENCE_GAP_MS),
+        )
+        self.assertEqual(track[200:220].rms, 0)
+        self.assertEqual(track[420:440].rms, 0)
+
+    def test_actual_spill_matches_planned_spill_without_inherited_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentences = [
+                sentence_audio(root, 0, start_ms=0, end_ms=500, raw_ms=500),
+                sentence_audio(root, 1, start_ms=520, end_ms=1020, raw_ms=500),
+            ]
+            runner = AudioRunner()
+            block = _fit_speech_blocks(
+                AppConfig(), runner, sentences, root, 700
+            )[0]
+            _render_sentence_track(runner, [block], root, 700)
+
+        detail = next(
+            message
+            for message in runner.messages
+            if message.startswith("TTS block 1: planned_spill=")
+        )
+        match = re.search(
+            r"planned_spill=(\d+)ms inherited_delay=(\d+)ms actual_spill=(\d+)ms",
+            detail,
+        )
+        self.assertIsNotNone(match)
+        planned, inherited, actual = (int(value) for value in match.groups())
+        self.assertEqual(inherited, 0)
+        self.assertLessEqual(abs(actual - planned), 1)
+        self.assertLessEqual(abs(actual - block.spill_ms), 1)
+
+    def test_inherited_delay_moves_whole_block_without_changing_relative_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = sentence_audio(
+                root, 0, start_ms=0, end_ms=500, raw_ms=700, frequency=330
+            )
+            second = sentence_audio(
+                root, 1, start_ms=500, end_ms=800, raw_ms=300, frequency=440
+            )
+            third = sentence_audio(
+                root, 2, start_ms=1300, end_ms=1600, raw_ms=300, frequency=550
+            )
+            blocks = [
+                SpeechBlock((first,), 0, 500, (), (), spill_ms=200),
+                SpeechBlock((second, third), 500, 1200, (500,), (60,)),
+            ]
+            runner = AudioRunner()
+            output = _render_sentence_track(runner, blocks, root, 1600)
+            with output.open("rb") as source:
+                track = AudioSegment.from_wav(source)
+
+        self.assertEqual(track[1000:1060].rms, 0)
+        self.assertGreater(track[1080:1180].rms, 0)
+        self.assertTrue(
+            any(
+                "TTS block 2: planned_spill=0ms inherited_delay=200ms actual_spill=160ms"
+                in message
+                for message in runner.messages
+            )
+        )
 
     def test_original_gap_is_preserved_when_space_allows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -424,8 +526,8 @@ class TimelineSchedulingTests(unittest.TestCase):
                 root,
                 0,
                 start_ms=0,
-                end_ms=1000,
-                raw_ms=900,
+                end_ms=500,
+                raw_ms=400,
                 frequency=440,
             )
             last = sentence_audio(
@@ -445,7 +547,7 @@ class TimelineSchedulingTests(unittest.TestCase):
             self.assertEqual(_audio_duration_ms(output), 2000)
             with output.open("rb") as source:
                 track = AudioSegment.from_wav(source)
-            self.assertGreater(track[100:800].rms, 0)
+            self.assertGreater(track[100:350].rms, 0)
             self.assertTrue(any("最后一句超出视频结尾" in item for item in runner.messages))
 
 
@@ -510,6 +612,13 @@ class DubVideoFlowTests(unittest.TestCase):
         self.assertFalse(hasattr(tts, "_local_duration_factor"))
 
 class SentenceCacheTests(unittest.TestCase):
+    def test_sentence_cache_generation_version_is_three(self):
+        from videodub.tts import _voice_cache_identity
+
+        identity = _voice_cache_identity(AppConfig())
+
+        self.assertEqual(identity["generation_version"], 3)
+
     def test_first_empty_then_success_and_two_empty_fail_with_context(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -519,7 +628,18 @@ class SentenceCacheTests(unittest.TestCase):
         for succeeds in [True, False]:
             with self.subTest(succeeds=succeeds), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
-                model = SimpleNamespace(generate=Mock(side_effect=[iter([]), iter([SimpleNamespace(audio="good")]) if succeeds else iter([])]))
+                good = SimpleNamespace(
+                    audio=[0.0] * 2400,
+                    sample_rate=24000,
+                    token_count=10,
+                )
+                generated = [iter([])] * 3
+                generated.extend(
+                    [iter([good]), iter([good])]
+                    if succeeds
+                    else [iter([])] * 3
+                )
+                model = SimpleNamespace(generate=Mock(side_effect=generated))
                 def request(config, text, output, runner, **kwargs):
                     _generate_tts_one(model, args, text, "Chinese")
                     write_tone(output, 200)
@@ -533,7 +653,7 @@ class SentenceCacheTests(unittest.TestCase):
                             _synthesize_sentence_units(config, AudioRunner(), units, root, "http://tts")
                         for detail in ["1/1", "87–88", units[0].text, "model-test", "mlx", "连续 2 次", "未生成任何音频"]:
                             self.assertIn(detail, str(error.exception))
-                self.assertEqual(model.generate.call_count, 2)
+                self.assertEqual(model.generate.call_count, 5 if succeeds else 6)
 
     def test_fifty_cached_sentences_survive_51_failure_and_fresh_work_directory(self):
         with tempfile.TemporaryDirectory() as temp:

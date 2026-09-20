@@ -9,9 +9,11 @@ import base64
 import io
 import math
 import os
+import statistics
 import tempfile
 import unicodedata
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,25 @@ MLX_SAMPLE_RATE = 16000
 MLX_CHUNK_DURATIONS = (240.0, 120.0, 60.0)
 CHUNK_BOUND_TOLERANCE_SECONDS = 0.001
 MAX_ALIGNMENT_OVERLAP_SECONDS = 0.1
+MLX_BASE_MIN_CANDIDATES = 2
+MLX_BASE_MAX_CANDIDATES = 3
+MLX_CANDIDATE_DURATION_TOLERANCE_MS = 225
+MLX_CANDIDATE_RELATIVE_TOLERANCE = 0.08
+MLX_CANDIDATE_TOKEN_TOLERANCE = 8
+MLX_CANDIDATE_OUTLIER_RATIO = 1.5
+
+
+@dataclass(frozen=True)
+class _MlxTtsCandidate:
+    index: int
+    result: Any = field(repr=False)
+    audio: Any = field(repr=False)
+    sample_rate: int
+    samples: int
+    duration_ms: int
+    token_count: int
+    peak_memory_usage: float | None
+    trailing_low_energy_ms: int | None
 
 
 def _health_payload(model: str, backend: str, service_type: str) -> dict[str, str | int]:
@@ -522,6 +543,319 @@ def _log_mlx_peak_memory(
         pass
 
 
+def _consume_mlx_generation(generated: Any, text: str) -> Any:
+    if hasattr(generated, "audio"):
+        results = [generated]
+    else:
+        try:
+            results = list(generated)
+        except TypeError:
+            results = [generated]
+    if not results:
+        raise RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}")
+    if len(results) != 1:
+        raise RuntimeError(
+            "MLX Qwen3-TTS 非 streaming 单句返回了多个音频 segment，"
+            f"无法安全地只取第一个：count={len(results)} text={text!r}"
+        )
+    return results[0]
+
+
+def _audio_sample_count(audio: Any) -> int:
+    shape = getattr(audio, "shape", None)
+    if shape is not None:
+        try:
+            return math.prod(int(value) for value in shape)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return len(audio)
+    except TypeError as exc:
+        raise RuntimeError("MLX Qwen3-TTS 返回的音频没有可读取的 sample 数量") from exc
+
+
+def _trailing_low_energy_ms(audio: Any, sample_rate: int) -> int | None:
+    try:
+        import numpy as np
+
+        samples = np.asarray(audio).squeeze()
+        if samples.ndim != 1 or samples.size == 0:
+            return None
+        magnitude = np.abs(samples.astype(float, copy=False))
+        threshold = max(1e-4, float(magnitude.max()) * 0.01)
+        active = np.flatnonzero(magnitude > threshold)
+        trailing_samples = (
+            samples.size
+            if active.size == 0
+            else samples.size - int(active[-1]) - 1
+        )
+        return round(trailing_samples / sample_rate * 1000)
+    except Exception:
+        return None
+
+
+def _mlx_candidate(result: Any, index: int, max_tokens: int) -> _MlxTtsCandidate:
+    token_count = int(getattr(result, "token_count", 0) or 0)
+    if token_count >= max_tokens:
+        raise RuntimeError("达到生成长度上限")
+    audio = getattr(result, "audio", result)
+    sample_rate = int(getattr(result, "sample_rate", 24000))
+    samples = _audio_sample_count(audio)
+    if sample_rate <= 0 or samples <= 0:
+        raise RuntimeError("返回空音频或非法 sample rate")
+    peak = getattr(result, "peak_memory_usage", None)
+    try:
+        peak_memory_usage = float(peak) if peak is not None else None
+    except (TypeError, ValueError):
+        peak_memory_usage = None
+    return _MlxTtsCandidate(
+        index=index,
+        result=result,
+        audio=audio,
+        sample_rate=sample_rate,
+        samples=samples,
+        duration_ms=max(1, round(samples / sample_rate * 1000)),
+        token_count=token_count,
+        peak_memory_usage=peak_memory_usage,
+        trailing_low_energy_ms=_trailing_low_energy_ms(audio, sample_rate),
+    )
+
+
+def _candidate_values_agree(
+    first: int,
+    second: int,
+    absolute_tolerance: int,
+) -> bool:
+    difference = abs(first - second)
+    return (
+        difference <= absolute_tolerance
+        or difference / max(first, second, 1) <= MLX_CANDIDATE_RELATIVE_TOLERANCE
+    )
+
+
+def _candidates_agree(first: _MlxTtsCandidate, second: _MlxTtsCandidate) -> bool:
+    duration_agrees = _candidate_values_agree(
+        first.duration_ms,
+        second.duration_ms,
+        MLX_CANDIDATE_DURATION_TOLERANCE_MS,
+    )
+    token_agrees = (
+        first.token_count <= 0
+        or second.token_count <= 0
+        or _candidate_values_agree(
+            first.token_count,
+            second.token_count,
+            MLX_CANDIDATE_TOKEN_TOLERANCE,
+        )
+    )
+    return duration_agrees and token_agrees
+
+
+def _candidate_distance(first: _MlxTtsCandidate, second: _MlxTtsCandidate) -> float:
+    duration_distance = abs(first.duration_ms - second.duration_ms) / max(
+        first.duration_ms,
+        second.duration_ms,
+        1,
+    )
+    token_distance = 0.0
+    if first.token_count > 0 and second.token_count > 0:
+        token_distance = abs(first.token_count - second.token_count) / max(
+            first.token_count,
+            second.token_count,
+            1,
+        )
+    return duration_distance + token_distance
+
+
+def _select_mlx_base_candidate(
+    candidates: list[_MlxTtsCandidate],
+) -> tuple[_MlxTtsCandidate, str, list[int]]:
+    if not candidates:
+        raise RuntimeError("MLX Qwen3-TTS 没有有效候选音频")
+    if len(candidates) == 1:
+        return candidates[0], "only valid candidate", []
+
+    median_duration = statistics.median(item.duration_ms for item in candidates)
+    suspicious = [
+        item.index
+        for item in candidates
+        if item.duration_ms > median_duration * MLX_CANDIDATE_OUTLIER_RATIO
+        or item.duration_ms * MLX_CANDIDATE_OUTLIER_RATIO < median_duration
+    ]
+    eligible = [item for item in candidates if item.index not in suspicious]
+    if not eligible:
+        eligible = candidates
+
+    agreeing_pairs = [
+        (first, second)
+        for position, first in enumerate(eligible)
+        for second in eligible[position + 1 :]
+        if _candidates_agree(first, second)
+    ]
+    if agreeing_pairs:
+        first, second = min(
+            agreeing_pairs,
+            key=lambda pair: _candidate_distance(*pair),
+        )
+        cluster = [first, second]
+        cluster.extend(
+            item
+            for item in eligible
+            if item not in cluster
+            and all(_candidates_agree(item, member) for member in cluster)
+        )
+        duration_center = statistics.median(item.duration_ms for item in cluster)
+        positive_tokens = [item.token_count for item in cluster if item.token_count > 0]
+        token_center = statistics.median(positive_tokens) if positive_tokens else 0
+
+        def centrality(item: _MlxTtsCandidate) -> tuple[float, float]:
+            return (
+                abs(item.duration_ms - duration_center) / max(duration_center, 1),
+                (
+                    abs(item.token_count - token_center) / max(token_center, 1)
+                    if token_center
+                    else 0
+                ),
+            )
+
+        best_centrality = min(centrality(item) for item in cluster)
+        central_candidates = [
+            item for item in cluster if centrality(item) == best_centrality
+        ]
+        selected = min(
+            central_candidates,
+            key=lambda item: (
+                -min(item.trailing_low_energy_ms or 0, 200),
+                -item.duration_ms,
+                -item.index,
+            ),
+        )
+        outside_cluster = [
+            item.index for item in candidates if item not in cluster
+        ]
+        reason = "duration/token consensus"
+        if (
+            len(central_candidates) > 1
+            and (selected.trailing_low_energy_ms or 0)
+            > min((item.trailing_low_energy_ms or 0) for item in central_candidates)
+        ):
+            reason += "; endpoint margin tie-break"
+        return (
+            selected,
+            reason,
+            sorted(set(suspicious + outside_cluster)),
+        )
+
+    ordered = sorted(candidates, key=lambda item: (item.duration_ms, item.index))
+    selected = ordered[len(ordered) // 2]
+    return selected, "no clear cluster; median duration", suspicious
+
+
+def _mlx_generation_result(
+    model: Any,
+    args: argparse.Namespace,
+    text: str,
+    language: str,
+    options: dict[str, Any],
+) -> Any:
+    if args.variant == "base":
+        generated = model.generate(
+            text=text,
+            ref_audio=args.reference_audio,
+            ref_text=args.reference_text,
+            lang_code=language,
+            **options,
+        )
+    else:
+        generated = model.generate_custom_voice(
+            text=text,
+            speaker=args.speaker,
+            language=language,
+            **options,
+        )
+    return _consume_mlx_generation(generated, text)
+
+
+def _generate_mlx_base_candidate_set(
+    model: Any,
+    args: argparse.Namespace,
+    text: str,
+    language: str,
+    options: dict[str, Any],
+    *,
+    request_number: int,
+    mx: Any | None,
+) -> tuple[Any, int]:
+    max_tokens = int(options["max_tokens"])
+    candidates: list[_MlxTtsCandidate] = []
+    errors: list[str] = []
+    for index in range(1, MLX_BASE_MAX_CANDIDATES + 1):
+        try:
+            result = _mlx_generation_result(
+                model,
+                args,
+                text,
+                language,
+                options,
+            )
+            candidates.append(_mlx_candidate(result, index, max_tokens))
+        except (RuntimeError, TypeError, ValueError) as exc:
+            errors.append(f"candidate {index}: {exc}")
+
+        if index < MLX_BASE_MIN_CANDIDATES:
+            continue
+        if len(candidates) >= MLX_BASE_MIN_CANDIDATES and _candidates_agree(
+            candidates[0], candidates[1]
+        ):
+            break
+
+    if not candidates:
+        detail = "; ".join(errors) or "没有有效候选音频"
+        raise RuntimeError(
+            f"MLX Qwen3-TTS 候选生成全部失败：text={text!r}；{detail}"
+        )
+
+    selected, reason, suspicious = _select_mlx_base_candidate(candidates)
+    _log_mlx_peak_memory(
+        f"request={request_number}",
+        [item.result for item in candidates],
+        mx,
+    )
+    if (
+        len(candidates) >= MLX_BASE_MAX_CANDIDATES
+        or errors
+        or suspicious
+        or "no clear" in reason
+    ):
+        durations = ", ".join(
+            f"{item.duration_ms / 1000:.2f}s" for item in candidates
+        )
+        token_counts = ", ".join(str(item.token_count) for item in candidates)
+        trailing = ", ".join(
+            "unavailable"
+            if item.trailing_low_energy_ms is None
+            else f"{item.trailing_low_energy_ms}ms"
+            for item in candidates
+        )
+        notes = []
+        if suspicious:
+            notes.append(
+                "candidate "
+                + ", ".join(map(str, suspicious))
+                + " suspicious/outside consensus"
+            )
+        notes.extend(errors)
+        suffix = f"; {'; '.join(notes)}" if notes else ""
+        print(
+            f"MLX Base TTS request={request_number}: "
+            f"candidate durations={durations}; token_counts={token_counts}; "
+            f"trailing_low_energy={trailing}; selected={selected.index}; "
+            f"reason={reason}{suffix}",
+            flush=True,
+        )
+    return selected.audio, selected.sample_rate
+
+
 def _generate_tts_one(
     model: Any,
     args: argparse.Namespace,
@@ -543,14 +877,16 @@ def _generate_tts_one(
         max_tokens = min(4096, max(512, text_tokens * 6))
         options = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
         if args.variant == "base":
-            results = model.generate(text=text, ref_audio=args.reference_audio,
-                                     ref_text=args.reference_text, lang_code=language, **options)
-        else:
-            results = model.generate_custom_voice(text=text, speaker=args.speaker,
-                                                  language=language, **options)
-        result = next(iter(results), None) if hasattr(results, "__iter__") else results
-        if result is None:
-            raise RuntimeError(f"MLX Qwen3-TTS 未生成任何音频：text={text!r}")
+            return _generate_mlx_base_candidate_set(
+                model,
+                args,
+                text,
+                language,
+                options,
+                request_number=request_number,
+                mx=mx,
+            )
+        result = _mlx_generation_result(model, args, text, language, options)
         _log_mlx_peak_memory(f"request={request_number}", [result], mx)
         token_count = int(getattr(result, "token_count", 0) or 0)
         if token_count >= max_tokens:
@@ -580,17 +916,16 @@ def _generate_tts_batch(
     *,
     request_start: int = 1,
 ) -> list[tuple[Any, int] | RuntimeError]:
-    if args.backend == "mlx" and len(texts) > 1 and hasattr(model, "batch_generate"):
+    if (
+        args.backend == "mlx"
+        and args.variant != "base"
+        and len(texts) > 1
+        and hasattr(model, "batch_generate")
+    ):
         mx = _reset_mlx_peak_memory()
         kwargs: dict[str, Any] = {"lang_code": language, "temperature": 0.7,
                                   "top_p": 0.9, "max_tokens": 4096}
-        if args.variant == "base":
-            kwargs.update(
-                ref_audio=args.reference_audio,
-                ref_text=args.reference_text,
-            )
-        else:
-            kwargs["voices"] = [args.speaker] * len(texts)
+        kwargs["voices"] = [args.speaker] * len(texts)
         try:
             results = list(model.batch_generate(texts, **kwargs))
         except (AttributeError, TypeError, NotImplementedError):
