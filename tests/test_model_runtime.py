@@ -91,7 +91,11 @@ class ManagedModelServiceTests(unittest.TestCase):
     def test_managed_tts_starts_rss_sampler_after_health_pid(self) -> None:
         process = Mock(pid=321, stdout=[])
         process.poll.return_value = None
-        installed = InstalledModel("tts", "mlx", "owner/model", "/model", variant="custom_voice")
+        installed = InstalledModel(
+            "tts", "mlx",
+            "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+            "/model", variant="custom_voice",
+        )
         checks = iter(
             (
                 QwenServiceInfo(False, "tts"),
@@ -108,7 +112,7 @@ class ManagedModelServiceTests(unittest.TestCase):
         with (
             patch("videodub.model_runtime.read_installed_model", return_value=installed),
             patch(
-                "videodub.model_runtime.check_qwen_service",
+                "videodub.model_runtime.check_speech_service",
                 side_effect=lambda *_args, **_kwargs: next(checks),
             ),
             patch("videodub.model_runtime.subprocess.Popen", return_value=process),
@@ -135,7 +139,11 @@ class ManagedModelServiceTests(unittest.TestCase):
             runner = ProcessRunner(messages.append)
             process = Mock(pid=321, stdout=[])
             process.poll.return_value = None
-            installed = InstalledModel("tts", "mlx", "owner/model", "/model", variant="base")
+            installed = InstalledModel(
+                "tts", "mlx",
+                "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
+                "/model", variant="base",
+            )
             checks = iter(
                 (
                     QwenServiceInfo(False, "tts"),
@@ -149,7 +157,7 @@ class ManagedModelServiceTests(unittest.TestCase):
             with (
                 patch("videodub.model_runtime.read_installed_model", return_value=installed),
                 patch(
-                    "videodub.model_runtime.check_qwen_service",
+                    "videodub.model_runtime.check_speech_service",
                     side_effect=lambda *_args, **_kwargs: next(checks),
                 ),
                 patch(
@@ -189,38 +197,37 @@ class ManagedModelServiceTests(unittest.TestCase):
         process = Mock()
         process.poll.return_value = None
         runner = ProcessRunner()
-        installed = InstalledModel(
-            "asr",
-            "mlx",
-            "owner/model",
-            "/model",
-            aligner_path="/aligner",
-        )
-        checks = iter(
-            (
-                QwenServiceInfo(False, "asr"),
-                QwenServiceInfo(True, "asr", "/model", "mlx"),
+        with tempfile.TemporaryDirectory() as temp:
+            aligner = Path(temp) / "aligner"
+            aligner.mkdir()
+            installed = InstalledModel(
+                "asr", "mlx", "mlx-community/Qwen3-ASR-0.6B-8bit",
+                "/model", aligner_path=str(aligner),
             )
-        )
-        config = AppConfig(asr_backend="mlx", asr_model_path="/model")
+            checks = iter(
+                (
+                    QwenServiceInfo(False, "asr"),
+                    QwenServiceInfo(True, "asr", "/model", "mlx"),
+                )
+            )
+            config = AppConfig(asr_backend="mlx", asr_model_path="/model")
+            with (
+                patch(
+                    "videodub.model_runtime.read_installed_model",
+                    return_value=installed,
+                ),
+                patch(
+                    "videodub.model_runtime.check_speech_service",
+                    side_effect=lambda *_args, **_kwargs: next(checks),
+                ),
+                patch("videodub.model_runtime.subprocess.Popen", return_value=process),
+                patch("videodub.model_runtime.threading.Thread"),
+                patch("videodub.model_runtime._terminate_process_tree") as terminate,
+                ManagedModelService(config, runner, "asr", port=12000),
+            ):
+                runner.cancel()
 
-        with (
-            patch(
-                "videodub.model_runtime.read_installed_model",
-                return_value=installed,
-            ),
-            patch(
-                "videodub.model_runtime.check_qwen_service",
-                side_effect=lambda *_args, **_kwargs: next(checks),
-            ),
-            patch("videodub.model_runtime.subprocess.Popen", return_value=process),
-            patch("videodub.model_runtime.threading.Thread"),
-            patch("videodub.model_runtime._terminate_process_tree") as terminate,
-            ManagedModelService(config, runner, "asr", port=12000),
-        ):
-            runner.cancel()
-
-        terminate.assert_called_once_with(process)
+            terminate.assert_called_once_with(process)
 
 
 if __name__ == "__main__":

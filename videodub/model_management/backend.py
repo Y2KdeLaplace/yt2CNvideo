@@ -15,22 +15,18 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import __version__
 from ..config import AppConfig
 from ..platform_utils import application_cache_dir
 from ..runner import CancelledError, CommandError, ProcessRunner
+from ..speech.providers import build_download_command, check_provider_cli
+from ..speech.registry import find_model_spec
 
 
 CRISPASR_REPOSITORY = "CrispStrobe/CrispASR"
-HF_FORCED_ALIGNER_REPOSITORY = "Qwen/Qwen3-ForcedAligner-0.6B"
-GGUF_FORCED_ALIGNER_REPOSITORY = "cstr/qwen3-forced-aligner-0.6b-GGUF"
-GGUF_FORCED_ALIGNER_FILENAME = "qwen3-forced-aligner-0.6b-q8_0.gguf"
-MLX_FORCED_ALIGNER_REPOSITORY = (
-    "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
-)
 HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
 HF_MIRROR_ENDPOINTS = (
     "https://hf-cdn.sufy.com",
@@ -496,44 +492,26 @@ def _resolve_choice(choice: ModelChoice) -> Path | None:
     return resolve_huggingface_model(choice.repo_id)
 
 
-def _companion_paths(kind: str, backend: str) -> tuple[str, str]:
-    codec_path = ""
-    aligner_path = ""
-    if kind == "asr" and backend in {"hf", "mlx"}:
+def _companion_paths(repo_id: str) -> dict[str, str]:
+    paths = {"codec_path": "", "aligner_path": "", "vad_path": ""}
+    spec = find_model_spec(repo_id)
+    for dependency in spec.dependencies if spec else ():
         repository = (
-            MLX_FORCED_ALIGNER_REPOSITORY
-            if backend == "mlx"
-            else HF_FORCED_ALIGNER_REPOSITORY
+            resolve_modelscope_model(dependency.repo_id)
+            if dependency.source == "modelscope"
+            else resolve_huggingface_model(dependency.repo_id)
         )
-        aligner = resolve_huggingface_model(repository)
-        if backend == "hf":
-            aligner = resolve_modelscope_model(repository) or aligner
-        aligner_path = str(aligner or "")
-    if kind == "asr" and backend == "gguf":
-        repository = resolve_huggingface_model(
-            GGUF_FORCED_ALIGNER_REPOSITORY
-        )
-        if repository:
-            aligner = repository / GGUF_FORCED_ALIGNER_FILENAME
-            aligner_path = str(aligner) if aligner.is_file() else ""
-    if kind == "tts" and backend == "gguf":
-        codec = resolve_huggingface_model(
-            "cstr/qwen3-tts-tokenizer-12hz-GGUF"
-        )
-        if codec:
-            files = sorted(codec.rglob("*.gguf"))
-            codec_path = str(files[0]) if files else ""
-    return codec_path, aligner_path
-
-
-def _installed_vad_path(kind: str, backend: str) -> str:
-    if kind != "asr" or backend != "gguf":
-        return ""
-    repository = resolve_huggingface_model("ggml-org/whisper-vad")
-    if repository is None:
-        return ""
-    candidate = repository / "ggml-silero-v6.2.0.bin"
-    return str(candidate) if candidate.is_file() else ""
+        if repository is None:
+            continue
+        path = repository
+        if dependency.files:
+            candidates = [repository / name for name in dependency.files]
+            match = next((item for item in candidates if item.is_file()), None)
+            if match is None:
+                continue
+            path = match
+        paths[dependency.manifest_field] = str(path)
+    return paths
 
 
 def _installed_from_choice(
@@ -551,17 +529,17 @@ def _installed_from_choice(
         and resolve_modelscope_model(choice.repo_id) is None
     ):
         source = "huggingface"
-    codec_path, aligner_path = _companion_paths(kind, choice.backend)
+    companions = _companion_paths(choice.repo_id)
     return InstalledModel(
         kind,
         choice.backend,
         choice.repo_id,
         str(path),
-        codec_path,
-        aligner_path,
+        companions["codec_path"],
+        companions["aligner_path"],
         source,
         _variant(choice.repo_id),
-        _installed_vad_path(kind, choice.backend),
+        companions["vad_path"],
     )
 
 
@@ -569,13 +547,13 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
     root = huggingface_cache_root()
     if not root.is_dir():
         return []
-    marker = "asr" if kind == "asr" else "tts"
     result: list[InstalledModel] = []
     for repo_root in root.glob("models--*--*"):
         raw = repo_root.name.removeprefix("models--")
         owner, name = raw.split("--", 1)
         repo_id = f"{owner}/{name}"
-        if marker not in repo_id.casefold():
+        spec = find_model_spec(repo_id)
+        if spec is None or spec.kind != kind:
             continue
         path = resolve_huggingface_model(repo_id)
         if path is None:
@@ -585,14 +563,8 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
             for item in path.rglob("*")
             if item.is_file() and item.suffix.casefold() == ".gguf"
         ]
-        backend = (
-            "mlx"
-            if owner.casefold() == "mlx-community"
-            else "gguf"
-            if gguf_files
-            else "hf"
-        )
-        codec_path, aligner_path = _companion_paths(kind, backend)
+        backend = "hf" if spec.engine == "transformers" else spec.engine
+        companions = _companion_paths(repo_id)
         if backend == "gguf":
             relative_files = [
                 item.relative_to(path).as_posix() for item in gguf_files
@@ -604,11 +576,11 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
                         backend,
                         repo_id,
                         str((path / option.files[0]).resolve()),
-                        codec_path,
-                        aligner_path,
+                        companions["codec_path"],
+                        companions["aligner_path"],
                         "huggingface",
-                        _variant(repo_id),
-                        _installed_vad_path(kind, backend),
+                        spec.variant,
+                        companions["vad_path"],
                     )
                 )
         else:
@@ -618,11 +590,11 @@ def _cached_huggingface_repositories(kind: str) -> list[InstalledModel]:
                     backend,
                     repo_id,
                     str(path),
-                    codec_path,
-                    aligner_path,
+                    companions["codec_path"],
+                    companions["aligner_path"],
                     "huggingface",
-                    _variant(repo_id),
-                    _installed_vad_path(kind, backend),
+                    spec.variant,
+                    companions["vad_path"],
                 )
             )
     return result
@@ -665,7 +637,7 @@ def list_installed_models(
         except OSError:
             pass
     if kind is not None:
-        available = [model for model in available if model.kind in {kind, "unknown"}]
+        available = [model for model in available if model.kind == kind]
     return sorted(
         available,
         key=lambda item: (item.repo_id.casefold(), item.source, item.path),
@@ -690,63 +662,9 @@ def read_installed_model(
     return None
 
 
-def runtime_packages(kind: str, backend: str) -> tuple[str, tuple[str, ...]]:
-    if backend == "mlx":
-        return (
-            "3.13",
-            (
-                "fastapi>=0.128",
-                "huggingface-hub[hf_xet]",
-                "mlx-audio>=0.3",
-                "numpy",
-                "python-multipart",
-                "soundfile",
-                "uvicorn>=0.40",
-            ),
-        )
-    if kind == "asr":
-        return (
-            "3.12",
-            (
-                "fastapi>=0.128",
-                "python-multipart",
-                "qwen-asr",
-                "uvicorn>=0.40",
-            ),
-        )
-    return (
-        "3.12",
-        (
-            "fastapi>=0.128",
-            "numpy",
-            "qwen-tts",
-            "soundfile",
-            "uvicorn>=0.40",
-        ),
-    )
-
-
-def uv_runtime_prefix(kind: str, backend: str) -> list[str]:
-    version, packages = runtime_packages(kind, backend)
-    command = ["uv", "run", "--no-project", "--python", version]
-    for package in packages:
-        command.extend(["--with", package])
-    return command
-
-
-def _install_runtime(kind: str, backend: str, runner: ProcessRunner) -> None:
-    if backend == "gguf":
-        _install_crispasr(runner)
-        return
-    runner.logger("正在由 uv 准备模型运行环境…")
-    imports = (
-        "import fastapi, mlx_audio, uvicorn"
-        if backend == "mlx"
-        else "import fastapi, qwen_asr, uvicorn"
-        if kind == "asr"
-        else "import fastapi, qwen_tts, uvicorn"
-    )
-    runner.run([*uv_runtime_prefix(kind, backend), "python", "-c", imports])
+def ensure_gguf_runtime(runner: ProcessRunner) -> Path:
+    """Prepare the external GGUF speech runtime when inference is requested."""
+    return _install_crispasr(runner)
 
 
 def _cache_tree_size(root: Path) -> int:
@@ -834,65 +752,13 @@ def _run_huggingface_download(
         watcher.join(timeout=1)
 
 
-def _download_with_hfd(
-    repo_id: str,
-    runner: ProcessRunner,
-    endpoint: str,
-    include: tuple[str, ...],
-) -> Path:
-    bash = shutil.which("bash")
-    curl = shutil.which("curl") or shutil.which("curl.exe")
-    if not bash or not curl:
-        raise RuntimeError("hfd requires both Bash and curl")
-    snapshot = _hf_repo_root(repo_id) / "snapshots" / "hfd"
-    snapshot.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="videodub-hfd-") as temporary:
-        script = Path(temporary) / "hfd.sh"
-        runner.logger(f"正在通过 hfd 下载：{repo_id}（{endpoint}）")
-        runner.run(
-            [
-                curl,
-                "--fail",
-                "--location",
-                "--output",
-                script,
-                f"{endpoint}/hfd/hfd.sh",
-            ]
-        )
-        command: list[str | Path] = [
-            bash,
-            script,
-            repo_id,
-            "--local-dir",
-            snapshot,
-        ]
-        if include:
-            command.extend(["--include", *include])
-        runner.run(command, env={"HF_ENDPOINT": endpoint})
-    reference = _hf_repo_root(repo_id) / "refs" / "main"
-    reference.parent.mkdir(parents=True, exist_ok=True)
-    reference.write_text("hfd\n", encoding="utf-8")
-    path = resolve_huggingface_model(repo_id)
-    if path is None:
-        raise RuntimeError(f"hfd completed but no model was found: {repo_id}")
-    return path
-
-
 def _download_huggingface(
     repo_id: str,
     runner: ProcessRunner,
     include: tuple[str, ...] = (),
 ) -> Path:
-    command: list[str] = [
-        "uvx",
-        "--from",
-        "huggingface-hub[hf_xet]",
-        "hf",
-        "download",
-        repo_id,
-    ]
-    for pattern in include:
-        command.extend(["--include", pattern])
+    command = build_download_command("huggingface", repo_id, include)
+    command[0] = check_provider_cli("huggingface")
     errors: list[Exception] = []
     repository = _hf_repo_root(repo_id)
     had_installed_model = resolve_huggingface_model(repo_id) is not None
@@ -919,14 +785,6 @@ def _download_huggingface(
                     runner.logger(
                         f"下载失败，正在使用镜像重试：{endpoints[index + 1]}"
                     )
-        for endpoint in HF_MIRROR_ENDPOINTS:
-            try:
-                return _download_with_hfd(repo_id, runner, endpoint, include)
-            except CancelledError:
-                raise
-            except (CommandError, RuntimeError) as exc:
-                errors.append(exc)
-                runner.logger(f"hfd 下载失败：{endpoint}")
         detail = str(errors[-1]) if errors else "未知错误"
         raise RuntimeError(f"Hugging Face 下载失败：{detail}") from (
             errors[-1] if errors else None
@@ -944,17 +802,9 @@ def _download_huggingface(
 def _download_modelscope(repo_id: str, runner: ProcessRunner) -> Path:
     repo_id = normalize_repository_id(repo_id)
     runner.logger(f"正在从 ModelScope 下载：{repo_id}")
-    runner.run(
-        [
-            "uvx",
-            "--from",
-            "modelscope",
-            "modelscope",
-            "download",
-            "--model",
-            repo_id,
-        ]
-    )
+    command = build_download_command("modelscope", repo_id)
+    command[0] = check_provider_cli("modelscope")
+    runner.run(command)
     path = resolve_modelscope_model(repo_id)
     if path is None:
         raise RuntimeError(f"ModelScope 下载完成后未找到模型缓存：{repo_id}")
@@ -1078,15 +928,14 @@ def crispasr_executable() -> Path | None:
 
 
 def _kind_from_repository(repo_id: str) -> str:
-    lowered = repo_id.casefold()
-    if "tts" in lowered:
-        return "tts"
-    if "asr" in lowered:
-        return "asr"
-    return "unknown"
+    spec = find_model_spec(repo_id)
+    return spec.kind if spec else "unknown"
 
 
 def _backend_from_repository(repo_id: str, selected_files: tuple[str, ...]) -> str:
+    spec = find_model_spec(repo_id)
+    if spec is not None:
+        return "hf" if spec.engine == "transformers" else spec.engine
     lowered = repo_id.casefold()
     if selected_files or "gguf" in lowered:
         return "gguf"
@@ -1130,8 +979,12 @@ def install_model(
     repo_id = custom_repo.strip() if choice.key == "other" else choice.repo_id
     repo_id = normalize_repository_id(repo_id)
     backend = "gguf" if selected_files else choice.backend
-    if kind in {"asr", "tts"}:
-        _install_runtime(kind, backend, runner)
+    spec = find_model_spec(repo_id)
+    if spec is not None:
+        kind = spec.kind
+        backend = "hf" if spec.engine == "transformers" else spec.engine
+    else:
+        kind = "unknown"
     target = _download_choice(
         choice,
         repo_id,
@@ -1152,68 +1005,90 @@ def install_model(
         if not candidates:
             raise RuntimeError("GGUF 模型下载后未找到 .gguf 文件")
         model_path = sorted(candidates)[0]
-    codec_path = ""
-    aligner_path = ""
-    vad_path = ""
-    if kind == "asr" and backend in {"hf", "mlx"}:
-        aligner_repo = (
-            MLX_FORCED_ALIGNER_REPOSITORY
-            if backend == "mlx"
-            else HF_FORCED_ALIGNER_REPOSITORY
-        )
-        aligner_choice = ModelChoice(
-            "aligner",
-            "",
-            aligner_repo,
+    companion_paths = {"codec_path": "", "aligner_path": "", "vad_path": ""}
+    for dependency in spec.dependencies if spec else ():
+        dependency_choice = ModelChoice(
+            dependency.id,
+            dependency.display_name,
+            dependency.repo_id,
             backend,
-            "huggingface" if backend == "mlx" else choice.source,
+            dependency.source,
         )
-        aligner_path = str(
-            _download_choice(aligner_choice, aligner_choice.repo_id, runner)
-        )
-    if kind == "tts" and backend == "gguf":
-        codec = _download_huggingface(
-            "cstr/qwen3-tts-tokenizer-12hz-GGUF",
+        repository = _download_choice(
+            dependency_choice,
+            dependency.repo_id,
             runner,
-            ("qwen3-tts-tokenizer-12hz.gguf",),
+            dependency.files,
         )
-        codec_files = sorted(codec.rglob("*.gguf"))
-        if not codec_files:
-            raise RuntimeError("TTS GGUF 编解码器下载后未找到 .gguf 文件")
-        codec_path = str(codec_files[0])
-    if kind == "asr" and backend == "gguf":
-        aligner = _download_huggingface(
-            GGUF_FORCED_ALIGNER_REPOSITORY,
-            runner,
-            (GGUF_FORCED_ALIGNER_FILENAME,),
-        )
-        aligner_file = aligner / GGUF_FORCED_ALIGNER_FILENAME
-        if not aligner_file.is_file():
-            raise RuntimeError("ASR GGUF 的 Qwen3 Forced Aligner 下载后未找到")
-        aligner_path = str(aligner_file)
-        vad = _download_huggingface(
-            "ggml-org/whisper-vad",
-            runner,
-            ("ggml-silero-v6.2.0.bin",),
-        )
-        vad_file = vad / "ggml-silero-v6.2.0.bin"
-        if not vad_file.is_file():
-            raise RuntimeError("ASR GGUF 的 Silero VAD 依赖下载后未找到")
-        vad_path = str(vad_file)
+        dependency_path = repository
+        if dependency.files:
+            candidates = [repository / item for item in dependency.files if (repository / item).is_file()]
+            if not candidates:
+                raise RuntimeError(
+                    f"Companion dependency 下载后缺少文件：{dependency.display_name}"
+                )
+            dependency_path = candidates[0]
+        companion_paths[dependency.manifest_field] = str(dependency_path)
     installed = InstalledModel(
         kind,
         backend,
         repo_id,
         str(model_path.resolve()),
-        codec_path,
-        aligner_path,
+        companion_paths["codec_path"],
+        companion_paths["aligner_path"],
         choice.source,
-        _variant(repo_id),
-        vad_path,
+        spec.variant if spec else _variant(repo_id),
+        companion_paths["vad_path"],
     )
     _record_installed_model(config, installed)
     runner.logger(f"模型下载完成：{model_path}")
     return installed
+
+
+def repair_model_dependencies(
+    config: AppConfig,
+    installed: InstalledModel,
+    runner: ProcessRunner,
+) -> InstalledModel:
+    spec = find_model_spec(installed.repo_id)
+    if spec is None:
+        raise RuntimeError(f"未知仓库没有可修复的 runtime dependency：{installed.repo_id}")
+    values = {
+        "codec_path": installed.codec_path,
+        "aligner_path": installed.aligner_path,
+        "vad_path": installed.vad_path,
+    }
+    for dependency in spec.dependencies:
+        current = values[dependency.manifest_field]
+        if current and Path(current).exists():
+            continue
+        choice = ModelChoice(
+            dependency.id,
+            dependency.display_name,
+            dependency.repo_id,
+            installed.backend,
+            dependency.source,
+        )
+        repository = _download_choice(
+            choice,
+            dependency.repo_id,
+            runner,
+            dependency.files,
+        )
+        path = repository
+        if dependency.files:
+            match = next(
+                (repository / name for name in dependency.files if (repository / name).is_file()),
+                None,
+            )
+            if match is None:
+                raise RuntimeError(f"依赖文件缺失：{dependency.display_name}")
+            path = match
+        values[dependency.manifest_field] = str(path)
+    repaired = replace(installed, **values)
+    _record_installed_model(config, repaired)
+    runner.logger(f"模型依赖修复完成：{installed.repo_id}")
+    return repaired
 
 
 def _repository_root(installed: InstalledModel) -> tuple[Path, Path]:

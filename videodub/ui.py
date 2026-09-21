@@ -47,7 +47,8 @@ from videodub.model_management.dialogs import (
     show_model_manager_dialog,
     show_speech_model_dialog,
 )
-from videodub.model_runtime import ManagedModelService, append_runtime_diagnostic
+from videodub.model_runtime import append_runtime_diagnostic
+from videodub.speech_service_manager import ManagedSpeechService
 from videodub.platform_utils import open_in_file_manager
 from videodub.processing import (
     run_dubbing_stage,
@@ -56,7 +57,8 @@ from videodub.processing import (
     run_translate_stage,
 )
 from videodub.processing.ui import build_processing_section, job_status_values
-from videodub.qwen_speech import resolve_tts_reference
+from videodub.speech_settings import resolve_tts_reference
+from videodub.speech.constants import SPEECH_WORKER_BASE_PORT
 from videodub.runner import CancelledError, ProcessRunner
 from videodub.subtitle_workflow import SubtitleRepairWorkflow
 from videodub.subtitles import find_source_subtitle
@@ -820,11 +822,11 @@ class VideoDubApp(tk.Tk):
                     runner,
                     enabled=config.asr_backend == "mlx",
                 ):
-                    with ManagedModelService(
+                    with ManagedSpeechService(
                         config,
                         runner,
                         "asr",
-                        port=12000 + slot * 2,
+                        port=SPEECH_WORKER_BASE_PORT + slot,
                     ) as asr_service:
                         asr_url = asr_service.base_url
                         run_extract_stage(
@@ -851,11 +853,11 @@ class VideoDubApp(tk.Tk):
                     runner,
                     enabled=config.tts_backend == "mlx",
                 ):
-                    with ManagedModelService(
+                    with ManagedSpeechService(
                         config,
                         runner,
                         "tts",
-                        port=12001 + slot * 2,
+                        port=SPEECH_WORKER_BASE_PORT + slot,
                     ) as tts_service:
                         tts_url = tts_service.base_url
                         output = run_dubbing_stage(

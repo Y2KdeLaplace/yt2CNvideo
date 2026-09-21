@@ -81,9 +81,17 @@ uv run scip
 - “语音模型”：从本地模型清单分别选择语音识别模型和语音生成模型。同一个模型不能同时用于两项，在另一个选择栏中会显示为不可选。声音列表实时读取项目的 `sample_voice` 文件夹，也可以导入新的样本声音。
 - “语音模型管理”：选择 Hugging Face 或 ModelScope，输入 `owner/model` 后下载；窗口上半部管理下载与卸载，下半部显示下载命令输出。调整窗口高度时，模型列表和命令输出按约 6:4 的比例同步伸缩。
 
-下载完成后，程序把平台、仓库名、运行后端、实际缓存路径和辅助模型路径写入应用缓存下的 `model-management/models.json`。语音模型列表只读取这份清单；首次升级时会把能够识别的旧缓存模型导入清单。卸载会删除对应平台缓存中的模型仓库，并同步删除清单记录。模型仍保存在 Hugging Face 与 ModelScope 各自的标准缓存位置，不会被移动到项目中。
+下载完成后，程序把平台、仓库名、运行后端、实际缓存路径和 companion dependency 路径写入应用缓存下的 `model-management/models.json`。语音模型列表只读取 registry 明确支持且类型匹配的模型；首次升级时会把能够识别的旧缓存模型导入清单。未知仓库可以下载并记录，但状态为“已下载 / Runtime Unknown / SCIP Unsupported”，不会因为存在 `.safetensors`、`.gguf` 或 `config.json` 就被猜成可运行模型。卸载会删除对应平台缓存中的模型仓库，并同步删除清单记录。模型仍保存在 Hugging Face 与 ModelScope 各自的标准缓存位置，不会被移动到项目中。
 
-Hugging Face 保留原有的抗网络限制下载链路：先用官方 `hf download`，失败后依次尝试镜像与 hfd。名称含 GGUF 的 Hugging Face 仓库会先检查文件：单一 GGUF 自动选择，多个量化版本由用户选择，分片 GGUF 成组下载。ModelScope 使用官方 `modelscope download --model owner/model`。下载过程会在管理窗口持续输出日志；下载失败或停止时会清理本次产生的不完整 Hugging Face 模型目录，避免它被误认为可用模型。
+模型下载工具不安装进 scip 主 `.venv`，也不再通过 `uvx --from ...` 临时创建工具环境。请按需要安装对应 CLI；只使用本地已有模型时两者都不是启动前置条件：
+
+```bash
+uv tool install "huggingface-hub[hf_xet]"
+uv tool install modelscope
+uv tool list
+```
+
+Hugging Face 使用 `hf download owner/model`，失败时依次尝试已配置的镜像 endpoint。名称含 GGUF 的 Hugging Face 仓库会先检查文件：单一 GGUF 自动选择，多个量化版本由用户选择，分片 GGUF 成组下载。ModelScope 使用 `modelscope download --model owner/model`。选择哪个平台才检查哪个 CLI；缺少另一个平台的 CLI 不影响程序运行。下载过程会在管理窗口持续输出日志，模型列表与下载命令输出都带垂直滚动条；下载失败或停止时会清理本次产生的不完整 Hugging Face 模型目录，避免它被误认为可用模型。
 
 导入声音时，第一行可选择常见音频或视频格式，第二行选择 TXT、SRT、VTT 等文本或字幕文件，第三行填写声音名称；选择媒体后会自动用不含扩展名的文件名填充名称。所有媒体都由 ffmpeg 统一生成 24 kHz 单声道 PCM WAV，字幕文件只提取实际台词，不保留序号与时间轴。音频和 UTF-8 文本写入 `sample_voice/<声音名称>/`，便于 TTS 直接读取，随后立即出现在声音列表中。
 
@@ -119,7 +127,7 @@ uv run scip
 uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 [royisme/qwen-speech-mlx](https://github.com/royisme/qwen-speech-mlx)
 的加载与推理流程，并配合上述模型仓库的接口。
-下载 Mac ASR 模型时会同时准备 MLX Forced Aligner。识别文本先取得逐词
+下载 Mac ASR preset 时，registry 中声明的 capability dependency 会同时准备 MLX Forced Aligner。识别文本先取得逐词
 时间戳，再按句末标点、真实停顿和字幕可读长度生成自然分段，不使用固定
 秒数作为最终字幕边界。
 
@@ -134,6 +142,45 @@ uv 会按需准备 Python 3.13 隔离运行环境。实现参考了
 - GGUF TTS：Base 与 CustomVoice 均可选择，并自动安装配套 tokenizer。
 
 GGUF 使用按当前系统下载的 CrispASR 预编译运行时。在“语音模型管理”中选择平台后可输入任意 `owner/model`，例如 Hugging Face 的 `seanghay/Qwen3-ASR-0.6B-Khmer`。
+
+## Speech service 架构
+
+语音推理不再运行在 Tk GUI 进程中：
+
+```text
+SCIP GUI → 127.0.0.1 HTTP → speech service → registry / manager → runtime adapter → ASR/TTS
+```
+
+GUI 只发送模型 ID、音频、语言和 TTS 参数。`videodub/speech/registry.py` 描述受支持模型、source、runtime、capabilities 与 companion dependencies；provider 只按 `source + repo_id + files` 调用下载 CLI；runtime adapter 才能 import `mlx-audio`、`qwen-asr`、`qwen-tts` 或执行 CrispASR。这样模型下载、是否受 SCIP 支持、runtime 是否可用、依赖是否完整和是否已加载是五个独立状态。
+
+任务开始时，SCIP 先检查指定端口上的 `/health`。已有用户手动启动的 speech service 会直接复用；否则使用所选模型的隔离 uv 环境启动 `videodub.speech.server`，调用 `/models/load`，任务结束、失败或取消时只清理由 SCIP 自己启动的进程。服务固定绑定 `127.0.0.1`，工作端口从一个集中常量分配，不默认开放到局域网。
+
+当前 API 包括：
+
+```text
+GET    /health
+GET    /models
+GET    /models/{id}
+POST   /models/load
+POST   /models/unload
+POST   /models/download
+DELETE /models/{id}
+POST   /audio/transcriptions
+POST   /audio/speech
+```
+
+手动启动时需使用与模型 runtime 相符的隔离环境。例如 Apple Silicon MLX：
+
+```bash
+uv run --no-project --python 3.13 \
+  --with 'fastapi>=0.128' --with python-multipart --with 'uvicorn>=0.40' \
+  --with 'mlx-audio>=0.3' --with numpy --with soundfile \
+  python -m videodub.speech.server --host 127.0.0.1 --port 9955
+```
+
+服务启动后默认未加载模型，可通过 `/models/load` 加载。通常无需手动操作，SCIP 会传入 manifest 中的本地路径、companion dependency 路径和声音参数。
+
+ForcedAligner 不作为顶层 ASR/TTS 模型显示。它是 Qwen3-ASR `timestamps` capability 的 dependency：主 ASR 权重存在但 aligner 缺失时，状态仍为“主模型已下载”，`transcription` 与 `timestamps` 分别显示可用性，模型管理器可单独“修复依赖”，不重新下载主模型。TTS 不使用 ForcedAligner。
 
 模型若以本机服务运行，会在任务开始前启动、就绪后执行，并在任务完成、失败或取消后终止；无需用户手动管理服务。
 
@@ -210,6 +257,8 @@ MLX 空 iterable 转为明确错误，不再穿透 `StopIteration`。生成最�
 顶部“关于”菜单提供缓存目录、版本与更新功能；“更新”只读取本项目 GitHub 最新 Release 并比较版本号。ffmpeg 与 yt-dlp 由软件启动后的后台任务按平台自动更新，不占用“更新”菜单。
 
 ## 代码结构
+
+语音服务集中在 `videodub/speech/`：`server.py` / `api.py` 提供 localhost API，`registry.py` 描述模型，`manager.py` 维护加载状态，`providers/` 只处理 repository 下载，`runtimes/` 隔离具体模型依赖。桌面侧只使用 `speech_client.py` 和 `speech_service_manager.py`；`qwen_speech.py` 仅保留旧导入名称的 HTTP 兼容 facade，`qwen_service.py` 暂时保留已经验证过的 Qwen 推理与时间戳算法供 runtime adapter 复用。
 
 视频下载功能集中在 `videodub/video_download/`：`ui.py` 是主窗口中的下载区域，`backend.py` 是 yt-dlp 命令、字幕回退、任务发现和失败清理。`videodub/downloader.py` 只保留旧导入路径兼容。该目录只依赖少量项目公共类型，单独取出后替换配置和任务类型即可改造成简单的 yt-dlp 下载 GUI。
 

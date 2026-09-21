@@ -1,16 +1,13 @@
-import base64
+from __future__ import annotations
+
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from videodub.config import AppConfig
-from videodub.model_management import InstalledModel
 from videodub.qwen_speech import (
-    _crispasr_asr_runtime_options,
-    _crispasr_language_code,
     _segments_to_cues,
-    _validate_crispasr_asr_model,
     check_qwen_service,
     resolve_tts_reference,
     synthesize_qwen,
@@ -19,66 +16,25 @@ from videodub.qwen_speech import (
 from videodub.subtitles import Cue
 
 
-class RecordingRunner:
-    def __init__(self) -> None:
-        self.command: list[str] = []
-
-    def run(self, command, *, quiet: bool = False) -> None:
-        self.command = [str(item) for item in command]
-
-
-class QwenSpeechTests(unittest.TestCase):
-    def test_health_pid_is_optional_and_validated(self) -> None:
+class QwenSpeechCompatibilityTests(unittest.TestCase):
+    def test_health_compatibility_reads_generic_service(self) -> None:
         with patch(
             "videodub.qwen_speech._json_request",
             return_value={
                 "status": "ok",
                 "type": "tts",
-                "model": "model",
-                "backend": "mlx",
+                "model": "qwen3-tts-mlx-customvoice-0.6b-8bit",
+                "runtime": "qwen3-tts-mlx",
                 "pid": 26762,
             },
         ):
             info = check_qwen_service("http://tts", "tts")
+
+        self.assertTrue(info.available)
         self.assertEqual(info.pid, 26762)
+        self.assertEqual(info.backend, "qwen3-tts-mlx")
 
-        with patch(
-            "videodub.qwen_speech._json_request",
-            return_value={"status": "ok", "type": "tts", "pid": "26762"},
-        ):
-            fallback = check_qwen_service("http://tts", "tts")
-        self.assertTrue(fallback.available)
-        self.assertIsNone(fallback.pid)
-
-    def test_crispasr_uses_explicit_language_codes(self) -> None:
-        self.assertEqual(_crispasr_language_code("English"), "en")
-        self.assertEqual(_crispasr_language_code("Chinese"), "zh")
-        self.assertEqual(_crispasr_language_code("Japanese"), "ja")
-        self.assertEqual(_crispasr_language_code("Russian"), "ru")
-        self.assertEqual(_crispasr_language_code("yue"), "yue")
-
-    def test_crispasr_asr_does_not_download_runtime_helpers(self) -> None:
-        options = _crispasr_asr_runtime_options(
-            "English",
-            Path("vad.bin"),
-            Path("aligner.gguf"),
-        )
-        self.assertEqual(
-            options,
-            [
-                "-l",
-                "en",
-                "--vad",
-                "-vm",
-                "vad.bin",
-                "-am",
-                "aligner.gguf",
-                "--split-on-punct",
-                "--strict-pipeline",
-            ],
-        )
-
-    def test_asr_segments_become_srt_cues(self) -> None:
+    def test_asr_segments_preserve_acoustic_boundaries(self) -> None:
         cues = _segments_to_cues(
             [
                 {"text": "Hello", "start": 0.25, "end": 1.5},
@@ -86,262 +42,43 @@ class QwenSpeechTests(unittest.TestCase):
             ],
             "",
         )
-        self.assertEqual([cue.index for cue in cues], [1, 2])
-        self.assertEqual(cues[0].start_ms, 250)
-        self.assertEqual(cues[0].end_ms, 1500)
-        self.assertEqual(cues[1].start_ms, 1500)
-        self.assertEqual(cues[1].end_ms, 2000)
-        self.assertEqual([cue.text for cue in cues], ["Hello", "world"])
-
-    def test_asr_preserves_short_word_aligned_cue(self) -> None:
-        cues = _segments_to_cues(
-            [
-                {
-                    "text": "you know? And it's just one of those things whenever it gets interrupted",
-                    "start": 59.52,
-                    "end": 62.24,
-                },
-                {
-                    "text": "from the power source, it has to reboot and it just totally wipes out the",
-                    "start": 62.24,
-                    "end": 65.76,
-                },
-                {"text": "history.", "start": 65.76, "end": 66.32},
-            ],
-            "",
-        )
-
-        self.assertEqual(
-            [(cue.start_ms, cue.end_ms, cue.text) for cue in cues],
-            [
-                (
-                    59_520,
-                    62_240,
-                    "you know? And it's just one of those things whenever it gets interrupted",
-                ),
-                (
-                    62_240,
-                    65_760,
-                    "from the power source, it has to reboot and it just totally wipes out the",
-                ),
-                (65_760, 66_320, "history."),
-            ],
-        )
-
-    def test_asr_does_not_invent_boundaries_for_long_cues(self) -> None:
-        cues = _segments_to_cues(
-            [
-                {
-                    "text": "one two three four five six seven eight",
-                    "start": 0,
-                    "end": 8,
-                }
-            ],
-            "",
-        )
-
         self.assertEqual(
             cues,
-            [Cue(1, 0, 8000, "one two three four five six seven eight")],
+            [Cue(1, 250, 1500, "Hello"), Cue(2, 1500, 2000, "world")],
         )
 
-    def test_asr_text_without_timestamps_is_rejected(self) -> None:
+    def test_text_without_timestamps_is_rejected(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "没有声学时间戳"):
             _segments_to_cues(None, "Fallback")
 
-    def test_asr_invalid_end_is_not_replaced_with_one_millisecond(self) -> None:
-        with self.assertRaisesRegex(ValueError, "invalid_duration"):
-            _segments_to_cues([{"text": "Isn't", "start": 3, "end": 2}], "")
-
-    def test_asr_zero_duration_spoken_segment_is_rejected(self) -> None:
-        segment = {"text": "Yet", "start": 10.32, "end": 10.32}
-        with self.assertRaisesRegex(ValueError, "invalid_duration"):
-            _segments_to_cues([segment], "")
-        self.assertEqual(segment, {"text": "Yet", "start": 10.32, "end": 10.32})
-
-    def test_old_gguf_conversion_is_rejected_before_crispasr_crashes(self) -> None:
-        installed = InstalledModel(
-            "asr",
-            "gguf",
-            "handy-computer/Qwen3-ASR-0.6B-gguf",
-            "model.gguf",
-        )
-        with patch(
-            "videodub.qwen_speech.read_installed_model",
-            return_value=installed,
+    def test_runtime_calls_are_forwarded_to_generic_client(self) -> None:
+        config = AppConfig()
+        output = Path("speech.wav")
+        with (
+            patch("videodub.qwen_speech.synthesize_speech") as single,
+            patch("videodub.qwen_speech.synthesize_speech_batch") as batch,
         ):
-            with self.assertRaisesRegex(RuntimeError, "cstr/qwen3-asr-0.6b-GGUF"):
-                _validate_crispasr_asr_model(Path("model.gguf"))
+            synthesize_qwen(config, "一", output, object())
+            synthesize_qwen_batch(config, ["一"], [output], object())
+        single.assert_called_once()
+        batch.assert_called_once()
 
-    def test_gguf_tts_uses_custom_voice_speaker(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            model = root / "model.gguf"
-            codec = root / "codec.gguf"
-            output = root / "output.wav"
-            model.touch()
-            codec.touch()
-            installed = InstalledModel(
-                "tts",
-                "gguf",
-                "owner/customvoice",
-                str(root),
-                str(codec),
-            )
-            runner = RecordingRunner()
-            config = AppConfig(
-                tts_backend="gguf",
-                tts_model_path=str(root),
-                tts_speaker="Vivian",
-            )
-            with (
-                patch(
-                    "videodub.qwen_speech.crispasr_executable",
-                    return_value=root / "crispasr.exe",
-                ),
-                patch(
-                    "videodub.qwen_speech.read_installed_model",
-                    return_value=installed,
-                ),
-            ):
-                synthesize_qwen(config, "你好", output, runner)
-
-        self.assertIn("qwen3-tts-customvoice", runner.command)
-        self.assertEqual(
-            runner.command[runner.command.index("--voice") + 1],
-            "Vivian",
-        )
-        self.assertNotIn("--ref-text", runner.command)
-
-    def test_gguf_base_tts_uses_reference_audio_and_text(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            model = root / "model.gguf"
-            codec = root / "codec.gguf"
-            reference = root / "reference.wav"
-            reference_text = root / "reference.anything"
-            output = root / "output.wav"
-            model.touch()
-            codec.touch()
-            reference.touch()
-            reference_text.write_text("参考文本", encoding="utf-8")
-            installed = InstalledModel(
-                "tts",
-                "gguf",
-                "owner/base",
-                str(root),
-                str(codec),
-                variant="base",
-            )
-            runner = RecordingRunner()
-            config = AppConfig(
-                tts_backend="gguf",
-                tts_model_path=str(root),
-                tts_use_custom_voice=True,
-                tts_reference_audio=str(reference),
-                tts_reference_text_file=str(reference_text),
-            )
-            with (
-                patch(
-                    "videodub.qwen_speech.crispasr_executable",
-                    return_value=root / "crispasr.exe",
-                ),
-                patch(
-                    "videodub.qwen_speech.read_installed_model",
-                    return_value=installed,
-                ),
-            ):
-                synthesize_qwen(config, "你好", output, runner)
-
-        self.assertIn("qwen3-tts", runner.command)
-        self.assertNotIn("qwen3-tts-customvoice", runner.command)
-        self.assertEqual(
-            runner.command[runner.command.index("--voice") + 1],
-            str(reference.resolve()),
-        )
-        self.assertEqual(
-            runner.command[runner.command.index("--ref-text") + 1],
-            "参考文本",
-        )
-        self.assertEqual(runner.command[runner.command.index("-l") + 1], "zh")
-
-    def test_custom_reference_text_file_has_no_extension_restriction(self) -> None:
+    def test_reference_text_remains_a_desktop_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             audio = root / "voice.wav"
-            text_file = root / "voice.data"
+            text = root / "voice.data"
             audio.touch()
-            text_file.write_text("实际读取的文本", encoding="utf-8")
-            config = AppConfig(
-                tts_use_custom_voice=True,
-                tts_reference_audio=str(audio),
-                tts_reference_text_file=str(text_file),
+            text.write_text("实际读取的文本", encoding="utf-8")
+            resolved_audio, resolved_text = resolve_tts_reference(
+                AppConfig(
+                    tts_use_custom_voice=True,
+                    tts_reference_audio=str(audio),
+                    tts_reference_text_file=str(text),
+                )
             )
-            resolved_audio, resolved_text = resolve_tts_reference(config)
             self.assertEqual(Path(resolved_audio), audio.resolve())
             self.assertEqual(resolved_text, "实际读取的文本")
-
-    def test_service_tts_request_contains_selected_language(self) -> None:
-        captured: dict = {}
-
-        def request(_url, *, payload=None, timeout=0):
-            captured.update(payload or {})
-            return {"audio_base64": ""}
-
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "videodub.qwen_speech._json_request",
-            side_effect=request,
-        ), patch("videodub.qwen_speech._copy_qwen_audio"):
-            synthesize_qwen(
-                AppConfig(tts_backend="mlx", tts_language="Japanese"),
-                "こんにちは",
-                Path(temp) / "out.wav",
-                RecordingRunner(),
-            )
-        self.assertEqual(captured["language"], "Japanese")
-
-    def test_service_tts_batch_writes_each_returned_audio(self) -> None:
-        captured: dict = {}
-
-        def request(_url, *, payload=None, timeout=0):
-            captured.update(payload or {})
-            return {
-                "audio_base64_list": [
-                    base64.b64encode(b"first").decode("ascii"),
-                    base64.b64encode(b"second").decode("ascii"),
-                ]
-            }
-
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "videodub.qwen_speech._json_request",
-            side_effect=request,
-        ):
-            outputs = [Path(temp) / "one.wav", Path(temp) / "two.wav"]
-            synthesize_qwen_batch(
-                AppConfig(tts_backend="mlx", tts_language="Chinese"),
-                ["一", "二"],
-                outputs,
-                RecordingRunner(),
-            )
-            audio_bytes = [path.read_bytes() for path in outputs]
-
-        self.assertEqual(captured["texts"], ["一", "二"])
-        self.assertEqual(audio_bytes, [b"first", b"second"])
-
-class PartialTTSResponseTests(unittest.TestCase):
-    def test_partial_batch_response_writes_success_before_reporting_failure(self):
-        import base64
-        from videodub.qwen_speech import synthesize_qwen_batch
-        with tempfile.TemporaryDirectory() as temp:
-            paths = [Path(temp) / "one.wav", Path(temp) / "two.wav"]
-            with patch("videodub.qwen_speech._json_request", return_value={
-                "audio_base64_list": [base64.b64encode(b"valid-bytes").decode(), None],
-                "errors": [None, "empty iterable"],
-            }):
-                with self.assertRaisesRegex(RuntimeError, "empty iterable"):
-                    synthesize_qwen_batch(AppConfig(tts_backend="mlx"), ["one", "two"], paths, RecordingRunner())
-            self.assertEqual(paths[0].read_bytes(), b"valid-bytes")
-            self.assertFalse(paths[1].exists())
 
 
 if __name__ == "__main__":

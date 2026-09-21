@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..config import AppConfig
 from ..media import VideoJob
-from ..qwen_speech import extract_asr_subtitle
+from ..speech_client import extract_asr_subtitle
 from ..runner import ProcessRunner
 
 

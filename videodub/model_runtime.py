@@ -10,9 +10,17 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import AppConfig
-from .model_management import read_installed_model, uv_runtime_prefix
-from .qwen_speech import check_qwen_service, resolve_tts_reference
+from .model_management import (
+    crispasr_executable,
+    ensure_gguf_runtime,
+    read_installed_model,
+)
 from .runner import ProcessRunner
+from .speech.constants import DEFAULT_SPEECH_PORT, speech_base_url
+from .speech.registry import find_model_spec
+from .speech.runtime_env import uv_runtime_prefix
+from .speech_client import SpeechClient, check_speech_service
+from .speech_settings import resolve_tts_reference
 
 
 RUNTIME_DIAGNOSTICS_FILENAME = "runtime-diagnostics.log"
@@ -103,8 +111,8 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
-class ManagedModelService:
-    """Start one locally installed model for one task and always stop it."""
+class ManagedSpeechService:
+    """Connect to or start the generic local speech service for one task."""
 
     def __init__(
         self,
@@ -117,9 +125,8 @@ class ManagedModelService:
         self.config = config
         self.runner = runner
         self.kind = kind
-        default_port = 9956 if kind == "asr" else 9955
-        self.port = port or default_port
-        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.port = port or DEFAULT_SPEECH_PORT
+        self.base_url = speech_base_url(self.port)
         self.process: subprocess.Popen[str] | None = None
         self.service_pid: int | None = None
         self._stop_lock = threading.Lock()
@@ -130,7 +137,7 @@ class ManagedModelService:
         self._rss_stop = threading.Event()
         self._rss_thread: threading.Thread | None = None
 
-    def __enter__(self) -> "ManagedModelService":
+    def __enter__(self) -> "ManagedSpeechService":
         selected_path = (
             self.config.asr_model_path
             if self.kind == "asr"
@@ -143,37 +150,43 @@ class ManagedModelService:
             raise RuntimeError(f"模型未完整下载或已被移动：{selected_path}")
         path = selected_path
         backend = installed.backend
-        if self.kind == "asr" and backend == "mlx" and not installed.aligner_path:
-            raise RuntimeError(
-                "Mac ASR 缺少 MLX Forced Aligner，请在模型菜单中重新下载该模型。"
-            )
-        if backend == "gguf":
-            return self
-        existing = check_qwen_service(self.base_url, self.kind, timeout=1)
-        if existing.available:
-            raise RuntimeError(
-                f"端口 {self.port} 已有 {self.kind.upper()} 服务运行，请先关闭后重试"
-            )
-        command = [
-            *uv_runtime_prefix(self.kind, backend),
-            "python",
-            "-m",
-            "videodub.qwen_service",
-            self.kind,
-            "--backend",
-            backend,
-            "--model",
-            path,
-            "--port",
-            str(self.port),
+        spec = find_model_spec(installed.repo_id)
+        if spec is None or spec.kind != self.kind:
+            raise RuntimeError(f"该仓库已下载，但 SCIP 不支持运行：{installed.repo_id}")
+        dependencies = {
+            dependency.id: str(getattr(installed, dependency.manifest_field, "") or "")
+            for dependency in spec.dependencies
+        }
+        missing = [
+            dependency.display_name
+            for dependency in spec.dependencies
+            if not dependencies[dependency.id]
+            or not Path(dependencies[dependency.id]).exists()
         ]
-        if self.kind == "asr" and installed.aligner_path:
-            command.extend(["--aligner", installed.aligner_path])
+        if missing:
+            raise RuntimeError(
+                "模型主体已安装，但 companion dependency 缺失："
+                + ", ".join(missing)
+                + "。请在模型管理器中修复依赖，无需重新下载主模型。"
+            )
+        existing = check_speech_service(self.base_url, timeout=1)
+        options: dict[str, str] = {}
+        if backend == "gguf":
+            executable = crispasr_executable()
+            if executable is None:
+                self.runner.logger("正在准备隔离的 GGUF speech runtime…")
+                executable = ensure_gguf_runtime(self.runner)
+            options["executable"] = str(executable)
         if self.kind == "tts":
             reference_audio = self.config.tts_reference_audio
             reference_text = self.config.tts_reference_text
             if installed.variant == "base":
                 reference_audio, reference_text = resolve_tts_reference(self.config)
+            options.update(
+                speaker=self.config.tts_speaker,
+                reference_audio=reference_audio,
+                reference_text=reference_text,
+            )
             if summary := _reference_audio_summary(reference_audio, reference_text):
                 self.runner.logger(summary)
                 append_runtime_diagnostic(self.config.cache_dir, summary)
@@ -191,19 +204,24 @@ class ManagedModelService:
                 )
                 self.runner.logger(warning)
                 append_runtime_diagnostic(self.config.cache_dir, warning)
-            command.extend(
-                [
-                    "--variant",
-                    installed.variant or "custom_voice",
-                    "--speaker",
-                    self.config.tts_speaker,
-                    "--reference-audio",
-                    reference_audio,
-                    "--reference-text",
-                    reference_text,
-                ]
-            )
-        self.runner.logger(f"正在启动 {self.kind.upper()} 模型…")
+        if existing.available:
+            self.runner.logger(f"连接到已有 speech service：{self.base_url}")
+            if hasattr(existing, "loaded"):
+                SpeechClient(self.base_url).load_model(
+                    spec.id, path, dependencies, options
+                )
+            self.service_pid = existing.pid
+            self.runner.logger(f"{self.kind.upper()} 模型已就绪：{spec.display_name}")
+            return self
+        command = [
+            *uv_runtime_prefix(self.kind, backend),
+            "python",
+            "-m",
+            "videodub.speech.server",
+            "--port",
+            str(self.port),
+        ]
+        self.runner.logger("正在启动 speech service…")
         self.process = subprocess.Popen(
             command,
             cwd=Path(__file__).resolve().parent.parent,
@@ -232,8 +250,13 @@ class ManagedModelService:
                 self.runner.check_cancelled()
                 if self.process.poll() is not None:
                     raise RuntimeError(f"{self.kind.upper()} 模型启动失败")
-                info = check_qwen_service(self.base_url, self.kind, timeout=1)
+                info = check_speech_service(self.base_url, timeout=1)
                 if info.available:
+                    if hasattr(info, "loaded"):
+                        SpeechClient(self.base_url).load_model(
+                            spec.id, path, dependencies, options
+                        )
+                        info = check_speech_service(self.base_url, timeout=1)
                     if self.kind == "tts":
                         self.service_pid = info.pid
                         if self.service_pid is not None and os.name != "nt":
@@ -253,7 +276,7 @@ class ManagedModelService:
                             )
                             self.runner.logger(message)
                             append_runtime_diagnostic(self.config.cache_dir, message)
-                    self.runner.logger(f"{self.kind.upper()} 模型已就绪：{info.model}")
+                    self.runner.logger(f"{self.kind.upper()} 模型已就绪：{spec.display_name}")
                     return self
                 time.sleep(1)
             raise RuntimeError(f"{self.kind.upper()} 模型启动超时")
@@ -349,3 +372,7 @@ class ManagedModelService:
                 _terminate_process_tree(process)
             finally:
                 self.process = None
+
+
+# Compatibility for integrations that imported the former lifecycle name.
+ManagedModelService = ManagedSpeechService

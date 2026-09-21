@@ -3,14 +3,15 @@ from .backend import (
     ModelFileOption,
     crispasr_executable,
     download_model,
+    ensure_gguf_runtime,
     first_model_file,
     list_huggingface_gguf_options,
     list_installed_models,
     model_manifest_path,
     normalize_repository_id,
     read_installed_model,
+    repair_model_dependencies,
     uninstall_model,
-    uv_runtime_prefix,
 )
 from .voices import (
     AUDIO_EXTENSIONS,
@@ -29,6 +30,7 @@ __all__ = [
     "VoiceSample",
     "crispasr_executable",
     "download_model",
+    "ensure_gguf_runtime",
     "first_model_file",
     "import_voice_sample",
     "list_huggingface_gguf_options",
@@ -37,7 +39,7 @@ __all__ = [
     "model_manifest_path",
     "normalize_repository_id",
     "read_installed_model",
+    "repair_model_dependencies",
     "resolve_voice_sample",
     "uninstall_model",
-    "uv_runtime_prefix",
 ]

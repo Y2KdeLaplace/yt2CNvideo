@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .config import AppConfig
 from .platform_utils import executable_exists, resolve_executable
 from .runner import CommandError, ProcessRunner
+from .speech.providers import check_provider_cli
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,11 @@ class DependencyVersions:
             f"依赖检查通过：yt-dlp {self.yt_dlp}；"
             f"ffmpeg {self.ffmpeg}；ffprobe {self.ffprobe}。"
         )
+
+
+def inspect_model_provider_dependency(source: str) -> str:
+    """Resolve only the download CLI selected by the user."""
+    return check_provider_cli(source.strip().casefold())
 
 
 def _version_line(

@@ -16,4 +16,4 @@ def run_dubbing_stage(
     base_url: str,
 ) -> Path:
     """Run stage 4: synthesize speech and mux the dubbed output."""
-    return dub_video(config, runner, job, qwen_base_url=base_url)
+    return dub_video(config, runner, job, speech_base_url=base_url)

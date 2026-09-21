@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 scip = "videodub.ui:main"
+scip-speech = "videodub.speech.server:main"
 
 [tool.setuptools.packages.find]
 include = ["videodub*"]

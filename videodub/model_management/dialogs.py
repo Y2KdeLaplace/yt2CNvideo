@@ -15,8 +15,10 @@ from .backend import (
     list_huggingface_gguf_options,
     list_installed_models,
     normalize_repository_id,
+    repair_model_dependencies,
     uninstall_model,
 )
+from ..speech.registry import find_model_spec
 from .voices import import_voice_sample, list_voice_samples
 
 
@@ -151,8 +153,9 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
     dialog.resizable(False, False)
     frame = ttk.Frame(dialog, padding=12)
     frame.pack(fill="both", expand=True)
-    models = list_installed_models(config=app.config_data)
-    model_paths = {model.path for model in models}
+    asr_models = list_installed_models("asr", config=app.config_data)
+    tts_models = list_installed_models("tts", config=app.config_data)
+    model_paths = {model.path for model in (*asr_models, *tts_models)}
     asr_path = (
         app.config_data.asr_model_path
         if app.config_data.asr_model_path in model_paths
@@ -178,16 +181,16 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         refreshing = True
         current_asr = asr_picker.selected_path
         current_tts = tts_picker.selected_path
-        asr_picker.set_models(models, current_asr, current_tts)
-        tts_picker.set_models(models, current_tts, current_asr)
+        asr_picker.set_models(asr_models, current_asr, current_tts)
+        tts_picker.set_models(tts_models, current_tts, current_asr)
         refreshing = False
 
     asr_picker = _ModelPicker(frame, refresh_pickers)
     asr_picker.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
     tts_picker = _ModelPicker(frame, refresh_pickers)
     tts_picker.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
-    asr_picker.set_models(models, asr_path, tts_path)
-    tts_picker.set_models(models, tts_path, asr_path)
+    asr_picker.set_models(asr_models, asr_path, tts_path)
+    tts_picker.set_models(tts_models, tts_path, asr_path)
 
     voices = list_voice_samples()
     voice_names = [sample.name for sample in voices]
@@ -322,7 +325,7 @@ def show_speech_model_dialog(app: ModelDialogHost) -> None:
         padx=(6, 0),
     )
 
-    if not models:
+    if not asr_models and not tts_models:
         ttk.Label(
             frame,
             text="当前清单中没有已下载模型，请先打开“语音模型管理”。",
@@ -401,22 +404,37 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     model_frame.rowconfigure(0, weight=1)
     tree = ttk.Treeview(
         model_frame,
-        columns=("platform", "model", "backend", "path"),
+        columns=("platform", "model", "runtime", "support", "status", "path"),
         show="headings",
         height=6,
         style="ModelManager.Treeview",
     )
     tree.heading("platform", text="平台")
     tree.heading("model", text="模型")
-    tree.heading("backend", text="类型")
+    tree.heading("runtime", text="Runtime")
+    tree.heading("support", text="SCIP support")
+    tree.heading("status", text="状态")
     tree.heading("path", text="位置")
     tree.column("platform", width=105, stretch=False)
     tree.column("model", width=240, stretch=False)
-    tree.column("backend", width=65, stretch=False)
-    tree.column("path", width=360, stretch=True)
+    tree.column("runtime", width=95, stretch=False)
+    tree.column("support", width=95, stretch=False)
+    tree.column("status", width=105, stretch=False)
+    tree.column("path", width=260, stretch=True)
     tree.grid(row=0, column=0, sticky="nsew")
-    uninstall_button = ttk.Button(model_frame, text="卸载", state="disabled")
-    uninstall_button.grid(row=1, column=0, sticky="e", pady=(7, 0))
+    tree_scroll = ttk.Scrollbar(model_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=tree_scroll.set)
+    tree_scroll.grid(row=0, column=1, sticky="ns")
+    detail = tk.StringVar(value="选择模型可查看 capabilities 与 companion dependencies。")
+    ttk.Label(model_frame, textvariable=detail, wraplength=820, justify="left").grid(
+        row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+    )
+    actions = ttk.Frame(model_frame)
+    actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(7, 0))
+    repair_button = ttk.Button(actions, text="修复依赖", state="disabled")
+    repair_button.pack(side="left")
+    uninstall_button = ttk.Button(actions, text="卸载", state="disabled")
+    uninstall_button.pack(side="left", padx=(6, 0))
 
     log_frame = ttk.LabelFrame(frame, text="下载命令输出", padding=8)
     log_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
@@ -432,6 +450,9 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
         foreground="#e5e7eb",
     )
     log.grid(row=0, column=0, sticky="nsew")
+    log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
+    log.configure(yscrollcommand=log_scroll.set)
+    log_scroll.grid(row=0, column=1, sticky="ns")
     rows: dict[str, InstalledModel] = {}
     state: dict[str, object] = {"busy": False, "runner": None}
     progress_active = False
@@ -461,7 +482,18 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
     def refresh() -> None:
         rows.clear()
         tree.delete(*tree.get_children())
-        for index, model in enumerate(list_installed_models(config=app.config_data)):
+        installed_models = sorted(
+            list_installed_models(config=app.config_data),
+            key=lambda item: (find_model_spec(item.repo_id) is None, item.repo_id.casefold()),
+        )
+        for index, model in enumerate(installed_models):
+            spec = find_model_spec(model.repo_id)
+            missing = [] if spec is None else [
+                dependency.display_name
+                for dependency in spec.dependencies
+                if not getattr(model, dependency.manifest_field, "")
+                or not Path(getattr(model, dependency.manifest_field, "")).exists()
+            ]
             row_id = str(index)
             rows[row_id] = model
             tree.insert(
@@ -471,11 +503,15 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
                 values=(
                     "ModelScope" if model.source == "modelscope" else "Hugging Face",
                     model.repo_id,
-                    model.backend,
+                    spec.engine.upper() if spec else "Unknown",
+                    "Supported" if spec else "Unsupported",
+                    "依赖缺失" if missing else "已下载",
                     model.path,
                 ),
             )
         uninstall_button.configure(state="disabled")
+        repair_button.configure(state="disabled")
+        detail.set("选择模型可查看 capabilities 与 companion dependencies。")
 
     def selected_model() -> InstalledModel | None:
         selected = tree.selection()
@@ -498,6 +534,14 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
             uninstall_button.configure(
                 state="disabled" if busy or selected_model() is None else "normal"
             )
+            model = selected_model()
+            spec = find_model_spec(model.repo_id) if model else None
+            missing = bool(spec and any(
+                not getattr(model, dependency.manifest_field, "")
+                or not Path(getattr(model, dependency.manifest_field, "")).exists()
+                for dependency in spec.dependencies
+            ))
+            repair_button.configure(state="normal" if not busy and missing else "disabled")
 
     def finish_download(installed: InstalledModel, runner: ProcessRunner) -> None:
         if state.get("runner") is not runner:
@@ -655,6 +699,58 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def start_repair() -> None:
+        model = selected_model()
+        if model is None:
+            return
+        runner = ProcessRunner(write_log, progress_logger=lambda text: write_log(text, progress=True))
+        set_busy(True, runner)
+
+        def worker() -> None:
+            try:
+                repair_model_dependencies(app.config_data, model, runner)
+                app.after(0, lambda: (set_busy(False), refresh()))
+            except Exception as exc:
+                app.after(0, lambda error=exc: fail_download(error, runner))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def update_selection() -> None:
+        model = selected_model()
+        if model is None:
+            uninstall_button.configure(state="disabled")
+            repair_button.configure(state="disabled")
+            return
+        spec = find_model_spec(model.repo_id)
+        uninstall_button.configure(state="disabled" if state.get("busy") else "normal")
+        if spec is None:
+            detail.set("Runtime: Unknown · SCIP support: Unsupported · 该仓库只作为已下载缓存记录。")
+            repair_button.configure(state="disabled")
+            return
+        dependency_lines = []
+        missing = False
+        for dependency in spec.dependencies:
+            ready = bool(
+                getattr(model, dependency.manifest_field, "")
+                and Path(getattr(model, dependency.manifest_field, "")).exists()
+            )
+            missing = missing or not ready
+            dependency_lines.append(f"{'✓' if ready else '✗'} {dependency.display_name}")
+        unavailable = {
+            capability
+            for dependency in spec.dependencies
+            if not getattr(model, dependency.manifest_field, "")
+            or not Path(getattr(model, dependency.manifest_field, "")).exists()
+            for capability in dependency.capabilities
+        }
+        capabilities = "  ".join(
+            f"{'✗' if capability in unavailable else '✓'} {capability}"
+            for capability in spec.capabilities
+        )
+        dependencies = "  ".join(dependency_lines) or "无"
+        detail.set(f"Capabilities: {capabilities}\nDependencies: {dependencies}")
+        repair_button.configure(state="normal" if missing and not state.get("busy") else "disabled")
+
     def close() -> None:
         if state.get("busy"):
             if not messagebox.askyesno(
@@ -669,15 +765,11 @@ def show_model_manager_dialog(app: ModelDialogHost) -> None:
             state["runner"] = None
         dialog.destroy()
 
-    tree.bind(
-        "<<TreeviewSelect>>",
-        lambda _event: uninstall_button.configure(
-            state="normal" if selected_model() and not state.get("busy") else "disabled"
-        ),
-    )
+    tree.bind("<<TreeviewSelect>>", lambda _event: update_selection())
     tree.bind("<Button-1>", clear_selection_on_blank, add="+")
     download_button.configure(command=start_download)
     uninstall_button.configure(command=start_uninstall)
+    repair_button.configure(command=start_repair)
     dialog.protocol("WM_DELETE_WINDOW", close)
     refresh()
     app._center_dialog(dialog, 900, 610)

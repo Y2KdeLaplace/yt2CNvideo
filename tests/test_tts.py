@@ -145,9 +145,9 @@ class SentenceUnitTests(unittest.TestCase):
 
             with (
                 patch("videodub.tts.TTS_CHUNK_MAX_CHARS", 4),
-                patch("videodub.tts.synthesize_qwen", side_effect=synthesize),
+                patch("videodub.tts.synthesize_speech", side_effect=synthesize),
                 patch(
-                    "videodub.tts.synthesize_qwen_batch",
+                    "videodub.tts.synthesize_speech_batch",
                     side_effect=synthesize_batch,
                 ),
             ):
@@ -192,9 +192,9 @@ class SentenceUnitTests(unittest.TestCase):
                     write_tone(output, 100)
 
             with (
-                patch("videodub.tts.synthesize_qwen", side_effect=synthesize),
+                patch("videodub.tts.synthesize_speech", side_effect=synthesize),
                 patch(
-                    "videodub.tts.synthesize_qwen_batch",
+                    "videodub.tts.synthesize_speech_batch",
                     side_effect=synthesize_batch,
                 ),
             ):
@@ -236,8 +236,8 @@ class SentenceUnitTests(unittest.TestCase):
                     write_tone(output, 100)
 
             with (
-                patch("videodub.tts.synthesize_qwen", side_effect=synthesize),
-                patch("videodub.tts.synthesize_qwen_batch", side_effect=synthesize_batch),
+                patch("videodub.tts.synthesize_speech", side_effect=synthesize),
+                patch("videodub.tts.synthesize_speech_batch", side_effect=synthesize_batch),
             ):
                 _synthesize_sentence_units(
                     AppConfig(tts_backend="hf", cache_dir=str(root / "cache")),
@@ -579,7 +579,7 @@ class DubVideoFlowTests(unittest.TestCase):
 
             with (
                 patch(
-                    "videodub.tts.check_qwen_service",
+                    "videodub.tts.check_speech_service",
                     return_value=QwenServiceInfo(True, "tts", "Qwen3-TTS", "mlx"),
                 ) as health,
                 patch(
@@ -593,10 +593,10 @@ class DubVideoFlowTests(unittest.TestCase):
                     config,
                     runner,
                     job,
-                    qwen_base_url="http://tts-only",
+                    speech_base_url="http://tts-only",
                 )
 
-        health.assert_called_once_with("http://tts-only", "tts")
+        health.assert_called_once_with("http://tts-only")
         synthesize.assert_called_once()
         fit.assert_called_once()
         render.assert_called_once()
@@ -645,7 +645,7 @@ class SentenceCacheTests(unittest.TestCase):
                     write_tone(output, 200)
                 units = [SentenceUnit(87, 88, 0, 5920, "我永远无法习惯那些临终挣扎。", 1)]
                 config = AppConfig(tts_backend="mlx", tts_model_id="model-test", cache_dir=str(root / "cache"))
-                with patch("videodub.tts.synthesize_qwen", side_effect=request):
+                with patch("videodub.tts.synthesize_speech", side_effect=request):
                     if succeeds:
                         self.assertEqual(len(_synthesize_sentence_units(config, AudioRunner(), units, root, "http://tts")), 1)
                     else:
@@ -669,7 +669,7 @@ class SentenceCacheTests(unittest.TestCase):
                 if text == "句子51。" and fail:
                     raise RuntimeError("empty")
                 write_tone(output, 150)
-            with patch("videodub.tts.synthesize_qwen", side_effect=request):
+            with patch("videodub.tts.synthesize_speech", side_effect=request):
                 with self.assertRaisesRegex(RuntimeError, "51/56"):
                     _synthesize_sentence_units(config, AudioRunner(), units, work, "http://tts")
                 self.assertEqual(len(calls), 52)
@@ -689,13 +689,13 @@ class SentenceCacheTests(unittest.TestCase):
             def batch(config, texts, outputs, runner, **kwargs):
                 write_tone(outputs[0], 150)
                 raise RuntimeError("second empty")
-            with patch("videodub.tts.synthesize_qwen_batch", side_effect=batch), patch("videodub.tts.synthesize_qwen", side_effect=RuntimeError("empty")):
+            with patch("videodub.tts.synthesize_speech_batch", side_effect=batch), patch("videodub.tts.synthesize_speech", side_effect=RuntimeError("empty")):
                 with self.assertRaises(RuntimeError):
                     _synthesize_sentence_units(config, AudioRunner(), units, root, "http://tts")
             def success(config, text, output, runner, **kwargs):
                 self.assertEqual(text, "第二句。")
                 write_tone(output, 150)
-            with patch("videodub.tts.synthesize_qwen", side_effect=success) as request, patch("videodub.tts.synthesize_qwen_batch") as batch_request:
+            with patch("videodub.tts.synthesize_speech", side_effect=success) as request, patch("videodub.tts.synthesize_speech_batch") as batch_request:
                 _synthesize_sentence_units(config, AudioRunner(), units, root, "http://tts")
                 request.assert_called_once()
                 batch_request.assert_not_called()
@@ -729,7 +729,7 @@ class SentenceCacheTests(unittest.TestCase):
             def empty(config, text, output, runner, **kwargs):
                 with wave.open(str(output), "wb") as wav:
                     wav.setparams((1, 2, 24000, 0, "NONE", ""))
-            with patch("videodub.tts.synthesize_qwen", side_effect=empty) as request:
+            with patch("videodub.tts.synthesize_speech", side_effect=empty) as request:
                 with self.assertRaisesRegex(RuntimeError, "连续 2 次"):
                     _synthesize_sentence_units(config, AudioRunner(), [SentenceUnit(1,1,0,1000,"你好",1)], root, "http://tts")
                 self.assertEqual(request.call_count, 2)

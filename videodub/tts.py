@@ -15,12 +15,13 @@ from pydub import AudioSegment
 
 from .config import AppConfig
 from .media import VideoJob, media_duration
-from .qwen_speech import (
-    check_qwen_service,
-    resolve_tts_reference,
-    synthesize_qwen,
-    synthesize_qwen_batch,
+from .speech_client import (
+    SPEECH_SERVICE_URL,
+    check_speech_service,
+    synthesize_speech,
+    synthesize_speech_batch,
 )
+from .speech_settings import resolve_tts_reference
 from .runner import CancelledError, ProcessRunner
 from .sentences import SentenceUnit, read_units, spoken_text, validate_units
 
@@ -186,9 +187,9 @@ def _run_tts_request(
             for path in requested_paths:
                 path.unlink(missing_ok=True)
             if len(pending) == 1:
-                synthesize_qwen(config, requested_texts[0], requested_paths[0], runner, base_url=base_url)
+                synthesize_speech(config, requested_texts[0], requested_paths[0], runner, base_url=base_url)
             else:
-                synthesize_qwen_batch(config, requested_texts, requested_paths, runner, base_url=base_url)
+                synthesize_speech_batch(config, requested_texts, requested_paths, runner, base_url=base_url)
         except CancelledError:
             raise
         except (OSError, RuntimeError, ValueError) as exc:
@@ -753,7 +754,7 @@ def dub_video(
     runner: ProcessRunner,
     job: VideoJob,
     *,
-    qwen_base_url: str = "http://127.0.0.1:9955",
+    speech_base_url: str = SPEECH_SERVICE_URL,
 ) -> Path:
     subtitle_path = job.translated_subtitle_path(config.translation_language)
     if not subtitle_path.exists():
@@ -770,17 +771,16 @@ def dub_video(
         else subtitle_end_ms / 1000
     )
     work_dir = _job_temp_dir(config, job)
-    if config.tts_backend != "gguf":
-        info = check_qwen_service(qwen_base_url, "tts")
-        if not info.available:
-            raise RuntimeError(f"Qwen3-TTS 模型服务未就绪：{info.error}")
-        runner.logger(f"Qwen3-TTS 模型：{info.model or '未报告'}")
+    info = check_speech_service(speech_base_url)
+    if not info.available or (hasattr(info, "loaded") and not info.loaded):
+        raise RuntimeError(f"Speech TTS 服务未就绪：{info.error or '模型未加载'}")
+    runner.logger(f"TTS 模型：{info.model or '未报告'}")
     raw_sentences = _synthesize_sentence_units(
         config,
         runner,
         units,
         work_dir,
-        qwen_base_url,
+        speech_base_url,
     )
     fitted_blocks = _fit_speech_blocks(
         config,

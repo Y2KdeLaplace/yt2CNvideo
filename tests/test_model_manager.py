@@ -22,8 +22,8 @@ from videodub.model_management.backend import (
     resolve_huggingface_model,
     resolve_modelscope_model,
     uninstall_model,
-    uv_runtime_prefix,
 )
+from videodub.speech.runtime_env import uv_runtime_prefix
 
 
 class RecordingRunner:
@@ -237,16 +237,9 @@ class ModelManagerTests(unittest.TestCase):
             )
 
         self.assertEqual(actual, expected)
-        self.assertEqual(
-            runner.command[:5],
-            [
-                "uvx",
-                "--from",
-                "huggingface-hub[hf_xet]",
-                "hf",
-                "download",
-            ],
-        )
+        self.assertEqual(Path(runner.command[0]).name, "hf")
+        self.assertEqual(runner.command[1:3], ["download", "owner/model"])
+        self.assertNotIn("uvx", runner.command)
         self.assertNotIn("--local-dir", runner.command)
         self.assertEqual(runner.command[-2:], ["--include", "model.gguf"])
         self.assertEqual(
@@ -325,10 +318,7 @@ class ModelManagerTests(unittest.TestCase):
         ):
             repository = Path(temp) / "models--owner--model"
             runner = FailingRunner(repository)
-            with patch(
-                "videodub.model_management.backend._download_with_hfd",
-                side_effect=RuntimeError("hfd failed"),
-            ), self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError):
                 _download_huggingface("owner/model", runner, ("model.gguf",))
 
             self.assertFalse(repository.exists())
@@ -351,15 +341,12 @@ class ModelManagerTests(unittest.TestCase):
                 "owner/model",
                 "existing.gguf",
             )
-            with patch(
-                "videodub.model_management.backend._download_with_hfd",
-                side_effect=RuntimeError("hfd failed"),
-            ), self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError):
                 _download_huggingface("owner/model", FailingRunner())
 
             self.assertTrue(installed.is_dir())
 
-    def test_selected_custom_gguf_file_becomes_runtime_model_path(self) -> None:
+    def test_unknown_custom_gguf_is_downloaded_but_not_assigned_runtime_dependencies(self) -> None:
         runner = RecordingRunner()
         choice = ModelChoice(
             "other",
@@ -386,7 +373,6 @@ class ModelManagerTests(unittest.TestCase):
                 return aligner_root if "forced-aligner" in repo_id else vad_root
 
             with (
-                patch("videodub.model_management.backend._install_runtime"),
                 patch("videodub.model_management.backend._record_installed_model"),
                 patch(
                     "videodub.model_management.backend._download_choice",
@@ -408,8 +394,9 @@ class ModelManagerTests(unittest.TestCase):
 
         self.assertEqual(installed.backend, "gguf")
         self.assertEqual(Path(installed.path), selected.resolve())
-        self.assertEqual(Path(installed.vad_path), vad_file)
-        self.assertEqual(Path(installed.aligner_path), aligner_file)
+        self.assertEqual(installed.kind, "unknown")
+        self.assertEqual(installed.vad_path, "")
+        self.assertEqual(installed.aligner_path, "")
 
     def test_mlx_asr_install_downloads_the_mlx_forced_aligner(self) -> None:
         choice = ModelChoice(
@@ -425,7 +412,6 @@ class ModelManagerTests(unittest.TestCase):
             return Path("aligner") if "ForcedAligner" in repo_id else Path("asr")
 
         with (
-            patch("videodub.model_management.backend._install_runtime"),
             patch("videodub.model_management.backend._record_installed_model"),
             patch(
                 "videodub.model_management.backend._download_choice",
@@ -457,19 +443,12 @@ class ModelManagerTests(unittest.TestCase):
             "mlx",
         )
         downloads: list[str] = []
-        runtimes: list[tuple[str, str]] = []
 
         def download(_choice, repo_id, _runner, _selected_files=()):
             downloads.append(repo_id)
             return Path("tts")
 
         with (
-            patch(
-                "videodub.model_management.backend._install_runtime",
-                side_effect=lambda kind, backend, _runner: runtimes.append(
-                    (kind, backend)
-                ),
-            ),
             patch("videodub.model_management.backend._record_installed_model"),
             patch(
                 "videodub.model_management.backend._download_choice",
@@ -484,7 +463,6 @@ class ModelManagerTests(unittest.TestCase):
                 RecordingRunner(),
             )
 
-        self.assertEqual(runtimes, [("tts", "mlx")])
         self.assertEqual(
             downloads,
             [
@@ -534,23 +512,19 @@ class ModelManagerTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            actual = _download_modelscope(
-                "Qwen/Qwen3-ASR-0.6B",
-                runner,
-            )
+            with patch(
+                "videodub.model_management.backend.check_provider_cli",
+                return_value="/tools/modelscope",
+            ):
+                actual = _download_modelscope(
+                    "Qwen/Qwen3-ASR-0.6B",
+                    runner,
+                )
 
         self.assertEqual(actual, expected.resolve())
         self.assertEqual(
             runner.command,
-            [
-                "uvx",
-                "--from",
-                "modelscope",
-                "modelscope",
-                "download",
-                "--model",
-                "Qwen/Qwen3-ASR-0.6B",
-            ],
+            ["/tools/modelscope", "download", "--model", "Qwen/Qwen3-ASR-0.6B"],
         )
 
     def test_tts_choices_support_base_and_custom_voice(self) -> None:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .sentences import TimelineError, spoken_text
+from .speech.constants import DEFAULT_SPEECH_PORT, SPEECH_HOST
 
 
 MLX_SAMPLE_RATE = 16000
@@ -1056,14 +1057,13 @@ def main() -> None:
     parser.add_argument("--speaker", default="Vivian")
     parser.add_argument("--reference-audio", default="")
     parser.add_argument("--reference-text", default="")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=SPEECH_HOST)
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
     import uvicorn
 
     app = create_asr_app(args) if args.service == "asr" else create_tts_app(args)
-    default_port = 9956 if args.service == "asr" else 9955
-    uvicorn.run(app, host=args.host, port=args.port or default_port)
+    uvicorn.run(app, host=args.host, port=args.port or DEFAULT_SPEECH_PORT)
 
 
 if __name__ == "__main__":
